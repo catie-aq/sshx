@@ -119,3 +119,64 @@ forwarding, TLS termination, private mesh networking, and graceful shutdown.
 
 Please do not run the development commands in a public setting, as this is
 insecure.
+
+
+## Tailscale MagicDNS Development Setup (with HTTPS)
+
+This configuration allows you to run sshx in development with valid HTTPS certificates via Tailscale.
+
+### Prerequisites
+
+1. Generate Tailscale certificates (only needed once):
+```shell
+tailscale cert homa-server2.gaur-toad.ts.net
+```
+
+This will create:
+- `homa-server2.gaur-toad.ts.net.crt` (public certificate)
+- `homa-server2.gaur-toad.ts.net.key` (private key)
+
+### Running the Development Environment
+
+**Terminal 1 - Start Redis (if not already running):**
+```shell
+docker compose up -d
+```
+
+**Terminal 2 - Start the backend server:**
+```shell
+cargo run --bin sshx-server -- \
+  --override-origin https://homa-server2.gaur-toad.ts.net:5173 \
+  --secret dev-secret \
+  --redis-url redis://localhost:12601 \
+  --listen 0.0.0.0
+```
+
+**Terminal 3 - Start the frontend with HTTPS:**
+```shell
+npm run dev
+```
+
+The Vite dev server will use the Tailscale certificates and serve on:
+- **https://homa-server2.gaur-toad.ts.net:5173** (valid HTTPS, accessible via Tailscale)
+- **https://localhost:5173** (also works locally)
+
+**Terminal 4 - Connect a client:**
+```shell
+cargo run --bin sshx -- --server http://homa-server2.gaur-toad.ts.net:8051
+
+## On remote machine
+sshx --server http://homa-server2.gaur-toad.ts.net:8051 
+```
+
+Or use the installed version:
+```shell
+sshx --server http://homa-server2.gaur-toad.ts.net:8051
+```
+
+### Benefits of this Setup
+
+- ✅ Valid HTTPS certificates (no browser warnings)
+- ✅ Web Crypto API (`crypto.subtle`) available for encryption
+- ✅ Accessible from any device on your Tailscale network
+- ✅ Certificates auto-renewable via Tailscale

@@ -3,13 +3,15 @@ procs:
   server:
     shell: >-
       cargo run --bin sshx-server --
-      --override-origin http://localhost:5173
+      --override-origin https://homa-server2.gaur-toad.ts.net:5173
       --secret dev-secret
       --redis-url redis://localhost:12601
-  client:
-    shell: >-
-      cargo run --bin sshx --
-      --server http://localhost:8051
+      --listen 0.0.0.0
   web:
     shell: npm run dev
     stop: SIGKILL  # TODO: Why is this necessary?
+  client:
+    shell: >-
+      cargo run --bin sshx --
+      --server http://homa-server2.gaur-toad.ts.net:8051
+    autostart: false
