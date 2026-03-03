@@ -1,5 +1,7 @@
 # sshx
 
+> **CATIE fork:** for Tailscale/tailnet setup, see [Tailscale.md](Tailscale.md).
+
 A secure web-based, collaborative terminal.
 
 ![](https://i.imgur.com/Q3qKAHW.png)
