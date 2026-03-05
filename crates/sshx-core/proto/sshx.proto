@@ -70,9 +70,26 @@ message ClientUpdate {
     TerminalData data = 2;      // Stream data from the terminal.
     NewShell created_shell = 3; // Acknowledge that a new shell was created.
     uint32 closed_shell = 4;    // Acknowledge that a shell was closed.
-    fixed64 pong = 14;          // Response for latency measurement.
+    bytes source_metadata = 10;  // zstd-compressed JSON Vec<WsSourceFile>.
+    bytes claude_event = 11;     // JSON-encoded WsClaudeEvent.
+    bytes component_graph = 12;  // zstd-compressed JSON WsComponentGraph.
+    fixed64 pong = 14;           // Response for latency measurement.
     string error = 15;
   }
+}
+
+// Request the CLI client to generate AI descriptions for a list of files.
+message DescribeFilesRequest {
+  repeated string paths = 1; // Relative paths to describe (empty = all files).
+}
+
+// Request the CLI to persist updated metadata for a single source file.
+message UpdateFileMetadata {
+  string path = 1;         // Relative file path.
+  string image_path = 2;   // Image URL/path (empty = no change).
+  string description = 3;  // Updated description (empty = no change).
+  uint32 widget_w = 4;     // Widget width in pixels (0 = no change).
+  uint32 widget_h = 5;     // Widget height in pixels (0 = no change).
 }
 
 // Bidirectional streaming update from the server.
@@ -83,7 +100,9 @@ message ServerUpdate {
     uint32 close_shell = 3;    // ID of a shell to close.
     SequenceNumbers sync = 4;  // Periodic sequence number sync.
     TerminalSize resize = 5;   // Resize a terminal window.
-    fixed64 ping = 14;         // Request a pong, with the timestamp.
+    DescribeFilesRequest describe_files = 12;          // Request AI descriptions.
+    UpdateFileMetadata update_file_metadata = 13;      // Persist updated file metadata.
+    fixed64 ping = 14;                                 // Request a pong, with the timestamp.
     string error = 15;
   }
 }

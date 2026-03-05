@@ -57,12 +57,17 @@
     startMove: MouseEvent;
     focus: void;
     blur: void;
+    nameChange: string;
   }>();
 
   const typeahead = new TypeAheadAddon();
 
   export let rows: number, cols: number;
   export let write: (data: string) => void; // bound function prop
+  export let shellName: string = "";
+
+  let localName = shellName;
+  $: localName = shellName;
 
   export let termEl: HTMLDivElement = null as any; // suppress "missing prop" warning
   let term: Terminal | null = null;
@@ -77,7 +82,12 @@
 
   let loaded = false;
   let focused = false;
+  let collapsed = false;
   let currentTitle = "Remote Terminal";
+
+  $: if (term) {
+    term.options.fontSize = collapsed ? 7 : 14;
+  }
 
   function handleWheelSkipXTerm(event: WheelEvent) {
     event.preventDefault(); // Stop native macOS Chrome zooming on pinch.
@@ -222,8 +232,9 @@
   on:pointerdown={(event) => event.stopPropagation()}
 >
   <div
-    class="flex select-none"
+    class="flex select-none cursor-grab active:cursor-grabbing"
     on:mousedown={(event) => dispatch("startMove", event)}
+    on:dblclick={() => (collapsed = !collapsed)}
   >
     <div class="flex-1 flex items-center px-3">
       <CircleButtons>
@@ -235,14 +246,16 @@
           kind="red"
           on:mousedown={(event) => event.button === 0 && dispatch("close")}
         />
-        <CircleButton
-          kind="yellow"
-          on:mousedown={(event) => event.button === 0 && dispatch("shrink")}
-        />
-        <CircleButton
-          kind="green"
-          on:mousedown={(event) => event.button === 0 && dispatch("expand")}
-        />
+        {#if !collapsed}
+          <CircleButton
+            kind="yellow"
+            on:mousedown={(event) => event.button === 0 && dispatch("shrink")}
+          />
+          <CircleButton
+            kind="green"
+            on:mousedown={(event) => event.button === 0 && dispatch("expand")}
+          />
+        {/if}
       </CircleButtons>
     </div>
     <div
@@ -250,10 +263,28 @@
     >
       {currentTitle}
     </div>
-    <div class="flex-1" />
+    <div class="flex-1 flex items-center justify-end pr-2"><span class="text-zinc-500 text-[10px]">{collapsed ? '▴' : '▾'}</span></div>
+  </div>
+  <div class="flex px-3 py-0.5 border-t border-zinc-700/50">
+    <input
+      class="flex-1 bg-transparent outline-none truncate"
+      class:text-sm={!!shellName}
+      class:font-medium={!!shellName}
+      class:text-zinc-300={!!shellName}
+      class:text-xs={!shellName}
+      class:text-zinc-600={!shellName}
+      class:italic={!shellName}
+      placeholder="Nommer ce terminal…"
+      bind:value={localName}
+      on:input={() => dispatch("nameChange", localName)}
+      on:mousedown|stopPropagation
+      on:pointerdown|stopPropagation
+    />
   </div>
   <div
-    class="inline-block px-4 py-2 transition-opacity duration-500"
+    class="inline-block transition-opacity duration-500"
+    class:px-4={!collapsed} class:py-2={!collapsed}
+    class:px-1={collapsed}  class:py-0={collapsed}
     bind:this={termEl}
     style:opacity={loaded ? 1.0 : 0.0}
     on:wheel={(event) => {

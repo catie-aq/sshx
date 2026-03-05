@@ -17,7 +17,7 @@ use tokio_stream::StreamExt;
 use tracing::{error, info_span, warn, Instrument};
 
 use crate::session::Session;
-use crate::web::protocol::{WsClient, WsServer};
+use crate::web::protocol::{WsClient, WsServer, WsWidget, WsWidgetKind};
 use crate::ServerState;
 
 pub async fn get_session_ws(
@@ -132,11 +132,27 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
     let update_tx = session.update_tx(); // start listening for updates before any state reads
     let mut broadcast_stream = session.subscribe_broadcast();
     send(socket, WsServer::Users(session.list_users())).await?;
+    send(socket, WsServer::Notes(session.list_notes())).await?;
+    let (sf_root, sf_files) = session.list_source_files();
+    send(socket, WsServer::SourceFiles(sf_root, sf_files)).await?;
+    send(socket, WsServer::Widgets(session.list_widgets())).await?;
+    send(socket, WsServer::ShellNames(session.list_shell_names())).await?;
+    if let Some(graph) = session.get_component_graph() {
+        send(socket, WsServer::ComponentGraph(graph)).await?;
+    }
+
+    // Replay stored Claude events so reconnecting browsers see recent history.
+    for event in session.list_claude_events() {
+        send(socket, WsServer::ClaudeEvent(event)).await?;
+    }
 
     let mut subscribed = HashSet::new(); // prevent duplicate subscriptions
     let (chunks_tx, mut chunks_rx) = mpsc::channel::<(Sid, u64, Vec<Bytes>)>(1);
 
     let mut shells_stream = session.subscribe_shells();
+    let mut notes_stream = session.subscribe_notes();
+    let mut source_files_stream = session.subscribe_source_files();
+    let mut widget_stream = session.subscribe_widgets();
     loop {
         let msg = tokio::select! {
             _ = session.terminated() => break,
@@ -147,6 +163,18 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
             }
             Some(shells) = shells_stream.next() => {
                 send(socket, WsServer::Shells(shells)).await?;
+                continue;
+            }
+            Some(notes) = notes_stream.next() => {
+                send(socket, WsServer::Notes(notes)).await?;
+                continue;
+            }
+            Some((root, files)) = source_files_stream.next() => {
+                send(socket, WsServer::SourceFiles(root, files)).await?;
+                continue;
+            }
+            Some(widgets) = widget_stream.next() => {
+                send(socket, WsServer::Widgets(widgets)).await?;
                 continue;
             }
             Some((id, seqnum, chunks)) = chunks_rx.recv() => {
@@ -245,6 +273,145 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
             }
             WsClient::Ping(ts) => {
                 send(socket, WsServer::Pong(ts)).await?;
+            }
+            WsClient::CreateNote(x, y) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                let id = session.counter().next_nid();
+                if let Err(err) = session.add_note(id, x, y) {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
+            }
+            WsClient::UpdateNote(id, note) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                if let Err(err) = session.update_note(id, note) {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
+            }
+            WsClient::DeleteNote(id) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                if let Err(err) = session.delete_note(id) {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
+            }
+            WsClient::OpenFileTree(x, y, root) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                let id = session.counter().next_wid();
+                let widget = WsWidget { x, y, w: 250, h: 400, kind: WsWidgetKind::FileTree { root }, collapsed: false };
+                if let Err(err) = session.add_widget(id, widget) {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
+            }
+            WsClient::OpenFileCard(x, y, path) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                let id = session.counter().next_wid();
+                let widget = WsWidget { x, y, w: 320, h: 400, kind: WsWidgetKind::FileCard { path }, collapsed: false };
+                if let Err(err) = session.add_widget(id, widget) {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
+            }
+            WsClient::MoveWidget(id, x, y) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                if let Err(err) = session.move_widget(id, x, y) {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
+            }
+            WsClient::ResizeWidget(id, w, h) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                if let Err(err) = session.resize_widget(id, w, h) {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
+            }
+            WsClient::CloseWidget(id) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                if let Err(err) = session.remove_widget(id) {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
+            }
+            WsClient::SetWidgetCollapsed(id, collapsed) => {
+                if let Err(err) = session.set_widget_collapsed(id, collapsed) {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
+            }
+            WsClient::SetShellName(id, name) => {
+                session.set_shell_name(id, name);
+            }
+            WsClient::DescribeFiles(paths) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                session.request_describe_files(paths);
+            }
+            WsClient::UpdateFileMetadata(path, update) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                let proto_msg = session.update_source_file_metadata(&path, &update);
+                session
+                    .update_tx()
+                    .send(ServerMessage::UpdateFileMetadata(proto_msg))
+                    .await?;
+            }
+            WsClient::OpenGraphView(x, y) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                let id = session.counter().next_wid();
+                let widget = WsWidget {
+                    x,
+                    y,
+                    w: 640,
+                    h: 520,
+                    kind: WsWidgetKind::GraphView {},
+                    collapsed: false,
+                };
+                if let Err(err) = session.add_widget(id, widget) {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
+            }
+            WsClient::OpenClaudeFeed(x, y, instance_id) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                let id = session.counter().next_wid();
+                let widget = WsWidget {
+                    x,
+                    y,
+                    w: 320,
+                    h: 400,
+                    kind: WsWidgetKind::ClaudeFeed { instance_id },
+                    collapsed: false,
+                };
+                if let Err(err) = session.add_widget(id, widget) {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
             }
         }
     }

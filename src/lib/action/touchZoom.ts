@@ -80,6 +80,29 @@ export class TouchZoom {
 
   #preventGesture = (event: TouchEvent) => event.preventDefault();
 
+  #handleGlobalWheel = (e: WheelEvent) => {
+    if (!(e.altKey || e.ctrlKey || e.metaKey) || e.buttons !== 0) return;
+    // Only intercept if not already targeting the canvas node itself
+    // (the Gesture handler on #node will handle that case)
+    if (this.#node && this.#node.contains(e.target as Node)) return;
+    e.preventDefault();
+    if (this.isPinching || e.timeStamp <= this.#wheelLastTimeStamp) return;
+    this.#wheelLastTimeStamp = e.timeStamp;
+    const [, , z] = normalizeWheel(e);
+    const delta = z * 0.618;
+    const point =
+      e.clientX && e.clientY
+        ? this.#getPoint(e)
+        : [this.#bounds.width / 2, this.#bounds.height / 2];
+    let newZoom = (1 - delta / 200) * this.zoom;
+    newZoom = Vec.clamp(newZoom, MIN_ZOOM, MAX_ZOOM);
+    const offset = Vec.sub(point, [0, 0]);
+    const movement = Vec.mul(offset, 1 / this.zoom - 1 / newZoom);
+    this.center = Vec.add(this.center, movement);
+    this.zoom = newZoom;
+    this.#moved();
+  };
+
   constructor(node: HTMLElement) {
     this.#node = node;
     this.#scrollingAnchor = getNearestScrollableContainer(node);
@@ -87,6 +110,7 @@ export class TouchZoom {
     document.addEventListener("gesturestart", this.#preventGesture);
     // @ts-ignore
     document.addEventListener("gesturechange", this.#preventGesture);
+    window.addEventListener("wheel", this.#handleGlobalWheel, { passive: false });
 
     this.#updateBounds();
     window.addEventListener("resize", this.#updateBoundsD);
@@ -117,8 +141,8 @@ export class TouchZoom {
           },
         },
         drag: {
-          filterTaps: true,
-          pointer: { keys: false },
+          filterTaps: false,
+          pointer: { keys: false, buttons: 4 },
         },
       },
     );
@@ -200,7 +224,7 @@ export class TouchZoom {
           : [this.#bounds.width / 2, this.#bounds.height / 2];
       const delta = z * 0.618;
 
-      let newZoom = (1 - delta / 320) * this.zoom;
+      let newZoom = (1 - delta / 200) * this.zoom;
       newZoom = Vec.clamp(newZoom, MIN_ZOOM, MAX_ZOOM);
 
       const offset = Vec.sub(point, [0, 0]);
@@ -288,6 +312,7 @@ export class TouchZoom {
       document.addEventListener("gesturechange", this.#preventGesture);
 
       window.removeEventListener("resize", this.#updateBoundsD);
+      window.removeEventListener("wheel", this.#handleGlobalWheel);
       this.#scrollingAnchor.removeEventListener("scroll", this.#updateBoundsD);
 
       this.#resizeObserver.disconnect();
@@ -299,7 +324,7 @@ export class TouchZoom {
 }
 
 // Reasonable defaults
-const MAX_ZOOM_STEP = 10;
+const MAX_ZOOM_STEP = 100;
 
 // Adapted from https://stackoverflow.com/a/13650579
 function normalizeWheel(event: WheelEvent) {

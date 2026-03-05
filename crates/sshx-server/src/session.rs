@@ -1,6 +1,6 @@
 //! Core logic for sshx sessions, independent of message transport.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ops::DerefMut;
 use std::sync::Arc;
 
@@ -9,7 +9,7 @@ use bytes::Bytes;
 use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use sshx_core::{
     proto::{server_update::ServerMessage, SequenceNumbers},
-    IdCounter, Sid, Uid,
+    IdCounter, Nid, Sid, Uid, Wid,
 };
 use tokio::sync::{broadcast, watch, Notify};
 use tokio::time::Instant;
@@ -18,7 +18,7 @@ use tokio_stream::Stream;
 use tracing::{debug, warn};
 
 use crate::utils::Shutdown;
-use crate::web::protocol::{WsServer, WsUser, WsWinsize};
+use crate::web::protocol::{WsClaudeEvent, WsComponentGraph, WsNote, WsServer, WsSourceFile, WsUser, WsWidget, WsWinsize};
 
 mod snapshot;
 
@@ -72,6 +72,34 @@ pub struct Session {
     /// Receiver end of a channel that buffers messages for the client.
     update_rx: async_channel::Receiver<ServerMessage>,
 
+    /// In-memory state for sticky notes.
+    notes: RwLock<HashMap<Nid, WsNote>>,
+
+    /// Watch channel source for the ordered list of notes.
+    notes_source: watch::Sender<Vec<(Nid, WsNote)>>,
+
+    /// Cached source file metadata sent by the CLI workspace analyzer.
+    /// The String is the workspace root basename (e.g. "my-project").
+    source_files: RwLock<(String, Vec<WsSourceFile>)>,
+
+    /// Watch channel source for source file snapshots; clients get the latest on connect.
+    source_files_source: watch::Sender<(String, Vec<WsSourceFile>)>,
+
+    /// In-memory widget state.
+    widgets: RwLock<HashMap<Wid, WsWidget>>,
+
+    /// Watch channel source for the widget list; clients get a snapshot on connect.
+    widget_source: watch::Sender<Vec<(Wid, WsWidget)>>,
+
+    /// Human-readable names for shell windows, set by browser clients.
+    shell_names: RwLock<HashMap<Sid, String>>,
+
+    /// Ring buffer of the last 200 Claude events for browser reconnect replay.
+    claude_events: Mutex<VecDeque<WsClaudeEvent>>,
+
+    /// Latest component graph sent by the CLI workspace analyzer.
+    component_graph: RwLock<Option<WsComponentGraph>>,
+
     /// Triggered from metadata events when an immediate snapshot is needed.
     sync_notify: Notify,
 
@@ -116,6 +144,15 @@ impl Session {
             broadcast: broadcast::channel(64).0,
             update_tx,
             update_rx,
+            notes: RwLock::new(HashMap::new()),
+            notes_source: watch::channel(Vec::new()).0,
+            source_files: RwLock::new((String::new(), Vec::new())),
+            source_files_source: watch::channel((String::new(), Vec::new())).0,
+            widgets: RwLock::new(HashMap::new()),
+            widget_source: watch::channel(Vec::new()).0,
+            shell_names: RwLock::new(HashMap::new()),
+            claude_events: Mutex::new(VecDeque::new()),
+            component_graph: RwLock::new(None),
             sync_notify: Notify::new(),
             shutdown: Shutdown::new(),
         }
@@ -373,6 +410,274 @@ impl Session {
         self.broadcast.send(WsServer::ShellLatency(latency)).ok();
     }
 
+    /// Receive a notification every time the set of notes is changed.
+    pub fn subscribe_notes(&self) -> impl Stream<Item = Vec<(Nid, WsNote)>> + Unpin {
+        WatchStream::new(self.notes_source.subscribe())
+    }
+
+    /// List all sticky notes in the session.
+    pub fn list_notes(&self) -> Vec<(Nid, WsNote)> {
+        self.notes
+            .read()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
+    }
+
+    /// Add a new sticky note at the given canvas position.
+    pub fn add_note(&self, id: Nid, x: i32, y: i32) -> Result<()> {
+        use std::collections::hash_map::Entry::*;
+        let note = WsNote {
+            x,
+            y,
+            text: String::new(),
+            color: "yellow".into(),
+            pinned: false,
+        };
+        match self.notes.write().entry(id) {
+            Occupied(_) => bail!("note already exists with id={id}"),
+            Vacant(v) => {
+                v.insert(note.clone());
+            }
+        }
+        self.notes_source.send_modify(|s| s.push((id, note)));
+        self.sync_now();
+        Ok(())
+    }
+
+    /// Update all fields of an existing sticky note.
+    pub fn update_note(&self, id: Nid, note: WsNote) -> Result<()> {
+        {
+            let mut notes = self.notes.write();
+            *notes.get_mut(&id).context("note not found")? = note.clone();
+        }
+        self.notes_source.send_modify(|s| {
+            if let Some(idx) = s.iter().position(|&(nid, _)| nid == id) {
+                s[idx].1 = note;
+            }
+        });
+        self.sync_now();
+        Ok(())
+    }
+
+    /// Delete a sticky note by ID.
+    pub fn delete_note(&self, id: Nid) -> Result<()> {
+        match self.notes.write().remove(&id) {
+            Some(_) => {
+                self.notes_source
+                    .send_modify(|s| s.retain(|&(nid, _)| nid != id));
+                self.sync_now();
+                Ok(())
+            }
+            None => bail!("note with id={id} does not exist"),
+        }
+    }
+
+    /// Replace the stored source file metadata and notify all WebSocket clients.
+    pub fn update_source_files(&self, root: String, files: Vec<WsSourceFile>) {
+        *self.source_files.write() = (root.clone(), files.clone());
+        self.source_files_source.send_modify(|s| *s = (root, files));
+    }
+
+    /// Return a snapshot of the current source file metadata.
+    pub fn list_source_files(&self) -> (String, Vec<WsSourceFile>) {
+        self.source_files.read().clone()
+    }
+
+    /// Store a new component graph received from the CLI workspace analyzer.
+    ///
+    /// Broadcasts `WsServer::ComponentGraph` to all connected WebSocket clients.
+    pub fn update_component_graph(&self, graph: WsComponentGraph) {
+        *self.component_graph.write() = Some(graph.clone());
+        let _ = self.broadcast.send(WsServer::ComponentGraph(graph));
+    }
+
+    /// Return the current component graph, or `None` if not yet received.
+    pub fn get_component_graph(&self) -> Option<WsComponentGraph> {
+        self.component_graph.read().clone()
+    }
+
+    /// Apply a partial metadata update to a single source file in memory.
+    ///
+    /// Updates the matching entry (by path) and notifies WebSocket clients.
+    /// Returns the updated fields as a proto message to forward to the CLI.
+    pub fn update_source_file_metadata(
+        &self,
+        path: &str,
+        update: &crate::web::protocol::WsFileMetadataUpdate,
+    ) -> sshx_core::proto::UpdateFileMetadata {
+        let mut sf_lock = self.source_files.write();
+        let mut changed = false;
+        for file in &mut sf_lock.1 {
+            if file.path == path {
+                if let Some(ref ip) = update.image_path {
+                    file.image_path = ip.clone();
+                    changed = true;
+                }
+                if let Some(ref desc) = update.description {
+                    file.description = desc.clone();
+                    changed = true;
+                }
+                if let Some(w) = update.widget_w {
+                    file.widget_w = w;
+                    changed = true;
+                }
+                if let Some(h) = update.widget_h {
+                    file.widget_h = h;
+                    changed = true;
+                }
+                break;
+            }
+        }
+        if changed {
+            let updated = sf_lock.clone();
+            drop(sf_lock);
+            self.source_files_source.send_modify(|s| *s = updated);
+        }
+        sshx_core::proto::UpdateFileMetadata {
+            path: path.to_string(),
+            image_path: update.image_path.clone().unwrap_or_default(),
+            description: update.description.clone().unwrap_or_default(),
+            widget_w: update.widget_w.unwrap_or(0),
+            widget_h: update.widget_h.unwrap_or(0),
+        }
+    }
+
+    /// Subscribe to source file updates (watch stream, delivers latest on connect).
+    pub fn subscribe_source_files(&self) -> impl Stream<Item = (String, Vec<WsSourceFile>)> + Unpin {
+        WatchStream::new(self.source_files_source.subscribe())
+    }
+
+    /// Broadcast a Claude Code event to all connected WebSocket clients,
+    /// and store it in the ring buffer for later replay to reconnecting browsers.
+    pub fn send_claude_event(&self, event: WsClaudeEvent) {
+        {
+            let mut buf = self.claude_events.lock();
+            if buf.len() >= 200 {
+                buf.pop_front();
+            }
+            buf.push_back(event.clone());
+        }
+        self.broadcast.send(WsServer::ClaudeEvent(event)).ok();
+    }
+
+    /// Return a snapshot of all buffered Claude events for replay on connect.
+    pub fn list_claude_events(&self) -> Vec<WsClaudeEvent> {
+        self.claude_events.lock().iter().cloned().collect()
+    }
+
+    /// Subscribe to canvas widget updates (watch stream, delivers latest on connect).
+    pub fn subscribe_widgets(&self) -> impl Stream<Item = Vec<(Wid, WsWidget)>> + Unpin {
+        WatchStream::new(self.widget_source.subscribe())
+    }
+
+    /// Return a snapshot of the current widget list.
+    pub fn list_widgets(&self) -> Vec<(Wid, WsWidget)> {
+        self.widgets
+            .read()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
+    }
+
+    /// Add a new canvas widget.
+    pub fn add_widget(&self, id: Wid, widget: WsWidget) -> Result<()> {
+        use std::collections::hash_map::Entry::*;
+        match self.widgets.write().entry(id) {
+            Occupied(_) => bail!("widget already exists with id={id}"),
+            Vacant(v) => {
+                v.insert(widget.clone());
+            }
+        }
+        self.widget_source.send_modify(|s| s.push((id, widget.clone())));
+        self.broadcast.send(WsServer::WidgetDiff(id, Some(widget))).ok();
+        Ok(())
+    }
+
+    /// Move an existing canvas widget to a new position.
+    pub fn move_widget(&self, id: Wid, x: i32, y: i32) -> Result<()> {
+        {
+            let mut widgets = self.widgets.write();
+            let w = widgets.get_mut(&id).context("widget not found")?;
+            w.x = x;
+            w.y = y;
+        }
+        self.widget_source.send_modify(|s| {
+            if let Some(entry) = s.iter_mut().find(|(wid, _)| *wid == id) {
+                entry.1.x = x;
+                entry.1.y = y;
+            }
+        });
+        let updated = self.widgets.read().get(&id).cloned();
+        if let Some(w) = updated {
+            self.broadcast.send(WsServer::WidgetDiff(id, Some(w))).ok();
+        }
+        Ok(())
+    }
+
+    /// Resize an existing canvas widget.
+    pub fn resize_widget(&self, id: Wid, w: u32, h: u32) -> Result<()> {
+        {
+            let mut widgets = self.widgets.write();
+            let widget = widgets.get_mut(&id).context("widget not found")?;
+            widget.w = w;
+            widget.h = h;
+        }
+        self.widget_source.send_modify(|s| {
+            if let Some(entry) = s.iter_mut().find(|(wid, _)| *wid == id) {
+                entry.1.w = w;
+                entry.1.h = h;
+            }
+        });
+        let updated = self.widgets.read().get(&id).cloned();
+        if let Some(widget) = updated {
+            self.broadcast.send(WsServer::WidgetDiff(id, Some(widget))).ok();
+        }
+        Ok(())
+    }
+
+    /// Set the collapsed state of a canvas widget and broadcast the change.
+    pub fn set_widget_collapsed(&self, id: Wid, collapsed: bool) -> Result<()> {
+        {
+            let mut widgets = self.widgets.write();
+            let widget = widgets.get_mut(&id).context("widget not found")?;
+            widget.collapsed = collapsed;
+        }
+        self.widget_source.send_modify(|s| {
+            if let Some(entry) = s.iter_mut().find(|(wid, _)| *wid == id) {
+                entry.1.collapsed = collapsed;
+            }
+        });
+        let updated = self.widgets.read().get(&id).cloned();
+        if let Some(widget) = updated {
+            self.broadcast.send(WsServer::WidgetDiff(id, Some(widget))).ok();
+        }
+        Ok(())
+    }
+
+    /// Remove a canvas widget by ID.
+    pub fn remove_widget(&self, id: Wid) -> Result<()> {
+        match self.widgets.write().remove(&id) {
+            Some(_) => {
+                self.widget_source.send_modify(|s| s.retain(|(wid, _)| *wid != id));
+                self.broadcast.send(WsServer::WidgetDiff(id, None)).ok();
+                Ok(())
+            }
+            None => bail!("widget with id={id} does not exist"),
+        }
+    }
+
+    /// Return a snapshot of all shell names.
+    pub fn list_shell_names(&self) -> Vec<(Sid, String)> {
+        self.shell_names.read().iter().map(|(k, v)| (*k, v.clone())).collect()
+    }
+
+    /// Set a human-readable name for a shell window and broadcast the change.
+    pub fn set_shell_name(&self, id: Sid, name: String) {
+        self.shell_names.write().insert(id, name.clone());
+        self.broadcast.send(WsServer::ShellNameDiff(id, name)).ok();
+    }
+
     /// Register a backend client heartbeat, refreshing the timestamp.
     pub fn access(&self) {
         *self.last_accessed.lock() = Instant::now();
@@ -381,6 +686,13 @@ impl Session {
     /// Returns the timestamp of the last backend client activity.
     pub fn last_accessed(&self) -> Instant {
         *self.last_accessed.lock()
+    }
+
+    /// Forward a describe-files request to the CLI client.
+    pub fn request_describe_files(&self, paths: Vec<String>) {
+        use sshx_core::proto::DescribeFilesRequest;
+        let msg = ServerMessage::DescribeFiles(DescribeFilesRequest { paths });
+        self.update_tx.try_send(msg).ok();
     }
 
     /// Access the sender of the client message channel for this session.

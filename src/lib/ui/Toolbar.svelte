@@ -1,24 +1,44 @@
 <script lang="ts">
   import { createEventDispatcher } from "svelte";
   import {
+    ActivityIcon,
+    FileTextIcon,
+    FolderIcon,
+    GitBranchIcon,
     MessageSquareIcon,
     PlusCircleIcon,
+    SearchIcon,
     SettingsIcon,
+    TerminalIcon,
     WifiIcon,
   } from "svelte-feather-icons";
+  import ClaudeInstanceList from "./ClaudeInstanceList.svelte";
 
   import logo from "$lib/assets/logo.svg";
 
   export let connected: boolean;
   export let hasWriteAccess: boolean | undefined;
   export let newMessages: boolean;
+  export let mode: "terminal" | "creative" = "terminal";
+  export let workspaceOpen: boolean = false;
+  export let claudeInstances: Map<string, { events: unknown[]; transcriptPath: string | null; sessionName: string | null; fileMtime: number | null }> = new Map();
+  export let claudeActive: boolean = false;
+  export let graphMode: boolean = false;
 
   const dispatch = createEventDispatcher<{
     create: void;
     chat: void;
     settings: void;
     networkInfo: void;
+    modeChange: "terminal" | "creative";
+    createNote: void;
+    toggleWorkspace: void;
+    openClaudeInstance: string;
+    openGraphView: void;
+    search: void;
   }>();
+
+  let claudeDropdownOpen = false;
 </script>
 
 <div class="panel inline-block px-3 py-2">
@@ -30,18 +50,108 @@
 
     <div class="v-divider" />
 
+    <!-- Mode tabs — icon only -->
+    <div class="flex space-x-1 mr-1">
+      <button
+        class="mode-tab"
+        class:active={mode === "terminal"}
+        title="Terminal"
+        on:click={() => dispatch("modeChange", "terminal")}
+      >
+        <TerminalIcon strokeWidth={1.5} size="15" />
+      </button>
+      <button
+        class="mode-tab"
+        class:active={mode === "creative"}
+        title="Notes"
+        on:click={() => dispatch("modeChange", "creative")}
+      >
+        <FileTextIcon strokeWidth={1.5} size="15" />
+      </button>
+    </div>
+
+    <div class="v-divider" />
+
     <div class="flex space-x-1">
+      <!-- Mode action button -->
+      {#if mode === "terminal"}
+        <button
+          class="icon-button"
+          on:click={() => dispatch("create")}
+          disabled={!connected || !hasWriteAccess}
+          title={!connected
+            ? "Not connected"
+            : hasWriteAccess === false
+            ? "No write access"
+            : "New terminal"}
+        >
+          <PlusCircleIcon strokeWidth={1.5} class="p-0.5" />
+        </button>
+      {:else if mode === "creative"}
+        <button
+          class="icon-button"
+          on:click={() => dispatch("createNote")}
+          disabled={!connected || !hasWriteAccess}
+          title={!connected
+            ? "Not connected"
+            : hasWriteAccess === false
+            ? "No write access"
+            : "Add sticky note"}
+        >
+          <PlusCircleIcon strokeWidth={1.5} class="p-0.5" />
+        </button>
+      {/if}
+
+      <!-- Workspace toggle — independent of mode -->
       <button
         class="icon-button"
-        on:click={() => dispatch("create")}
-        disabled={!connected || !hasWriteAccess}
-        title={!connected
-          ? "Not connected"
-          : hasWriteAccess === false // Only show the "No write access" title after confirming read-only mode.
-          ? "No write access"
-          : "Create new terminal"}
+        class:workspace-active={workspaceOpen}
+        on:click={() => dispatch("toggleWorkspace")}
+        disabled={!connected}
+        title={workspaceOpen ? "Close workspace" : "Open workspace"}
       >
-        <PlusCircleIcon strokeWidth={1.5} class="p-0.5" />
+        <FolderIcon strokeWidth={1.5} class="p-0.5" />
+      </button>
+
+      <!-- Claude activity dropdown toggle -->
+      <div class="relative">
+        <button
+          class="icon-button"
+          class:claude-active={claudeDropdownOpen}
+          on:click={() => (claudeDropdownOpen = !claudeDropdownOpen)}
+          disabled={!connected}
+          title={claudeDropdownOpen ? "Close Claude sessions" : "Claude sessions"}
+        >
+          <ActivityIcon strokeWidth={1.5} class="p-0.5" />
+          {#if claudeActive}
+            <div class="activity claude-dot" />
+          {/if}
+        </button>
+        {#if claudeDropdownOpen}
+          <ClaudeInstanceList
+            instances={claudeInstances}
+            on:openInstance={({ detail: sid }) => {
+              dispatch("openClaudeInstance", sid);
+              claudeDropdownOpen = false;
+            }}
+            on:close={() => (claudeDropdownOpen = false)}
+          />
+        {/if}
+      </div>
+
+      <!-- Graph mode toggle -->
+      <button
+        class="icon-button"
+        class:graph-active={graphMode}
+        on:click={() => dispatch("openGraphView")}
+        disabled={!connected}
+        title={graphMode ? "Graph mode ON — click to disable" : "Graph mode — show import connections"}
+      >
+        <GitBranchIcon strokeWidth={1.5} class="p-0.5" />
+      </button>
+
+      <button class="icon-button" on:click={() => dispatch("search")} title="Search (Ctrl+K)">
+        <SearchIcon strokeWidth={1.5} class="p-0.5" />
       </button>
       <button class="icon-button" on:click={() => dispatch("chat")}>
         <MessageSquareIcon strokeWidth={1.5} class="p-0.5" />
@@ -74,7 +184,31 @@
     @apply disabled:opacity-50 disabled:bg-transparent;
   }
 
+  .workspace-active {
+    @apply bg-indigo-800 text-indigo-200 hover:bg-indigo-700;
+  }
+
+  .claude-active {
+    @apply bg-emerald-900 text-emerald-200 hover:bg-emerald-800;
+  }
+
+  .graph-active {
+    @apply bg-cyan-900 text-cyan-200 hover:bg-cyan-800;
+  }
+
   .activity {
     @apply absolute top-1 right-0.5 text-xs p-[4.5px] bg-red-500 rounded-full;
+  }
+
+  .claude-dot {
+    @apply bg-emerald-400 animate-pulse;
+  }
+
+  .mode-tab {
+    @apply flex items-center px-2 py-1 rounded-md text-zinc-400 hover:bg-zinc-700 transition-colors;
+  }
+
+  .mode-tab.active {
+    @apply bg-zinc-700 text-white border-b-2 border-indigo-400;
   }
 </style>

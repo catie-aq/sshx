@@ -6,7 +6,9 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod analyze;
 pub mod controller;
 pub mod encrypt;
 pub mod runner;
 pub mod terminal;
+pub mod workspace;

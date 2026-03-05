@@ -50,11 +50,35 @@ impl Display for Uid {
     }
 }
 
+/// Unique identifier for a sticky note within a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Nid(pub u32);
+
+impl Display for Nid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "nid#{}", self.0)
+    }
+}
+
+/// Unique identifier for a canvas widget within a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Wid(pub u32);
+
+impl Display for Wid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "wid#{}", self.0)
+    }
+}
+
 /// A counter for generating unique identifiers.
 #[derive(Debug)]
 pub struct IdCounter {
     next_sid: AtomicU32,
     next_uid: AtomicU32,
+    next_nid: AtomicU32,
+    next_wid: AtomicU32,
 }
 
 impl Default for IdCounter {
@@ -62,6 +86,8 @@ impl Default for IdCounter {
         Self {
             next_sid: AtomicU32::new(1),
             next_uid: AtomicU32::new(1),
+            next_nid: AtomicU32::new(1),
+            next_wid: AtomicU32::new(1),
         }
     }
 }
@@ -75,6 +101,16 @@ impl IdCounter {
     /// Returns the next unique user ID.
     pub fn next_uid(&self) -> Uid {
         Uid(self.next_uid.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Returns the next unique note ID.
+    pub fn next_nid(&self) -> Nid {
+        Nid(self.next_nid.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Returns the next unique widget ID.
+    pub fn next_wid(&self) -> Wid {
+        Wid(self.next_wid.fetch_add(1, Ordering::Relaxed))
     }
 
     /// Return the current internal values of the counter.

@@ -224,6 +224,68 @@ See `mprocs.yaml` for exact dev commands and `Tailscale.md` for deployment notes
 
 ---
 
+## UI Design Principles
+
+The sshx frontend is built around a dark, dense, functional aesthetic — closer to a professional IDE than a consumer app. These principles govern all UI decisions.
+
+### Visual language
+
+- **Dark zinc palette** — `zinc-900` backgrounds, `zinc-800` panels, `zinc-700` borders, `zinc-300` text. Avoid pure black or pure white.
+- **Opacity as depth** — idle panels sit at `opacity-90`; focused/hovered panels go `opacity-100`. Gives the canvas a layered feel without heavy shadows.
+- **Rounded corners** — `rounded-lg` on all floating panels (terminals, file cards, file tree). `rounded-xl` for the global `.panel` utility class.
+- **`border border-zinc-700`** on every floating element — thin, subtle boundary that separates layers without shouting.
+
+### Window chrome
+
+All movable/floating elements share the same title-bar structure (mirroring macOS window chrome):
+
+```
+┌─────────────────────────────────────────┐
+│  ● ● ●  │   centered title   │  (info)  │
+│ circle  │   text-sm zinc-300  │  flex-1  │
+│ buttons │   flex-grow-[4]     │  spacer  │
+└─────────────────────────────────────────┘
+```
+
+- **CircleButtons** (red/yellow/green) on the left — red = close, yellow = collapse/shrink, green = expand. Implemented via `CircleButton` + `CircleButtons` components.
+- **Centered title** — `w-0 flex-grow-[4]` so it expands into the middle; `overflow-hidden whitespace-nowrap text-ellipsis` for long paths.
+- **Right slot** — symmetric `flex-1` spacer, optionally holds secondary info (file count, etc.).
+- The entire title bar is the drag handle (`on:mousedown → dispatch("startMove")`).
+
+This applies to: `XTerm.svelte`, `FileCard.svelte`, `FileTreePanel.svelte`.
+Exception: `StickyNote.svelte` uses a colored post-it aesthetic by design.
+
+### Fixed UI (HUD)
+
+Panels that are **not** on the canvas (chat, Claude activity) live in a single bottom-right column container, anchored `absolute bottom-4 right-4`:
+
+- **Chat** sits above, `flex-1 min-h-0` — expands to fill available space.
+- **Claude Activity** sits below, `flex-shrink-0` — fixed height with its own collapse button.
+- Container is `pointer-events-none`; each panel inside is `pointer-events-auto`.
+- Max height: `calc(100vh - 80px)` to stay clear of the toolbar.
+
+### Canvas interaction
+
+- **Ctrl/Meta + scroll** = zoom (fast: ~44% per mouse-wheel notch, smooth on trackpad).
+- **Scroll** = pan vertically; **Shift + scroll** = pan horizontally (non-macOS).
+- **Alt + scroll** = zoom (same path as ctrl).
+- Zoom range: `MIN_ZOOM` to `MAX_ZOOM` (clamped), centered on the cursor position.
+
+### Typography
+
+- UI text: system font via Tailwind defaults.
+- Terminal / code: `Fira Code VF` (variable font), `font-size: 14px`, loaded via `FontFaceObserver`.
+- File paths and identifiers in panels: `font-mono`.
+
+### Tone
+
+- Panels are **small and dense** — pack information, avoid padding waste.
+- Avoid decorative icons; prefer text labels or simple SVG primitives.
+- Animations: `transition-opacity duration-200` for show/hide; no bouncy or playful effects.
+- Error/status colors: `emerald-400` (ok), `red-400` (error), `indigo-400` (AI/Claude actions), `yellow-300` (tools/directories).
+
+---
+
 ## Security Notes
 
 - Encryption key is in the **URL fragment** — never logged or sent to server
@@ -232,3 +294,17 @@ See `mprocs.yaml` for exact dev commands and `Tailscale.md` for deployment notes
 - Use **constant-time comparison** for all security-sensitive checks (see `socket.rs`)
 - Write passwords are bcrypt-hashed server-side
 - Token signing uses **HMAC-SHA256** with a per-server secret
+
+---
+
+## Claude Activity Feed — Implementation Notes
+
+The activity feed pipelines Claude Code JSONL transcripts to the browser in real time.
+
+**Path encoding**: Claude Code stores transcripts under `~/.claude/projects/<encoded-cwd>/`, where the CWD is encoded by replacing `/` with `-` — including the leading slash, so paths always start with `-` (e.g. `-home-user-repos-sshx`). Do **not** strip the leading dash.
+
+**Retry loop**: `run_claude_tracker` (`workspace.rs`) loops forever — retries every 5 s when no transcript exists, and re-discovers after `tail_transcript` returns. This handles the case where sshx starts before Claude.
+
+**History replay on connect**: `tail_transcript` reads and sends the last 200 lines of an existing transcript before entering tail mode, so the browser sees current-session history immediately.
+
+**Server-side ring buffer**: `Session::claude_events` (`session.rs`) holds the last 200 `WsClaudeEvent` items. `socket.rs` replays them during the initial WebSocket handshake so reconnecting browsers see recent history without a new CLI connection.

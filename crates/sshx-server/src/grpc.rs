@@ -17,6 +17,7 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{error, info, warn};
 
 use crate::session::{Metadata, Session};
+use crate::web::protocol::{WsClaudeEvent, WsComponentGraph, WsSourceFile};
 use crate::ServerState;
 
 /// Interval for synchronizing sequence numbers with the client.
@@ -208,6 +209,37 @@ async fn handle_update(tx: &ServerTx, session: &Session, update: ClientUpdate) -
         Some(ClientMessage::ClosedShell(id)) => {
             if let Err(err) = session.close_shell(Sid(id)) {
                 return send_err(tx, format!("close shell: {:?}", err)).await;
+            }
+        }
+        Some(ClientMessage::SourceMetadata(bytes)) => {
+            #[derive(serde::Deserialize)]
+            struct Payload {
+                root: Option<String>,
+                files: Vec<WsSourceFile>,
+            }
+            match zstd::decode_all(&*bytes)
+                .map_err(|e| format!("zstd decode: {e}"))
+                .and_then(|raw| serde_json::from_slice::<Payload>(&raw)
+                    .map_err(|e| format!("json parse: {e}")))
+            {
+                Ok(p) => session.update_source_files(p.root.unwrap_or_default(), p.files),
+                Err(e) => warn!("failed to decode source metadata: {e}"),
+            }
+        }
+        Some(ClientMessage::ClaudeEvent(bytes)) => {
+            match serde_json::from_slice::<WsClaudeEvent>(&bytes) {
+                Ok(event) => session.send_claude_event(event),
+                Err(e) => warn!("failed to decode claude event: {e}"),
+            }
+        }
+        Some(ClientMessage::ComponentGraph(bytes)) => {
+            match zstd::decode_all(&*bytes)
+                .map_err(|e| format!("zstd decode: {e}"))
+                .and_then(|raw| serde_json::from_slice::<WsComponentGraph>(&raw)
+                    .map_err(|e| format!("json parse: {e}")))
+            {
+                Ok(graph) => session.update_component_graph(graph),
+                Err(e) => warn!("failed to decode component graph: {e}"),
             }
         }
         Some(ClientMessage::Pong(ts)) => {

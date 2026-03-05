@@ -52,7 +52,7 @@
 </script>
 
 <div
-  class="panel flex flex-col h-full max-h-[480px]"
+  class="panel flex flex-col h-full"
   in:fade|local={{ duration: 100 }}
   out:fade|local={{ duration: 75 }}
 >

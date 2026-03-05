@@ -18,6 +18,7 @@ use tracing::{debug, error, warn};
 
 use crate::encrypt::Encrypt;
 use crate::runner::{Runner, ShellData};
+use crate::workspace::{spawn_describe_files, spawn_update_file_metadata};
 
 /// Interval for sending empty heartbeat messages to the server.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
@@ -238,6 +239,18 @@ impl Controller {
                     // Echo back the timestamp, for stateless latency measurement.
                     send_msg(&tx, ClientMessage::Pong(ts)).await?;
                 }
+                ServerMessage::DescribeFiles(req) => {
+                    spawn_describe_files(req.paths);
+                }
+                ServerMessage::UpdateFileMetadata(meta) => {
+                    spawn_update_file_metadata(
+                        meta.path,
+                        meta.image_path,
+                        meta.description,
+                        meta.widget_w,
+                        meta.widget_h,
+                    );
+                }
                 ServerMessage::Error(err) => {
                     error!(?err, "error received from server");
                 }
@@ -271,6 +284,11 @@ impl Controller {
             }
             output_tx.send(ClientMessage::ClosedShell(id.0)).await.ok();
         });
+    }
+
+    /// Returns a sender that can inject `ClientMessage`s into the gRPC stream.
+    pub fn output_sender(&self) -> mpsc::Sender<ClientMessage> {
+        self.output_tx.clone()
     }
 
     /// Terminate this session gracefully.

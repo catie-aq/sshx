@@ -1,16 +1,32 @@
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use ansi_term::Color::{Cyan, Fixed, Green};
+use ansi_term::Color::{Cyan, Fixed, Green, White, Yellow};
 use anyhow::Result;
-use clap::Parser;
-use sshx::{controller::Controller, runner::Runner, terminal::get_default_shell};
+use clap::{Parser, Subcommand};
+use sshx::{
+    analyze::{AnalysisDb, ANALYSIS_FILENAME},
+    controller::Controller,
+    runner::Runner,
+    terminal::get_default_shell,
+    workspace::{spawn_claude_pid_tracker, spawn_claude_tracker, spawn_source_analyzer},
+};
 use tokio::signal;
 use tracing::error;
+
+// ---------------------------------------------------------------------------
+// CLI definition
+// ---------------------------------------------------------------------------
 
 /// A secure web-based, collaborative terminal.
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
+    #[clap(subcommand)]
+    command: Option<Commands>,
+
+    // ---- Session options (used when no subcommand is given) ---------------
+
     /// Address of the remote sshx server.
     #[clap(long, default_value = "https://sshx.io", env = "SSHX_SERVER")]
     server: String,
@@ -19,7 +35,7 @@ struct Args {
     #[clap(long)]
     shell: Option<String>,
 
-    /// Quiet mode, only prints the URL to stdout.
+    /// Quiet mode — only prints the URL to stdout.
     #[clap(short, long)]
     quiet: bool,
 
@@ -27,11 +43,165 @@ struct Args {
     #[clap(long)]
     name: Option<String>,
 
-    /// Enable read-only access mode - generates separate URLs for viewers and
-    /// editors.
+    /// Enable read-only access mode — generates separate URLs for viewers
+    /// and editors.
     #[clap(long)]
     enable_readers: bool,
+
+    /// Workspace root to stream to the browser (default: current directory).
+    /// Reads `.sshx-analysis.json` if present; falls back to an inline scan.
+    #[clap(long)]
+    workspace: Option<PathBuf>,
+
+    /// Disable workspace file streaming entirely.
+    #[clap(long)]
+    no_workspace: bool,
+
+    /// Disable Claude Code JSONL event tracking.
+    #[clap(long)]
+    no_claude_tracking: bool,
 }
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Analyze the workspace and write source metadata to
+    /// `.sshx-analysis.json`.
+    ///
+    /// This command scans every source file (Rust, TypeScript, Svelte, …),
+    /// extracts import/export graphs, line counts, and file timestamps, then
+    /// writes a structured JSON database to the workspace root.
+    ///
+    /// The file is read by `sshx` at session start and streamed to the browser
+    /// so the FileTree and FileCard widgets are populated.  Re-running this
+    /// command while a session is live will push an update to all connected
+    /// browsers automatically.
+    ///
+    /// AI descriptions are left empty by default; they can be filled in
+    /// on-demand from the browser UI.
+    Analyze {
+        /// Root directory to analyse (default: current directory).
+        #[clap(long, value_name = "PATH")]
+        workspace: Option<PathBuf>,
+
+        /// Output file path.
+        /// Defaults to `<workspace>/.sshx-analysis.json`.
+        #[clap(long, value_name = "FILE")]
+        output: Option<PathBuf>,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Main entry point
+// ---------------------------------------------------------------------------
+
+fn main() -> ExitCode {
+    let args = Args::parse();
+
+    let default_level = if args.quiet { "error" } else { "info" };
+
+    tracing_subscriber::fmt()
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or(default_level.into()))
+        .with_writer(std::io::stderr)
+        .init();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+
+    match runtime.block_on(run(args)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            error!("{err:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run(args: Args) -> Result<()> {
+    match args.command {
+        Some(Commands::Analyze { workspace, output }) => {
+            run_analyze(workspace, output).await
+        }
+        None => run_session(args).await,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `sshx analyze`
+// ---------------------------------------------------------------------------
+
+async fn run_analyze(workspace: Option<PathBuf>, output: Option<PathBuf>) -> Result<()> {
+    let root = match workspace {
+        Some(p) => p,
+        None => std::env::current_dir()?,
+    };
+    let root = root.canonicalize().unwrap_or(root);
+    let out_path = output.unwrap_or_else(|| root.join(ANALYSIS_FILENAME));
+
+    println!(
+        "\n  {} Scanning {}…\n",
+        Green.bold().paint("sshx analyze"),
+        Fixed(8).paint(root.display().to_string()),
+    );
+
+    // Build fresh analysis.
+    let fresh = AnalysisDb::build(&root)?;
+
+    // Merge with any existing file to preserve previously-written descriptions.
+    let db = match AnalysisDb::load(&out_path)? {
+        Some(existing) => fresh.merge_with_existing(&existing),
+        None => fresh,
+    };
+
+    // Write.
+    db.save(&out_path)?;
+
+    // Summary table.
+    let total = db.file_count();
+    let described = db.described_count();
+
+    // Group by kind.
+    let mut by_kind: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for entry in db.files.values() {
+        *by_kind.entry(entry.kind.as_str()).or_default() += 1;
+    }
+    let mut by_kind: Vec<(&str, usize)> = by_kind.into_iter().collect();
+    by_kind.sort_by_key(|(k, _)| *k);
+
+    println!(
+        "  {}  {}",
+        Green.paint("✓"),
+        White.bold().paint(format!("{total} files indexed")),
+    );
+    for (kind, count) in &by_kind {
+        println!("      {:<12} {}", Fixed(8).paint(*kind), count);
+    }
+    println!(
+        "\n  {}  descriptions: {}/{total}",
+        Yellow.paint("ℹ"),
+        described,
+    );
+    println!(
+        "\n  {}  {}\n",
+        Green.paint("→"),
+        Cyan.underline().paint(out_path.display().to_string()),
+    );
+
+    if described < total {
+        println!(
+            "  {} To add AI descriptions, open the Workspace panel in the browser\n  {} and click \"Describe\" on individual files or the whole project.\n",
+            Fixed(8).paint("tip"),
+            Fixed(8).paint("   "),
+        );
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `sshx` (default session)
+// ---------------------------------------------------------------------------
 
 fn print_greeting(shell: &str, controller: &Controller) {
     let version_str = match option_env!("CARGO_PKG_VERSION") {
@@ -71,8 +241,7 @@ fn print_greeting(shell: &str, controller: &Controller) {
     }
 }
 
-#[tokio::main]
-async fn start(args: Args) -> Result<()> {
+async fn run_session(args: Args) -> Result<()> {
     let shell = match args.shell {
         Some(shell) => shell,
         None => get_default_shell().await,
@@ -81,7 +250,6 @@ async fn start(args: Args) -> Result<()> {
     let name = args.name.unwrap_or_else(|| {
         let mut name = whoami::username();
         if let Ok(host) = whoami::fallible::hostname() {
-            // Trim domain information like .lan or .local
             let host = host.split('.').next().unwrap_or(&host);
             name += "@";
             name += host;
@@ -90,7 +258,23 @@ async fn start(args: Args) -> Result<()> {
     });
 
     let runner = Runner::Shell(shell.clone());
-    let mut controller = Controller::new(&args.server, &name, runner, args.enable_readers).await?;
+    let mut controller =
+        Controller::new(&args.server, &name, runner, args.enable_readers).await?;
+
+    // Spawn workspace intelligence tasks.
+    if !args.no_workspace {
+        let workspace_root = args
+            .workspace
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        spawn_source_analyzer(workspace_root, controller.output_sender());
+    }
+    if !args.no_claude_tracking {
+        spawn_claude_tracker(controller.output_sender());
+        spawn_claude_pid_tracker(controller.output_sender());
+    }
+
     if args.quiet {
         if let Some(write_url) = controller.write_url() {
             println!("{}", write_url);
@@ -110,23 +294,4 @@ async fn start(args: Args) -> Result<()> {
     controller.close().await?;
 
     Ok(())
-}
-
-fn main() -> ExitCode {
-    let args = Args::parse();
-
-    let default_level = if args.quiet { "error" } else { "info" };
-
-    tracing_subscriber::fmt()
-        .with_env_filter(std::env::var("RUST_LOG").unwrap_or(default_level.into()))
-        .with_writer(std::io::stderr)
-        .init();
-
-    match start(args) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            error!("{err:?}");
-            ExitCode::FAILURE
-        }
-    }
 }

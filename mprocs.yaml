@@ -7,6 +7,7 @@ procs:
       --secret dev-secret
       --redis-url redis://localhost:12601
       --listen 0.0.0.0
+      --host homa-server2.gaur-toad.ts.net
   web:
     shell: npm run dev
     stop: SIGKILL  # TODO: Why is this necessary?
