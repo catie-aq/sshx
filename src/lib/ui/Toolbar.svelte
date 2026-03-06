@@ -2,10 +2,12 @@
   import { createEventDispatcher } from "svelte";
   import {
     ActivityIcon,
+    CastIcon,
     FileTextIcon,
     FolderIcon,
     GitBranchIcon,
     MessageSquareIcon,
+    MonitorIcon,
     PlusCircleIcon,
     SearchIcon,
     SettingsIcon,
@@ -21,9 +23,13 @@
   export let newMessages: boolean;
   export let mode: "terminal" | "creative" = "terminal";
   export let workspaceOpen: boolean = false;
-  export let claudeInstances: Map<string, { events: unknown[]; transcriptPath: string | null; sessionName: string | null; fileMtime: number | null }> = new Map();
+  export let claudeInstances: Map<string, { events: unknown[]; transcriptPath: string | null; sessionName: string | null; widgetName: string | null; fileMtime: number | null; closed: boolean }> = new Map();
   export let claudeActive: boolean = false;
   export let graphMode: boolean = false;
+
+  export let isSharing: boolean = false;
+  /** Number of video streams dismissed (hidden) by the user. */
+  export let hiddenStreamCount: number = 0;
 
   const dispatch = createEventDispatcher<{
     create: void;
@@ -34,8 +40,12 @@
     createNote: void;
     toggleWorkspace: void;
     openClaudeInstance: string;
+    resumeClaudeInTerminal: string;
     openGraphView: void;
     search: void;
+    startScreenShare: void;
+    stopScreenShare: void;
+    showStreams: void;
   }>();
 
   let claudeDropdownOpen = false;
@@ -134,10 +144,37 @@
               dispatch("openClaudeInstance", sid);
               claudeDropdownOpen = false;
             }}
+            on:resumeInTerminal={({ detail: sid }) => {
+              dispatch("resumeClaudeInTerminal", sid);
+              claudeDropdownOpen = false;
+            }}
             on:close={() => (claudeDropdownOpen = false)}
           />
         {/if}
       </div>
+
+      <!-- Screen share toggle -->
+      <button
+        class="icon-button"
+        class:share-active={isSharing}
+        on:click={() => isSharing ? dispatch("stopScreenShare") : dispatch("startScreenShare")}
+        disabled={!connected || hasWriteAccess === false}
+        title={isSharing ? "Stop screen share" : "Share your screen"}
+      >
+        <CastIcon strokeWidth={1.5} class="p-0.5" />
+      </button>
+
+      <!-- Restore hidden streams (visible only when streams are dismissed) -->
+      {#if hiddenStreamCount > 0}
+        <button
+          class="icon-button streams-hidden"
+          on:click={() => dispatch("showStreams")}
+          title="{hiddenStreamCount} hidden stream{hiddenStreamCount > 1 ? 's' : ''} — click to show"
+        >
+          <MonitorIcon strokeWidth={1.5} class="p-0.5" />
+          <span class="stream-badge">{hiddenStreamCount}</span>
+        </button>
+      {/if}
 
       <!-- Graph mode toggle -->
       <button
@@ -194,6 +231,19 @@
 
   .graph-active {
     @apply bg-cyan-900 text-cyan-200 hover:bg-cyan-800;
+  }
+
+  .share-active {
+    @apply bg-red-900 text-red-200 hover:bg-red-800;
+  }
+
+  .streams-hidden {
+    @apply bg-zinc-700 text-zinc-200 hover:bg-indigo-700;
+  }
+
+  .stream-badge {
+    @apply absolute -top-1 -right-1 text-[10px] leading-none px-[4px] py-[2px]
+           bg-indigo-500 text-white rounded-full pointer-events-none;
   }
 
   .activity {

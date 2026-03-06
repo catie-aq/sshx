@@ -22,10 +22,15 @@ export default defineConfig({
     },
     proxy: {
       "/api": {
-        target: "http://homa-server2.gaur-toad.ts.net:8051",
+        target: "http://localhost:8051",
         changeOrigin: true,
         ws: true,
         secure: false, // Allow proxy to HTTP backend
+      },
+      "/uploads": {
+        target: "http://localhost:8051",
+        changeOrigin: true,
+        secure: false,
       },
     },
   },

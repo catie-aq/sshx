@@ -5,14 +5,15 @@ use std::time::Duration;
 
 use anyhow::{ensure, Result};
 use axum::serve::ListenerExt;
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use http::StatusCode;
 use sshx::encrypt::Encrypt;
 use sshx_core::proto::sshx_service_client::SshxServiceClient;
-use sshx_core::{Sid, Uid};
+use sshx_core::{Sid, Uid, Vid};
 use sshx_server::{
     state::ServerState,
-    web::protocol::{WsClient, WsServer, WsUser, WsWinsize},
+    web::protocol::{WsClient, WsIceCandidate, WsIceServer, WsServer, WsUser, WsVideoStream, WsWinsize},
     Server,
 };
 use tokio::net::{TcpListener, TcpStream};
@@ -93,6 +94,15 @@ pub struct ClientSocket {
     pub data: HashMap<Sid, String>,
     pub messages: Vec<(Uid, String, String)>,
     pub errors: Vec<String>,
+
+    // Video / screen share fields
+    pub video_streams: HashMap<Vid, WsVideoStream>,
+    pub browser_frames: Vec<(Vid, u64, Bytes, bool)>,
+    pub rtc_offers: Vec<(Vid, Uid, String)>,
+    pub rtc_answers: Vec<(Vid, Uid, Uid, String)>,
+    pub rtc_ice_candidates: Vec<(Vid, Uid, Uid, WsIceCandidate)>,
+    pub ice_servers: Vec<WsIceServer>,
+    pub browser_control: HashMap<Vid, Option<Uid>>,
 }
 
 impl ClientSocket {
@@ -111,6 +121,13 @@ impl ClientSocket {
             data: HashMap::new(),
             messages: Vec::new(),
             errors: Vec::new(),
+            video_streams: HashMap::new(),
+            browser_frames: Vec::new(),
+            rtc_offers: Vec::new(),
+            rtc_answers: Vec::new(),
+            rtc_ice_candidates: Vec::new(),
+            ice_servers: Vec::new(),
+            browser_control: HashMap::new(),
         };
         this.authenticate().await;
         Ok(this)
@@ -190,6 +207,35 @@ impl ClientSocket {
                     WsServer::ShellLatency(_) => {}
                     WsServer::Pong(_) => {}
                     WsServer::Error(err) => self.errors.push(err),
+                    WsServer::VideoStreams(list) => {
+                        self.video_streams = list.into_iter().collect();
+                    }
+                    WsServer::VideoStreamDiff(vid, maybe_stream) => {
+                        if let Some(stream) = maybe_stream {
+                            self.video_streams.insert(vid, stream);
+                        } else {
+                            self.video_streams.remove(&vid);
+                        }
+                    }
+                    WsServer::BrowserFrame(vid, ts, data, kf) => {
+                        self.browser_frames.push((vid, ts, data, kf));
+                    }
+                    WsServer::RtcOffer(vid, uid, sdp) => {
+                        self.rtc_offers.push((vid, uid, sdp));
+                    }
+                    WsServer::RtcAnswer(vid, uid, sender_uid, sdp) => {
+                        self.rtc_answers.push((vid, uid, sender_uid, sdp));
+                    }
+                    WsServer::RtcIce(vid, uid, sender_uid, candidate) => {
+                        self.rtc_ice_candidates.push((vid, uid, sender_uid, candidate));
+                    }
+                    WsServer::IceServers(servers) => {
+                        self.ice_servers = servers;
+                    }
+                    WsServer::BrowserControlStatus(vid, uid) => {
+                        self.browser_control.insert(vid, uid);
+                    }
+                    _ => {} // ignore other message types in tests
                 }
             }
         };

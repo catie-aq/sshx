@@ -18,7 +18,7 @@ use tracing::{debug, error, warn};
 
 use crate::encrypt::Encrypt;
 use crate::runner::{Runner, ShellData};
-use crate::workspace::{spawn_describe_files, spawn_update_file_metadata};
+use crate::workspace::{spawn_describe_files, spawn_update_file_metadata, spawn_update_widget_name};
 
 /// Interval for sending empty heartbeat messages to the server.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
@@ -124,6 +124,11 @@ impl Controller {
     /// Returns the name of the session.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Returns the HMAC token for this session (used to authenticate sshx-browser).
+    pub fn token(&self) -> &str {
+        &self.token
     }
 
     /// Returns the URL of the session.
@@ -251,8 +256,14 @@ impl Controller {
                         meta.widget_h,
                     );
                 }
+                ServerMessage::SetWidgetName(req) => {
+                    spawn_update_widget_name(req.instance_id, req.name);
+                }
                 ServerMessage::Error(err) => {
                     error!(?err, "error received from server");
+                }
+                ServerMessage::BrowserInput(_) => {
+                    // sshx-browser handles this, not the sshx CLI client.
                 }
             }
         }

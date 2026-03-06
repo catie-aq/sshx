@@ -13,7 +13,7 @@
   import { Encrypt } from "./encrypt";
   import { createLock } from "./lock";
   import { Srocket } from "./srocket";
-  import type { WsClient, WsClaudeEvent, WsComponentGraph, WsFileMetadataUpdate, WsNote, WsServer, WsSourceFile, WsUser, WsWidget, WsWinsize } from "./protocol";
+  import type { WsClient, WsClaudeEvent, WsComponentGraph, WsFileMetadataUpdate, WsIceCandidate, WsNote, WsServer, WsSourceFile, WsUser, WsVideoStream, WsWidget, WsWinsize } from "./protocol";
   import { makeToast } from "./toast";
   import Chat, { type ChatMessage } from "./ui/Chat.svelte";
   import ChooseName from "./ui/ChooseName.svelte";
@@ -32,6 +32,8 @@
   import GraphOverlay from "./ui/GraphOverlay.svelte";
   import LibraryCard from "./ui/LibraryCard.svelte";
   import CommandPalette from "./ui/CommandPalette.svelte";
+  import ScreenShareWidget from "./ui/ScreenShareWidget.svelte";
+  import ImageWidget from "./ui/ImageWidget.svelte";
   import type { SearchItem } from "./protocol";
   import { buildRuntimeEdges } from "./runtimeGraph";
   import { slide } from "./action/slide";
@@ -162,14 +164,20 @@
   // Per-Claude-session activity state
   type ClaudeInstance = {
     sessionId: string;
-    events: WsClaudeEvent[]; // rolling last 50
+    events: WsClaudeEvent[];
     transcriptPath: string | null;
     /** Name derived from the first user_message in this session. */
     sessionName: string | null;
+    /** User-set custom name (from widget.name, propagated from widgetDiff). */
+    widgetName: string | null;
     /** UNIX timestamp (seconds) of the transcript file's last modification. */
     fileMtime: number | null;
+    /** True once a session_end event has been received (/exit command). */
+    closed: boolean;
   };
   let claudeInstances = new Map<string, ClaudeInstance>();
+  // Track sessions for which we already auto-opened a panel (prevents re-opening on reconnect).
+  const autoOpenedClaudeSessions = new Set<string>();
 
   // PID of the running claude process, null if not found.
   let claudePid: string | null = null;
@@ -239,15 +247,53 @@
 
   let resizingWidget: { wid: number; startW: number; startH: number; startX: number; startY: number } | null = null;
 
+  /** Last known mouse position in canvas (infinite grid) coordinates. Updated on every mousemove. */
+  let lastCanvasMousePos: [number, number] | null = null;
+
   // Pending input for the next newly-created terminal (used by "Open in Claude Code").
   let pendingShellInput: string | null = null;
   let shellIdsBeforeCreate = new Set<number>();
+
+  // FileCard deduplication: highlighted widget ID and its auto-clear timer.
+  let highlightedWidgetId: number | null = null;
+  let highlightClearTimer: ReturnType<typeof setTimeout> | null = null;
 
   let chatMessages: ChatMessage[] = [];
   let newMessages = false;
 
   let serverLatencies: number[] = [];
   let shellLatencies: number[] = [];
+
+  // --- Video stream / screen share state ---
+  /** All active video streams announced by the server (includes x/y/w/h). */
+  let videoStreams = new Map<number, WsVideoStream>();
+  /** Streams dismissed by the user (red-X closed locally, still alive on server). */
+  // hiddenStreams is no longer used — screen shares are closed globally, not hidden.
+  /** WebRTC peer connections: viewer-side (vid → RTCPeerConnection). */
+  let peerConnections = new Map<number, RTCPeerConnection>();
+  /** Local screen share stream (non-null when we are sharing). */
+  let localStream: MediaStream | null = null;
+  /** The vid assigned by the server for our screen share (null = not sharing). */
+  let screenShareVid: number | null = null;
+  /** Browser stream controller status: vid → uid of controller (null = no one). */
+  let browserControllers = new Map<number, number | null>();
+  /** ICE candidate queues while remote description is not yet set. */
+  const iceCandidateQueues = new Map<number, RTCIceCandidateInit[]>();
+  /** References to ScreenShareWidget instances, for routing VP8 frames. */
+  let screenShareWidgetRefs: Record<number, { feedFrame: (d: Uint8Array, t: number, k: boolean) => void } | undefined> = {};
+  /** Streams we have already sent watchStream for (avoid duplicate requests). */
+  const watchedStreams = new Set<number>();
+
+  function autoWatch(vid: number, stream: import("./protocol").WsVideoStream) {
+    if (watchedStreams.has(vid)) return;
+    const isOurShare = stream.ownerUid === userId && !stream.isBrowser;
+    if (!isOurShare) {
+      watchedStreams.add(vid);
+      srocket?.send({ watchStream: vid });
+    }
+  }
+
+  $: isSharing = screenShareVid !== null;
 
   onMount(async () => {
     // The page hash sets the end-to-end encryption key.
@@ -358,11 +404,43 @@
             // Synthetic marker event — store transcript path on the instance keyed
             // by the session UUID embedded in the filename (= ev.sessionId).
             const sid = ev.sessionId || ev.content; // fallback: use path as key
-            let inst = claudeInstances.get(sid) ?? { sessionId: sid, events: [], transcriptPath: null, sessionName: null, fileMtime: null };
+            let inst = claudeInstances.get(sid) ?? { sessionId: sid, events: [], transcriptPath: null, sessionName: null, widgetName: null, fileMtime: null, closed: false };
             inst.transcriptPath = ev.content;
             if (ev.fileMtime != null) inst.fileMtime = ev.fileMtime;
             claudeInstances.set(sid, inst);
             claudeInstances = claudeInstances;
+            // Auto-open the Claude activity panel for this session if we haven't
+            // done so already in this browser session (prevents re-opening on reconnect).
+            if (hasWriteAccess && !autoOpenedClaudeSessions.has(sid)) {
+              autoOpenedClaudeSessions.add(sid);
+              const alreadyOpen = [...widgets.values()].some(
+                (w) => w.kind.type === "claudeFeed" && (w.kind as any).instanceId === sid,
+              );
+              if (!alreadyOpen) {
+                const [ox, oy] = getConstantOffset();
+                const x = Math.round(center[0] + window.innerWidth / 2 / zoom - ox);
+                const y = Math.round(center[1] + window.innerHeight / 2 / zoom - oy);
+                srocket?.send({ openClaudeFeed: [x, y, sid] });
+              }
+            }
+          } else if (ev.kind === "session_end") {
+            // Claude /exit command — mark session closed and auto-close its widget.
+            const sid = ev.sessionId;
+            const inst = claudeInstances.get(sid);
+            if (inst) {
+              inst.closed = true;
+              claudeInstances.set(sid, inst);
+              claudeInstances = claudeInstances;
+            }
+            if (hasWriteAccess) {
+              // Close the ClaudeFeed widget for this session, if one is open.
+              for (const [wid, w] of widgets) {
+                if (w.kind.type === "claudeFeed" && (w.kind as any).instanceId === sid) {
+                  srocket?.send({ closeWidget: wid });
+                  break;
+                }
+              }
+            }
           } else if (ev.kind === "claude_pid") {
             // PID status update from the background tracker.
             if (ev.tool === "dead") {
@@ -374,12 +452,12 @@
           } else {
             // Route event to its per-session instance (or "" fallback).
             const sid = ev.sessionId;
-            let inst = claudeInstances.get(sid) ?? { sessionId: sid, events: [], transcriptPath: null, sessionName: null, fileMtime: null };
+            let inst = claudeInstances.get(sid) ?? { sessionId: sid, events: [], transcriptPath: null, sessionName: null, widgetName: null, fileMtime: null, closed: false };
             // Derive session name from first user_message.
             if (inst.sessionName === null && ev.kind === "user_message" && ev.content.trim()) {
               inst.sessionName = ev.content.trim().replace(/\s+/g, " ").slice(0, 60);
             }
-            inst.events = [...inst.events.slice(-49), ev];
+            inst.events = [...inst.events.slice(-199), ev];
             claudeInstances.set(sid, inst);
             claudeInstances = claudeInstances;
             // Auto-open: if enabled and this is a tool_use with a readable file path,
@@ -405,11 +483,20 @@
           widgets = new Map(message.widgets);
         } else if (message.widgetDiff) {
           const [wid, widget] = message.widgetDiff;
-          console.log("[widgetDiff] wid=", wid, "widget=", widget);
           if (widget === null) {
             widgets.delete(wid);
           } else {
             widgets.set(wid, widget);
+            // Propagate custom widget name into claudeInstances so the dropdown shows it.
+            if (widget.kind.type === "claudeFeed" && widget.kind.instanceId) {
+              const iid = widget.kind.instanceId;
+              const inst = claudeInstances.get(iid);
+              if (inst) {
+                inst.widgetName = widget.name ?? null;
+                claudeInstances.set(iid, inst);
+                claudeInstances = claudeInstances;
+              }
+            }
           }
           widgets = widgets; // trigger reactivity
         } else if (message.shellNames) {
@@ -418,6 +505,98 @@
           const [sid, name] = message.shellNameDiff;
           shellNames.set(sid, name);
           shellNames = shellNames;
+        } else if (message.videoStreams) {
+          videoStreams = new Map(message.videoStreams);
+          // Auto-watch all streams that are not ours.
+          for (const [vid, stream] of message.videoStreams) autoWatch(vid, stream);
+        } else if (message.videoStreamDiff) {
+          const [vid, stream] = message.videoStreamDiff;
+          if (stream === null) {
+            videoStreams.delete(vid);
+            // Stream removed — nothing to do locally.
+            watchedStreams.delete(vid);
+            // Clean up any peer connection for this vid.
+            const pc = peerConnections.get(vid);
+            if (pc) { pc.close(); peerConnections.delete(vid); }
+            if (screenShareVid === vid) {
+              screenShareVid = null;
+              localStream?.getTracks().forEach((t) => t.stop());
+              localStream = null;
+            }
+          } else {
+            videoStreams.set(vid, stream);
+            // If we just started sharing, record our vid.
+            if (stream.ownerUid === userId && !stream.isBrowser && screenShareVid === null && localStream !== null) {
+              screenShareVid = vid;
+            }
+            autoWatch(vid, stream);
+          }
+          videoStreams = videoStreams;
+        } else if (message.rtcOffer) {
+          const [vid, targetUid, sdp] = message.rtcOffer;
+          if (targetUid !== userId) return; // not for us
+          if (sdp.startsWith("watch:")) {
+            // We are the sharer; a viewer wants to watch. Create an offer for them.
+            const viewerUid = parseInt(sdp.slice(6));
+            handleNewViewer(vid, viewerUid);
+          } else {
+            // We are a viewer receiving an SDP offer from the sharer.
+            handleRtcOffer(vid, sdp);
+          }
+        } else if (message.rtcAnswer) {
+          const [vid, targetUid, senderUid, sdp] = message.rtcAnswer;
+          if (targetUid !== userId) return;
+          // We are the sharer; the viewer (senderUid) sent back an answer.
+          // Use compound key to find the correct PC for this specific viewer.
+          const compoundKey = vid * 1000000 + senderUid;
+          const pc = peerConnections.get(compoundKey) ?? peerConnections.get(vid);
+          if (pc) {
+            (async () => {
+              await pc.setRemoteDescription({ type: "answer", sdp });
+              // Flush queued ICE candidates for this specific viewer.
+              const queued = iceCandidateQueues.get(compoundKey) ?? iceCandidateQueues.get(vid) ?? [];
+              for (const c of queued) await pc.addIceCandidate(c);
+              iceCandidateQueues.delete(compoundKey);
+              iceCandidateQueues.delete(vid);
+            })();
+          }
+        } else if (message.rtcIce) {
+          const [vid, targetUid, senderUid, candidate] = message.rtcIce;
+          if (targetUid !== userId) return;
+          // Use compound key for sharer-side lookups (one PC per viewer).
+          const compoundKey = vid * 1000000 + senderUid;
+          const pc = peerConnections.get(compoundKey) ?? peerConnections.get(vid);
+          if (pc) {
+            const iceCandidate = { candidate: candidate.candidate, sdpMid: candidate.sdpMid, sdpMLineIndex: candidate.sdpMlineIndex };
+            if (pc.remoteDescription) {
+              pc.addIceCandidate(iceCandidate);
+            } else {
+              const queueKey = peerConnections.has(compoundKey) ? compoundKey : vid;
+              const q = iceCandidateQueues.get(queueKey) ?? [];
+              q.push(iceCandidate);
+              iceCandidateQueues.set(queueKey, q);
+            }
+          }
+        } else if (message.browserControlStatus) {
+          const [vid, controller] = message.browserControlStatus;
+          browserControllers.set(vid, controller ?? null);
+          browserControllers = browserControllers;
+        } else if (message.browserFrame) {
+          const [vid, timestamp, data, keyframe] = message.browserFrame;
+          screenShareWidgetRefs[vid]?.feedFrame(data, Number(timestamp), keyframe);
+        } else if (message.iceServers) {
+          iceServers = message.iceServers.map((s) => ({
+            urls: s.urls,
+            ...(s.username !== undefined && { username: s.username }),
+            ...(s.credential !== undefined && { credential: s.credential }),
+          }));
+        } else if (message.highlightComponent) {
+          // Forward to any connected overlay tabs (e.g. Next.js dev server).
+          try {
+            const bc = new BroadcastChannel("sshx-overlay");
+            bc.postMessage({ type: "HighlightComponent", name: message.highlightComponent });
+            bc.close();
+          } catch (_) {}
         } else if (message.error) {
           console.warn("Server error: " + message.error);
         }
@@ -437,6 +616,17 @@
         users = [];
         serverLatencies = [];
         shellLatencies = [];
+        // Close all peer connections on disconnect.
+        for (const pc of peerConnections.values()) pc.close();
+        peerConnections.clear();
+        peerConnections = peerConnections;
+        videoStreams.clear();
+        videoStreams = videoStreams;
+        if (localStream) {
+          localStream.getTracks().forEach((t) => t.stop());
+          localStream = null;
+        }
+        screenShareVid = null;
       },
 
       onClose(event) {
@@ -540,6 +730,24 @@
   // Live runtime graph: links between terminals, file cards, and Claude sessions.
   $: runtimeGraph = buildRuntimeEdges(claudeInstances, widgets, shells);
 
+  /**
+   * If a FileCard for `path` already exists on the canvas, navigate to it,
+   * highlight it for 2 s, and return true.  Returns false if it doesn't exist.
+   */
+  function focusExistingFileCard(path: string): boolean {
+    for (const [wid, w] of widgets) {
+      if (w.kind.type === "fileCard" && w.kind.path === path) {
+        const targetZoom = Math.min(zoom, INITIAL_ZOOM);
+        touchZoom.moveTo([w.x, w.y], targetZoom);
+        highlightedWidgetId = wid;
+        if (highlightClearTimer !== null) clearTimeout(highlightClearTimer);
+        highlightClearTimer = setTimeout(() => { highlightedWidgetId = null; }, 2000);
+        return true;
+      }
+    }
+    return false;
+  }
+
   async function handleCreate() {
     if (hasWriteAccess === false) {
       makeToast({
@@ -630,6 +838,156 @@
     }
   }
 
+  // --- Screen share / WebRTC helpers ---
+
+  let iceServers: RTCIceServer[] = [{ urls: "stun:stun.l.google.com:19302" }];
+
+  function createPeerConnection(vid: number): RTCPeerConnection {
+    const pc = new RTCPeerConnection({ iceServers });
+    pc.onicecandidate = ({ candidate }) => {
+      if (candidate) {
+        // We broadcast ICE to the owner; they relay back to all interested viewers.
+        // For simplicity, target uid 0 is a placeholder — the server relays to all.
+        const stream = videoStreams.get(vid);
+        const ownerUid = stream?.ownerUid ?? 0;
+        const iceMsg: WsIceCandidate = {
+          candidate: candidate.candidate,
+          sdpMid: candidate.sdpMid ?? null,
+          sdpMlineIndex: candidate.sdpMLineIndex ?? null,
+        };
+        srocket?.send({ sendRtcIce: [vid, ownerUid, iceMsg] });
+      }
+    };
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === "failed" || pc.connectionState === "closed") {
+        peerConnections.delete(vid);
+        peerConnections = peerConnections;
+      }
+    };
+    return pc;
+  }
+
+  /** Called when we are the sharer and a new viewer wants to watch. */
+  async function handleNewViewer(vid: number, viewerUid: number) {
+    if (!localStream) return;
+    const pc = createPeerConnection(vid);
+    // Store under compound key for multi-viewer tracking, AND under plain vid
+    // so that the rtcAnswer handler (which only knows targetUid = our own uid) can find it.
+    peerConnections.set(vid * 1000000 + viewerUid, pc);
+    peerConnections.set(vid, pc);
+    // Sharer's ICE should target the viewer.
+    pc.onicecandidate = ({ candidate }) => {
+      if (candidate) {
+        srocket?.send({ sendRtcIce: [vid, viewerUid, {
+          candidate: candidate.candidate,
+          sdpMid: candidate.sdpMid ?? null,
+          sdpMlineIndex: candidate.sdpMLineIndex ?? null,
+        }]});
+      }
+    };
+    for (const track of localStream.getTracks()) {
+      pc.addTrack(track, localStream);
+    }
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    srocket?.send({ sendRtcOffer: [vid, viewerUid, offer.sdp!] });
+    peerConnections = peerConnections;
+  }
+
+  /** Called when we are a viewer and receive an SDP offer from the sharer. */
+  async function handleRtcOffer(vid: number, sdp: string) {
+    const pc = createPeerConnection(vid);
+    peerConnections.set(vid, pc);
+    pc.onicecandidate = ({ candidate }) => {
+      if (candidate) {
+        const stream = videoStreams.get(vid);
+        const ownerUid = stream?.ownerUid ?? 0;
+        srocket?.send({ sendRtcIce: [vid, ownerUid, {
+          candidate: candidate.candidate,
+          sdpMid: candidate.sdpMid ?? null,
+          sdpMlineIndex: candidate.sdpMLineIndex ?? null,
+        }]});
+      }
+    };
+    await pc.setRemoteDescription({ type: "offer", sdp });
+    // Flush queued ICE candidates.
+    const queued = iceCandidateQueues.get(vid) ?? [];
+    for (const c of queued) await pc.addIceCandidate(c);
+    iceCandidateQueues.delete(vid);
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    const stream = videoStreams.get(vid);
+    const ownerUid = stream?.ownerUid ?? 0;
+    srocket?.send({ sendRtcAnswer: [vid, ownerUid, answer.sdp!] });
+    peerConnections = peerConnections;
+  }
+
+  /** Start sharing the current user's screen. */
+  async function handleStartScreenShare() {
+    if (!hasWriteAccess) {
+      makeToast({ kind: "info", message: "You are in read-only mode." });
+      return;
+    }
+    try {
+      localStream = await (navigator.mediaDevices as any).getDisplayMedia({
+        video: { frameRate: 30 },
+        audio: true,
+      });
+      // Notify server — it will reply with videoStreamDiff containing our vid.
+      srocket?.send({ startScreenShare: true });
+      // Stop sharing if user dismisses the browser prompt.
+      localStream.getVideoTracks()[0]?.addEventListener("ended", () => {
+        handleStopScreenShare();
+      });
+    } catch {
+      makeToast({ kind: "error", message: "Screen share cancelled or not supported." });
+    }
+  }
+
+  /** Stop sharing our screen. */
+  function handleStopScreenShare() {
+    localStream?.getTracks().forEach((t) => t.stop());
+    localStream = null;
+    if (screenShareVid !== null) {
+      srocket?.send({ stopScreenShare: true });
+      screenShareVid = null;
+    }
+  }
+
+  // --- Video widget drag handling ---
+  let movingVideo: number | null = null;
+  let movingVideoOrigin = [0, 0];
+  let movingVideoPos: { x: number; y: number } | null = null;
+
+  let resizingVideo: { vid: number; startW: number; startH: number; startX: number; startY: number } | null = null;
+
+  function startVideoResize(e: PointerEvent, vid: number, stream: WsVideoStream) {
+    resizingVideo = { vid, startW: stream.w, startH: stream.h, startX: e.clientX, startY: e.clientY };
+    window.addEventListener("pointermove", onVideoResizeMove);
+    window.addEventListener("pointerup", onVideoResizeEnd, { once: true });
+  }
+
+  function onVideoResizeMove(e: PointerEvent) {
+    if (!resizingVideo) return;
+    const dw = (e.clientX - resizingVideo.startX) / zoom;
+    const dh = (e.clientY - resizingVideo.startY) / zoom;
+    const w = Math.max(200, resizingVideo.startW + dw);
+    const h = Math.max(150, resizingVideo.startH + dh);
+    const s = videoStreams.get(resizingVideo.vid);
+    if (s) { s.w = Math.round(w); s.h = Math.round(h); videoStreams = videoStreams; }
+  }
+
+  function onVideoResizeEnd(e: PointerEvent) {
+    if (!resizingVideo) return;
+    const dw = (e.clientX - resizingVideo.startX) / zoom;
+    const dh = (e.clientY - resizingVideo.startY) / zoom;
+    const w = Math.max(200, Math.round(resizingVideo.startW + dw));
+    const h = Math.max(150, Math.round(resizingVideo.startH + dh));
+    srocket?.send({ resizeVideoStream: [resizingVideo.vid, w, h] });
+    resizingVideo = null;
+    window.removeEventListener("pointermove", onVideoResizeMove);
+  }
+
   // Stupid hack to preserve input focus when terminals are reordered.
   // See: https://github.com/sveltejs/svelte/issues/3973
   let activeElement: Element | null = null;
@@ -657,6 +1015,14 @@
     }, 80);
 
     function handleMouse(event: MouseEvent) {
+      if (movingVideo !== null && movingVideoPos) {
+        const [x, y] = normalizePosition(event);
+        movingVideoPos = {
+          x: Math.round(x - movingVideoOrigin[0]),
+          y: Math.round(y - movingVideoOrigin[1]),
+        };
+      }
+
       if (movingLibrary !== null && movingLibraryPos) {
         const [x, y] = normalizePosition(event);
         movingLibraryPos = {
@@ -720,10 +1086,17 @@
         }
       }
 
-      sendCursor({ setCursor: normalizePosition(event) });
+      lastCanvasMousePos = normalizePosition(event);
+      sendCursor({ setCursor: lastCanvasMousePos });
     }
 
     function handleMouseEnd(event: MouseEvent) {
+      if (movingVideo !== null && movingVideoPos) {
+        srocket?.send({ moveVideoStream: [movingVideo, movingVideoPos.x, movingVideoPos.y] });
+        movingVideo = null;
+        movingVideoPos = null;
+      }
+
       if (movingLibrary !== null && movingLibraryPos) {
         const existing = libraryPanels.get(movingLibrary);
         libraryPanels.set(movingLibrary, { ...movingLibraryPos, w: existing?.w ?? 240, h: existing?.h ?? 220 });
@@ -777,6 +1150,51 @@
     };
   });
 
+  // Paste handler: paste an image from the clipboard onto the canvas.
+  // If the mouse is over a FileCard, fill that card's image. Otherwise create a new ImageWidget.
+  onMount(() => {
+    async function handlePaste(e: ClipboardEvent) {
+      if (!hasWriteAccess) return;
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      for (const item of Array.from(items)) {
+        if (item.type.startsWith("image/")) {
+          e.preventDefault();
+          const blob = item.getAsFile();
+          if (!blob) return;
+          const formData = new FormData();
+          formData.append("file", blob);
+          try {
+            const res = await fetch(`/api/s/${id}/upload`, { method: "POST", body: formData });
+            if (!res.ok) return;
+            const { url } = await res.json() as { url: string };
+            // Check if mouse is over a FileCard (hit-test in canvas coords)
+            const [mx, my] = lastCanvasMousePos ?? [0, 0];
+            let hoveredFilePath: string | null = null;
+            for (const [, w] of widgets) {
+              if (w.kind.type !== "fileCard") continue;
+              if (mx >= w.x && mx <= w.x + w.w && my >= w.y && my <= w.y + w.h) {
+                hoveredFilePath = w.kind.path;
+                break;
+              }
+            }
+            if (hoveredFilePath) {
+              srocket?.send({ updateFileMetadata: [hoveredFilePath, { imagePath: url }] });
+            } else {
+              const [cx, cy] = lastCanvasMousePos ?? [0, 0];
+              srocket?.send({ createImageWidget: [cx, cy, url, blob.name || ""] });
+            }
+          } catch (err) {
+            console.error("Image paste upload failed:", err);
+          }
+          break;
+        }
+      }
+    }
+    document.addEventListener("paste", handlePaste);
+    return () => document.removeEventListener("paste", handlePaste);
+  });
+
   let focused: number[] = [];
   $: setFocus(focused);
 
@@ -803,6 +1221,8 @@
       {mode}
       {workspaceOpen}
       {graphMode}
+      {isSharing}
+      hiddenStreamCount={0}
       claudeInstances={claudeInstances}
       {claudeActive}
       on:create={handleCreate}
@@ -814,6 +1234,9 @@
         const x = Math.round(center[0] + window.innerWidth / 2 / zoom - ox);
         const y = Math.round(center[1] + window.innerHeight / 2 / zoom - oy);
         srocket?.send({ openClaudeFeed: [x, y, sid] });
+      }}
+      on:resumeClaudeInTerminal={({ detail: sid }) => {
+        handleCreateWithInput(`claude --resume ${sid}`);
       }}
       on:openGraphView={handleOpenGraphView}
       on:modeChange={({ detail }) => (mode = detail)}
@@ -828,6 +1251,9 @@
         showNetworkInfo = !showNetworkInfo;
       }}
       on:search={() => (commandPaletteOpen = true)}
+      on:startScreenShare={handleStartScreenShare}
+      on:stopScreenShare={handleStopScreenShare}
+      on:showStreams={() => {}}
     />
 
     {#if showNetworkInfo}
@@ -1055,8 +1481,10 @@
             on:delete={() => srocket?.send({ closeWidget: wid })}
             on:dragFile={({ detail: { path, event } }) => {
               if (!hasWriteAccess) return;
-              const [x, y] = normalizePosition(event);
-              srocket?.send({ openFileCard: [Math.round(x + 30), Math.round(y), path] });
+              if (!focusExistingFileCard(path)) {
+                const [x, y] = normalizePosition(event);
+                srocket?.send({ openFileCard: [Math.round(x + 30), Math.round(y), path] });
+              }
             }}
             on:collapse={({ detail: newCollapsed }) => {
               console.log("[collapse] fileTree wid=", wid, "collapsed=", newCollapsed);
@@ -1070,6 +1498,7 @@
             {widget}
             collapsed={widget.collapsed ?? false}
             {graphMode}
+            highlighted={highlightedWidgetId === wid}
             sessionId={id}
             file={sourceFiles.get(widget.kind.path) ?? null}
             canWrite={hasWriteAccess ?? false}
@@ -1083,7 +1512,9 @@
             on:delete={() => srocket?.send({ closeWidget: wid })}
             on:openFile={({ detail: path }) => {
               if (!hasWriteAccess) return;
-              srocket?.send({ openFileCard: [widget.x + 30, widget.y + 30, path] });
+              if (!focusExistingFileCard(path)) {
+                srocket?.send({ openFileCard: [widget.x + 30, widget.y + 30, path] });
+              }
             }}
             on:describe={({ detail: path }) => srocket?.send({ describeFiles: [path] })}
             on:updateMetadata={({ detail: { path, update } }) => {
@@ -1144,12 +1575,7 @@
             }}
             on:delete={() => srocket?.send({ closeWidget: wid })}
             on:navigateTo={({ detail: path }) => {
-              const w = [...widgets.values()].find(
-                (w) => w.kind.type === "fileCard" && w.kind.path === path,
-              );
-              if (w) {
-                touchZoom.moveTo([w.x, w.y], zoom);
-              } else if (hasWriteAccess) {
+              if (!focusExistingFileCard(path) && hasWriteAccess) {
                 const [ox, oy] = getConstantOffset();
                 const x = Math.round(center[0] + window.innerWidth / 2 / zoom - ox);
                 const y = Math.round(center[1] + window.innerHeight / 2 / zoom - oy);
@@ -1168,6 +1594,7 @@
             {autoOpenCards}
             sessionId={widget.kind.instanceId}
             sessionName={inst?.sessionName ?? null}
+            name={widget.name ?? null}
             {claudePid}
             {claudePidDead}
             on:startMove={({ detail: event }) => {
@@ -1183,13 +1610,12 @@
               widgets = widgets;
               srocket?.send({ setWidgetCollapsed: [wid, newCollapsed] });
             }}
+            on:rename={({ detail: newName }) => {
+              if (!hasWriteAccess) return;
+              srocket?.send({ setWidgetName: [wid, newName] });
+            }}
             on:highlightFile={({ detail: path }) => {
-              const w = [...widgets.values()].find(
-                (w) => w.kind.type === "fileCard" && w.kind.path === path,
-              );
-              if (w) {
-                touchZoom.moveTo([w.x, w.y], zoom);
-              } else if (hasWriteAccess) {
+              if (!focusExistingFileCard(path) && hasWriteAccess) {
                 const [ox, oy] = getConstantOffset();
                 const x = Math.round(center[0] + window.innerWidth / 2 / zoom - ox);
                 const y = Math.round(center[1] + window.innerHeight / 2 / zoom - oy);
@@ -1197,6 +1623,19 @@
               }
             }}
             on:toggleAutoOpen={() => { autoOpenCards = !autoOpenCards; }}
+          />
+        {:else if widget.kind.type === "image"}
+          <ImageWidget
+            {widget}
+            canWrite={hasWriteAccess ?? false}
+            on:startMove={({ detail: event }) => {
+              if (!hasWriteAccess) return;
+              const [x, y] = normalizePosition(event);
+              movingWidget = wid;
+              movingWidgetOrigin = [x - widget.x, y - widget.y];
+              movingWidgetPos = { x: widget.x, y: widget.y };
+            }}
+            on:delete={() => srocket?.send({ closeWidget: wid })}
           />
         {/if}
         {#if hasWriteAccess}
@@ -1224,6 +1663,53 @@
       >
         <LiveCursor {user} />
       </div>
+    {/each}
+
+    {#each [...videoStreams] as [vid, stream] (vid)}
+      {@const pos = vid === movingVideo && movingVideoPos ? movingVideoPos : stream}
+      <div
+        class="absolute"
+        style:left={OFFSET_LEFT_CSS}
+        style:top={OFFSET_TOP_CSS}
+        style:transform-origin={OFFSET_TRANSFORM_ORIGIN_CSS}
+        transition:fade|local
+        use:slide={{ x: pos.x, y: pos.y, center, zoom, immediate: vid === movingVideo }}
+        on:pointerdown|stopPropagation={() => {}}
+      >
+        <ScreenShareWidget
+          bind:this={screenShareWidgetRefs[vid]}
+          {vid}
+          {stream}
+          w={stream.w}
+          h={stream.h}
+          {userId}
+          peerConnection={peerConnections.get(vid) ?? null}
+          localStream={screenShareVid === vid ? localStream : null}
+          hasControl={browserControllers.get(vid) === userId}
+          canWrite={hasWriteAccess ?? false}
+          on:startMove={({ detail: event }) => {
+            const [x, y] = normalizePosition(event);
+            movingVideo = vid;
+            movingVideoOrigin = [x - stream.x, y - stream.y];
+            movingVideoPos = { x: stream.x, y: stream.y };
+          }}
+          on:close={() => {
+            if (stream.ownerUid === userId && !stream.isBrowser) {
+              handleStopScreenShare();
+            } else {
+              // Close the stream for everyone.
+              const pc = peerConnections.get(vid);
+              if (pc) { pc.close(); peerConnections.delete(vid); peerConnections = peerConnections; }
+              srocket?.send({ closeStream: vid });
+            }
+          }}
+            on:stopShare={handleStopScreenShare}
+            on:startResize={({ detail: e }) => startVideoResize(e, vid, stream)}
+            on:requestControl={() => srocket?.send({ requestBrowserControl: vid })}
+            on:releaseControl={() => srocket?.send({ releaseBrowserControl: vid })}
+            on:browserInput={({ detail }) => srocket?.send({ browserInput: [vid, detail] })}
+          />
+        </div>
     {/each}
 
     {#each [...libraryPanels] as [libName, panel] (libName)}
@@ -1257,7 +1743,9 @@
           }}
           on:openFile={({ detail: path }) => {
             if (!hasWriteAccess) return;
-            srocket?.send({ openFileCard: [pos.x + 260, pos.y, path] });
+            if (!focusExistingFileCard(path)) {
+              srocket?.send({ openFileCard: [pos.x + 260, pos.y, path] });
+            }
           }}
         />
       </div>

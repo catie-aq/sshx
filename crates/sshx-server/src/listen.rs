@@ -4,12 +4,15 @@ use anyhow::Result;
 use axum::body::Body;
 use axum::serve::Listener;
 use http::{header::CONTENT_TYPE, Request};
-use sshx_core::proto::{sshx_service_server::SshxServiceServer, FILE_DESCRIPTOR_SET};
+use sshx_core::proto::{
+    browser_service_server::BrowserServiceServer, sshx_service_server::SshxServiceServer,
+    FILE_DESCRIPTOR_SET,
+};
 use tonic::service::Routes as TonicRoutes;
 use tower::{make::Shared, steer::Steer, ServiceExt};
 use tower_http::trace::TraceLayer;
 
-use crate::{grpc::GrpcServer, web, ServerState};
+use crate::{grpc::{BrowserGrpcServer, GrpcServer}, web, ServerState};
 
 /// Bind and listen from the application, with a state and termination signal.
 ///
@@ -31,7 +34,8 @@ where
         .boxed_clone();
 
     let grpc_service = TonicRoutes::default()
-        .add_service(SshxServiceServer::new(GrpcServer::new(state)))
+        .add_service(SshxServiceServer::new(GrpcServer::new(state.clone())))
+        .add_service(BrowserServiceServer::new(BrowserGrpcServer::new(state)))
         .add_service(
             tonic_reflection::server::Builder::configure()
                 .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)

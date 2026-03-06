@@ -75,6 +75,7 @@ message ClientUpdate {
     bytes component_graph = 12;  // zstd-compressed JSON WsComponentGraph.
     fixed64 pong = 14;           // Response for latency measurement.
     string error = 15;
+    bytes widget_names = 16;     // JSON-encoded map<instanceId, name> on startup.
   }
 }
 
@@ -92,6 +93,18 @@ message UpdateFileMetadata {
   uint32 widget_h = 5;     // Widget height in pixels (0 = no change).
 }
 
+// Request the CLI to persist a user-set name for a canvas widget.
+message SetWidgetNameRequest {
+  string instance_id = 1; // Stable instance ID (Claude session UUID).
+  string name = 2;        // User-set name (empty = remove).
+}
+
+// An input event (mouse/keyboard) to be injected into an offscreen browser display.
+message BrowserInputEvent {
+  uint32 vid = 1;  // Video stream ID.
+  string json = 2; // JSON-encoded mouse or keyboard event.
+}
+
 // Bidirectional streaming update from the server.
 message ServerUpdate {
   oneof server_message {
@@ -104,6 +117,8 @@ message ServerUpdate {
     UpdateFileMetadata update_file_metadata = 13;      // Persist updated file metadata.
     fixed64 ping = 14;                                 // Request a pong, with the timestamp.
     string error = 15;
+    BrowserInputEvent browser_input = 16;              // Forward input to offscreen browser.
+    SetWidgetNameRequest set_widget_name = 17;         // Persist a widget name.
   }
 }
 
@@ -115,6 +130,69 @@ message CloseRequest {
 
 // Server response to closing a session.
 message CloseResponse {}
+
+// Service for the offscreen browser binary (sshx-browser) to stream video to a session.
+service BrowserService {
+  // Announce the browser stream and get a session token.
+  rpc Join(BrowserJoinRequest) returns (BrowserJoinResponse);
+
+  // Bidirectional stream: browser sends frames/audio, server sends input commands.
+  rpc Stream(stream BrowserUpdate) returns (stream BrowserCommand);
+
+  // Leave and close the video stream.
+  rpc Leave(BrowserLeaveRequest) returns (BrowserLeaveResponse);
+}
+
+// Request to join a session with an offscreen browser stream.
+message BrowserJoinRequest {
+  string session_name = 1; // Name of the session to join.
+  string token = 2;        // HMAC token to authenticate as the session owner.
+  uint32 width = 3;        // Display width in pixels.
+  uint32 height = 4;       // Display height in pixels.
+}
+
+// Response with the assigned video stream ID.
+message BrowserJoinResponse {
+  uint32 vid = 1; // Assigned video stream ID.
+}
+
+// A single encoded video frame (VP8).
+message VideoFrame {
+  uint32 vid = 1;      // Video stream ID.
+  bytes data = 2;      // Encoded VP8 frame data.
+  uint64 timestamp = 3; // Presentation timestamp (microseconds).
+  bool keyframe = 4;   // Whether this is a keyframe.
+}
+
+// Update sent from sshx-browser to the server during streaming.
+message BrowserUpdate {
+  oneof browser_message {
+    VideoFrame frame = 1; // Encoded video frame.
+    fixed64 pong = 2;     // Response to a ping.
+  }
+}
+
+// A mouse/keyboard input event forwarded to the offscreen browser.
+message InputEvent {
+  string json = 1; // JSON-encoded mouse or keyboard event.
+}
+
+// Command sent from the server to sshx-browser.
+message BrowserCommand {
+  oneof browser_command {
+    InputEvent input = 1; // Mouse/keyboard input to inject.
+    fixed64 ping = 2;     // Request a pong, with the timestamp.
+  }
+}
+
+// Request to gracefully stop a browser stream.
+message BrowserLeaveRequest {
+  uint32 vid = 1;   // Video stream ID to close.
+  string token = 2; // HMAC token.
+}
+
+// Server response to a browser leave.
+message BrowserLeaveResponse {}
 
 // Snapshot of a session, used to restore state for persistence across servers.
 message SerializedSession {

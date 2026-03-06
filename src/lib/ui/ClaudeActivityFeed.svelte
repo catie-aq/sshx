@@ -17,6 +17,8 @@
   export let sessionId: string | null = null;
   /** Human-readable name derived from the first user prompt, if available. */
   export let sessionName: string | null = null;
+  /** User-set custom name (overrides sessionName in title bar). */
+  export let name: string | null = null;
 
   const dispatch = createEventDispatcher<{
     startMove: MouseEvent;
@@ -24,7 +26,11 @@
     collapse: boolean;
     highlightFile: string;
     toggleAutoOpen: void;
+    rename: string;
   }>();
+
+  let localName = name ?? "";
+  $: localName = name ?? "";
 
   let displayMode: "compact" | "full" = "full";
   let expandedEvents = new Set<number>();
@@ -177,9 +183,11 @@
       </div>
 
       <!-- Center: title -->
-      <div class="w-0 flex-grow-[4] text-sm text-zinc-300 text-center font-medium overflow-hidden whitespace-nowrap text-ellipsis" title={sessionName ?? sessionId ?? undefined}>
-        {#if sessionName}
-          ✦ <span class="text-zinc-200">{sessionName}</span>
+      <div class="w-0 flex-grow-[4] text-sm text-zinc-300 text-center font-medium overflow-hidden whitespace-nowrap text-ellipsis" title={name ?? sessionName ?? sessionId ?? undefined}>
+        {#if name}
+          ✦ <span class="text-zinc-200">{name}</span>
+        {:else if sessionName}
+          ✦ <span class="text-zinc-400">{sessionName}</span>
         {:else if sessionId}
           ✦ Claude <span class="font-mono text-xs text-indigo-300">{sessionId.slice(0, 8)}</span>
         {:else}
@@ -206,21 +214,45 @@
     </div>
   </div>
 
-  <!-- Collapsed summary: recent events as pills -->
+  <!-- Collapsed summary: recent events as compact rows with timestamps -->
   {#if collapsed && events.length > 0}
-    {@const recent = events.slice(-10)}
-    <div class="px-2 py-1.5 flex flex-wrap gap-1 bg-zinc-900 rounded-b-lg">
-      {#each recent as ev}
-        {#if ev.kind === "tool_use" && ev.tool}
-          <span class="text-[10px] px-1.5 py-0.5 rounded bg-zinc-800 text-yellow-300 font-mono leading-none">{ev.tool}</span>
-        {:else if ev.kind === "assistant_message"}
-          <span class="text-[10px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-400 leading-none">Response</span>
-        {/if}
+    <div class="overflow-y-auto bg-zinc-900 rounded-b-lg" style:max-height="160px"
+      on:wheel={(e) => { if (!e.ctrlKey && !e.metaKey && !e.altKey) e.stopPropagation(); }}>
+      {#each events.slice(-20) as ev}
+        {@const label = getActionLabel(ev)}
+        {@const time = ev.timestamp ? new Date(ev.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : ""}
+        <div class="flex items-center gap-1.5 px-2 py-0.5 border-b border-zinc-800 text-xs">
+          <span class="flex-shrink-0 {kindColor[ev.kind] ?? 'text-zinc-400'}">
+            {kindIcon[ev.kind] ?? "·"}
+          </span>
+          <span class="font-mono {kindColor[ev.kind] ?? 'text-zinc-400'} flex-shrink-0">{label}</span>
+          {#if time}
+            <span class="ml-auto text-zinc-600 text-[10px] flex-shrink-0">{time}</span>
+          {/if}
+        </div>
       {/each}
     </div>
   {/if}
 
   {#if !collapsed}
+    <!-- Rename input -->
+    <div class="flex px-3 py-0.5 border-b border-zinc-800 bg-zinc-900">
+      <input
+        class="flex-1 bg-transparent outline-none truncate"
+        class:text-sm={!!localName}
+        class:font-medium={!!localName}
+        class:text-zinc-300={!!localName}
+        class:text-xs={!localName}
+        class:text-zinc-600={!localName}
+        class:italic={!localName}
+        placeholder="Nommer cette session…"
+        bind:value={localName}
+        on:input={() => dispatch("rename", localName)}
+        on:mousedown|stopPropagation
+        on:pointerdown|stopPropagation
+      />
+    </div>
+
     <!-- Toggle row -->
     <div class="flex items-center gap-1.5 px-2 py-1 border-b border-zinc-800 bg-zinc-900">
       <button
@@ -268,6 +300,7 @@
     <div
       class="overflow-y-auto flex-1 bg-zinc-900 rounded-b text-xs"
       bind:this={listEl}
+      on:wheel={(e) => { if (!e.ctrlKey && !e.metaKey && !e.altKey) e.stopPropagation(); }}
     >
       {#if events.length === 0}
         <div class="px-3 py-4 text-zinc-500 text-center">No Claude activity yet.</div>

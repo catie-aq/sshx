@@ -30,7 +30,7 @@ pub mod utils;
 pub mod web;
 
 /// Options when constructing the application server.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct ServerOptions {
     /// Secret used for signing tokens. Set randomly if not provided.
@@ -44,6 +44,25 @@ pub struct ServerOptions {
 
     /// Hostname of this server, if running multiple servers.
     pub host: Option<String>,
+
+    /// STUN server URLs sent to clients for WebRTC ICE negotiation.
+    pub stun_servers: Vec<String>,
+
+    /// TURN server configuration: each entry is `(url, username, credential)`.
+    pub turn_servers: Vec<(String, String, String)>,
+}
+
+impl Default for ServerOptions {
+    fn default() -> Self {
+        Self {
+            secret: None,
+            override_origin: None,
+            redis_url: None,
+            host: None,
+            stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
+            turn_servers: vec![],
+        }
+    }
 }
 
 /// Stateful object that manages the sshx server, with graceful termination.

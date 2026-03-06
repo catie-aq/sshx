@@ -35,6 +35,9 @@
     "xterm-addon-webgl": "^0.16.0"
   },
   "devDependencies": {
+    "@grpc/grpc-js": "^1.14.3",
+    "@grpc/proto-loader": "^0.8.0",
+    "@playwright/test": "^1.58.2",
     "@sveltejs/adapter-static": "^2.0.3",
     "@sveltejs/kit": "^1.24.1",
     "@types/lodash-es": "^4.17.9",

@@ -36,6 +36,14 @@ struct Args {
     /// Hostname of this server, if running multiple servers.
     #[clap(long)]
     host: Option<String>,
+
+    /// STUN server URLs (comma-separated). Default: stun:stun.l.google.com:19302
+    #[clap(long, value_delimiter = ',')]
+    stun_servers: Vec<String>,
+
+    /// TURN server in the form url,username,credential (repeatable).
+    #[clap(long)]
+    turn_server: Vec<String>,
 }
 
 #[tokio::main]
@@ -50,6 +58,20 @@ async fn start(args: Args) -> Result<()> {
     options.override_origin = args.override_origin;
     options.redis_url = args.redis_url;
     options.host = args.host;
+    if !args.stun_servers.is_empty() {
+        options.stun_servers = args.stun_servers;
+    }
+    options.turn_servers = args
+        .turn_server
+        .into_iter()
+        .filter_map(|s| {
+            let mut parts = s.splitn(3, ',');
+            let url = parts.next()?.to_string();
+            let user = parts.next()?.to_string();
+            let cred = parts.next()?.to_string();
+            Some((url, user, cred))
+        })
+        .collect();
 
     let server = Server::new(options)?;
 

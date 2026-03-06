@@ -8,17 +8,21 @@ use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use sshx_core::{
-    proto::{server_update::ServerMessage, SequenceNumbers},
-    IdCounter, Nid, Sid, Uid, Wid,
+    proto::{
+        browser_command::BrowserCommand as BrowserCmd, server_update::ServerMessage, BrowserCommand,
+        InputEvent, SequenceNumbers, VideoFrame,
+    },
+    IdCounter, Nid, Sid, Uid, Vid, Wid,
 };
-use tokio::sync::{broadcast, watch, Notify};
+use tokio::sync::{broadcast, mpsc, watch, Notify};
+use tonic::Status;
 use tokio::time::Instant;
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream, WatchStream};
 use tokio_stream::Stream;
 use tracing::{debug, warn};
 
 use crate::utils::Shutdown;
-use crate::web::protocol::{WsClaudeEvent, WsComponentGraph, WsNote, WsServer, WsSourceFile, WsUser, WsWidget, WsWinsize};
+use crate::web::protocol::{WsClaudeEvent, WsComponentGraph, WsIceCandidate, WsNote, WsServer, WsSourceFile, WsUser, WsVideoStream, WsWidget, WsWinsize};
 
 mod snapshot;
 
@@ -100,6 +104,24 @@ pub struct Session {
     /// Latest component graph sent by the CLI workspace analyzer.
     component_graph: RwLock<Option<WsComponentGraph>>,
 
+    /// Active video streams (screen shares + offscreen browser streams).
+    video_streams: RwLock<HashMap<Vid, WsVideoStream>>,
+
+    /// Watch channel source for video stream snapshots; clients get a snapshot on connect.
+    video_streams_source: watch::Sender<Vec<(Vid, WsVideoStream)>>,
+
+    /// Current controller of each offscreen browser stream (None = uncontrolled).
+    browser_controllers: RwLock<HashMap<Vid, Option<Uid>>>,
+
+    /// Command senders to connected sshx-browser gRPC streams (keyed by vid).
+    browser_cmd_senders: Mutex<HashMap<Vid, mpsc::Sender<Result<BrowserCommand, Status>>>>,
+
+    /// Per-vid subscribers receiving live VP8 frames from sshx-browser.
+    browser_frame_subscribers: Mutex<HashMap<Vid, Vec<mpsc::Sender<VideoFrame>>>>,
+
+    /// Per-vid GOP buffer: keyframe + subsequent deltas, for new-viewer catch-up.
+    browser_frame_buffers: Mutex<HashMap<Vid, Vec<VideoFrame>>>,
+
     /// Triggered from metadata events when an immediate snapshot is needed.
     sync_notify: Notify,
 
@@ -153,6 +175,12 @@ impl Session {
             shell_names: RwLock::new(HashMap::new()),
             claude_events: Mutex::new(VecDeque::new()),
             component_graph: RwLock::new(None),
+            video_streams: RwLock::new(HashMap::new()),
+            video_streams_source: watch::channel(Vec::new()).0,
+            browser_controllers: RwLock::new(HashMap::new()),
+            browser_cmd_senders: Mutex::new(HashMap::new()),
+            browser_frame_subscribers: Mutex::new(HashMap::new()),
+            browser_frame_buffers: Mutex::new(HashMap::new()),
             sync_notify: Notify::new(),
             shutdown: Shutdown::new(),
         }
@@ -497,6 +525,190 @@ impl Session {
         self.component_graph.read().clone()
     }
 
+    /// Subscribe to video stream list updates (watch stream, delivers latest on connect).
+    pub fn subscribe_video_streams(&self) -> impl Stream<Item = Vec<(Vid, WsVideoStream)>> + Unpin {
+        WatchStream::new(self.video_streams_source.subscribe())
+    }
+
+    /// Return a snapshot of all active video streams.
+    pub fn list_video_streams(&self) -> Vec<(Vid, WsVideoStream)> {
+        self.video_streams
+            .read()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
+    }
+
+    /// Add a new video stream and broadcast the addition.
+    pub fn add_video_stream(&self, id: Vid, stream: WsVideoStream) {
+        self.video_streams.write().insert(id, stream.clone());
+        self.video_streams_source
+            .send_modify(|s| s.push((id, stream.clone())));
+        self.broadcast
+            .send(WsServer::VideoStreamDiff(id, Some(stream)))
+            .ok();
+    }
+
+    /// Update the canvas position of a video stream and broadcast the change.
+    pub fn move_video_stream(&self, id: Vid, x: i32, y: i32) {
+        {
+            let mut streams = self.video_streams.write();
+            if let Some(s) = streams.get_mut(&id) {
+                s.x = x;
+                s.y = y;
+            }
+        }
+        self.video_streams_source.send_modify(|s| {
+            if let Some(entry) = s.iter_mut().find(|(v, _)| *v == id) {
+                entry.1.x = x;
+                entry.1.y = y;
+            }
+        });
+        let updated = self.video_streams.read().get(&id).cloned();
+        if let Some(stream) = updated {
+            self.broadcast.send(WsServer::VideoStreamDiff(id, Some(stream))).ok();
+        }
+    }
+
+    /// Update the size of a video stream widget and broadcast the change.
+    pub fn resize_video_stream(&self, id: Vid, w: u32, h: u32) {
+        {
+            let mut streams = self.video_streams.write();
+            if let Some(s) = streams.get_mut(&id) {
+                s.w = w;
+                s.h = h;
+            }
+        }
+        self.video_streams_source.send_modify(|s| {
+            if let Some(entry) = s.iter_mut().find(|(v, _)| *v == id) {
+                entry.1.w = w;
+                entry.1.h = h;
+            }
+        });
+        let updated = self.video_streams.read().get(&id).cloned();
+        if let Some(stream) = updated {
+            self.broadcast.send(WsServer::VideoStreamDiff(id, Some(stream))).ok();
+        }
+    }
+
+    /// Remove a video stream by ID and broadcast the removal.
+    pub fn remove_video_stream(&self, id: Vid) {
+        self.video_streams.write().remove(&id);
+        self.video_streams_source
+            .send_modify(|s| s.retain(|(vid, _)| *vid != id));
+        self.broadcast
+            .send(WsServer::VideoStreamDiff(id, None))
+            .ok();
+        // Clean up browser controller and frame relay state.
+        self.browser_controllers.write().remove(&id);
+        self.browser_frame_subscribers.lock().remove(&id);
+        self.browser_frame_buffers.lock().remove(&id);
+    }
+
+    /// Get the current controller of an offscreen browser stream.
+    pub fn get_browser_controller(&self, vid: Vid) -> Option<Option<Uid>> {
+        self.browser_controllers.read().get(&vid).copied()
+    }
+
+    /// Set the controller of an offscreen browser stream and broadcast the change.
+    pub fn set_browser_controller(&self, vid: Vid, controller: Option<Uid>) {
+        self.browser_controllers.write().insert(vid, controller);
+        self.broadcast
+            .send(WsServer::BrowserControlStatus(vid, controller))
+            .ok();
+    }
+
+    /// Relay a WebRTC signaling message (offer, answer, or ICE) to a target user.
+    pub fn relay_rtc_offer(&self, vid: Vid, target_uid: Uid, sdp: String) {
+        self.broadcast
+            .send(WsServer::RtcOffer(vid, target_uid, sdp))
+            .ok();
+    }
+
+    /// Relay a WebRTC answer to a target user, including the sender's UID for multi-viewer routing.
+    pub fn relay_rtc_answer(&self, vid: Vid, target_uid: Uid, sender_uid: Uid, sdp: String) {
+        self.broadcast
+            .send(WsServer::RtcAnswer(vid, target_uid, sender_uid, sdp))
+            .ok();
+    }
+
+    /// Relay a WebRTC ICE candidate to a target user, including the sender's UID for multi-viewer routing.
+    pub fn relay_rtc_ice(&self, vid: Vid, target_uid: Uid, sender_uid: Uid, candidate: WsIceCandidate) {
+        self.broadcast
+            .send(WsServer::RtcIce(vid, target_uid, sender_uid, candidate))
+            .ok();
+    }
+
+    /// Broadcast a component-highlight request to all connected browsers.
+    pub fn broadcast_highlight(&self, name: String) {
+        self.broadcast
+            .send(WsServer::HighlightComponent(name))
+            .ok();
+    }
+
+    /// Register a command sender for an sshx-browser gRPC stream.
+    pub fn register_browser_cmd_sender(
+        &self,
+        vid: Vid,
+        tx: mpsc::Sender<Result<BrowserCommand, Status>>,
+    ) {
+        self.browser_cmd_senders.lock().insert(vid, tx);
+    }
+
+    /// Unregister the command sender for an sshx-browser gRPC stream.
+    pub fn unregister_browser_cmd_sender(&self, vid: Vid) {
+        self.browser_cmd_senders.lock().remove(&vid);
+    }
+
+    /// Ingest a video frame from sshx-browser and relay it to watching WebSocket clients.
+    ///
+    /// Maintains a per-vid GOP buffer (keyframe + subsequent deltas) so that new viewers
+    /// can catch up immediately when they subscribe.
+    pub fn store_browser_frame(&self, vid: Vid, frame: VideoFrame) {
+        // Relay to all live subscribers.
+        {
+            let mut subs = self.browser_frame_subscribers.lock();
+            if let Some(txs) = subs.get_mut(&vid) {
+                txs.retain(|tx| tx.try_send(frame.clone()).is_ok());
+            }
+        }
+        // Update GOP buffer: reset on keyframe, append otherwise.
+        let mut bufs = self.browser_frame_buffers.lock();
+        let buf = bufs.entry(vid).or_default();
+        if frame.keyframe {
+            buf.clear();
+        }
+        buf.push(frame);
+        // Cap at 300 frames to prevent unbounded growth.
+        if buf.len() > 300 {
+            buf.drain(..100);
+        }
+    }
+
+    /// Subscribe to live VP8 frames for a browser video stream.
+    ///
+    /// Returns the current GOP buffer (for decoder catch-up) and a receiver
+    /// that delivers live frames going forward.
+    pub fn subscribe_browser_frames(&self, vid: Vid) -> (Vec<VideoFrame>, mpsc::Receiver<VideoFrame>) {
+        let (tx, rx) = mpsc::channel(256);
+        // Register subscriber before reading the backlog to avoid missing frames.
+        self.browser_frame_subscribers.lock().entry(vid).or_default().push(tx);
+        let backlog = self.browser_frame_buffers.lock().get(&vid).cloned().unwrap_or_default();
+        (backlog, rx)
+    }
+
+    /// Forward a mouse/keyboard input event to the sshx-browser controlling the given stream.
+    pub fn send_browser_input(&self, vid: Vid, json: String) {
+        let cmd = BrowserCommand {
+            browser_command: Some(BrowserCmd::Input(InputEvent { json })),
+        };
+        if let Some(tx) = self.browser_cmd_senders.lock().get(&vid).cloned() {
+            if let Err(e) = tx.try_send(Ok(cmd)) {
+                warn!(%vid, "failed to send browser input: {e}");
+            }
+        }
+    }
+
     /// Apply a partial metadata update to a single source file in memory.
     ///
     /// Updates the matching entry (by path) and notifies WebSocket clients.
@@ -653,6 +865,67 @@ impl Session {
             self.broadcast.send(WsServer::WidgetDiff(id, Some(widget))).ok();
         }
         Ok(())
+    }
+
+    /// Set a user-defined name on a canvas widget.
+    pub fn set_widget_name(&self, id: Wid, name: String) -> Result<()> {
+        {
+            let mut widgets = self.widgets.write();
+            let widget = widgets.get_mut(&id).context("widget not found")?;
+            widget.name = if name.is_empty() { None } else { Some(name.clone()) };
+        }
+        self.widget_source.send_modify(|s| {
+            if let Some(entry) = s.iter_mut().find(|(wid, _)| *wid == id) {
+                entry.1.name = if name.is_empty() { None } else { Some(name.clone()) };
+            }
+        });
+        let updated = self.widgets.read().get(&id).cloned();
+        if let Some(widget) = updated {
+            self.broadcast.send(WsServer::WidgetDiff(id, Some(widget))).ok();
+        }
+        Ok(())
+    }
+
+    /// Return true if a claudeFeed widget with the given instance_id already exists.
+    pub fn claude_feed_exists(&self, instance_id: &str) -> bool {
+        use crate::web::protocol::WsWidgetKind;
+        self.widgets.read().values().any(|w| {
+            matches!(&w.kind, WsWidgetKind::ClaudeFeed { instance_id: iid } if iid == instance_id)
+        })
+    }
+
+    /// Return the Claude session instance_id for a claudeFeed widget, if any.
+    pub fn get_widget_instance_id(&self, id: Wid) -> Option<String> {
+        use crate::web::protocol::WsWidgetKind;
+        self.widgets.read().get(&id).and_then(|w| {
+            if let WsWidgetKind::ClaudeFeed { instance_id } = &w.kind {
+                Some(instance_id.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Apply a bulk map of instanceId → name from CLI startup state.
+    /// Sets the name on any claudeFeed widget whose instanceId is in the map.
+    pub fn apply_widget_names(&self, names: &std::collections::HashMap<String, String>) {
+        use crate::web::protocol::WsWidgetKind;
+        let ids: Vec<(Wid, String)> = {
+            let widgets = self.widgets.read();
+            widgets
+                .iter()
+                .filter_map(|(wid, w)| {
+                    if let WsWidgetKind::ClaudeFeed { instance_id } = &w.kind {
+                        names.get(instance_id.as_str()).map(|n| (*wid, n.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        for (wid, name) in ids {
+            self.set_widget_name(wid, name).ok();
+        }
     }
 
     /// Remove a canvas widget by ID.

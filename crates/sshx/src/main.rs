@@ -9,10 +9,10 @@ use sshx::{
     controller::Controller,
     runner::Runner,
     terminal::get_default_shell,
-    workspace::{spawn_claude_pid_tracker, spawn_claude_tracker, spawn_source_analyzer},
+    workspace::{send_widget_names, spawn_claude_pid_tracker, spawn_claude_tracker, spawn_source_analyzer},
 };
 use tokio::signal;
-use tracing::error;
+use tracing::{error, warn};
 
 // ---------------------------------------------------------------------------
 // CLI definition
@@ -60,6 +60,17 @@ struct Args {
     /// Disable Claude Code JSONL event tracking.
     #[clap(long)]
     no_claude_tracking: bool,
+
+    /// Launch sshx-browser alongside this session, opening the given URL.
+    /// The session name, token and server are forwarded automatically.
+    /// Example: --with-browser https://example.com
+    #[clap(long, value_name = "URL")]
+    with_browser: Option<String>,
+
+    /// Browser binary forwarded to sshx-browser's --browser flag.
+    /// Only used when --with-browser is set.
+    #[clap(long, value_name = "BIN", env = "SSHX_BROWSER")]
+    browser_bin: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -274,6 +285,8 @@ async fn run_session(args: Args) -> Result<()> {
         spawn_claude_tracker(controller.output_sender());
         spawn_claude_pid_tracker(controller.output_sender());
     }
+    // Send persisted widget names to the server so they survive restarts.
+    send_widget_names(&controller.output_sender()).await;
 
     if args.quiet {
         if let Some(write_url) = controller.write_url() {
@@ -285,6 +298,24 @@ async fn run_session(args: Args) -> Result<()> {
         print_greeting(&shell, &controller);
     }
 
+    // Spawn sshx-browser if requested.
+    let mut browser_child = if let Some(browser_url) = &args.with_browser {
+        match spawn_sshx_browser(&args.server, controller.name(), controller.token(), browser_url, args.browser_bin.as_deref()) {
+            Ok(child) => {
+                if !args.quiet {
+                    println!("  {}  sshx-browser launched (pid {})\n", Green.paint("➜"), child.id());
+                }
+                Some(child)
+            }
+            Err(err) => {
+                warn!("failed to spawn sshx-browser: {err:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let exit_signal = signal::ctrl_c();
     tokio::pin!(exit_signal);
     tokio::select! {
@@ -293,5 +324,41 @@ async fn run_session(args: Args) -> Result<()> {
     };
     controller.close().await?;
 
+    if let Some(ref mut child) = browser_child {
+        child.kill().ok();
+    }
+
     Ok(())
+}
+
+/// Find and launch `sshx-browser` with the session credentials pre-filled.
+///
+/// Looks for `sshx-browser` next to the running `sshx` binary first, then
+/// falls back to the PATH.
+fn spawn_sshx_browser(
+    server: &str,
+    session: &str,
+    token: &str,
+    url: &str,
+    browser_bin: Option<&str>,
+) -> Result<std::process::Child> {
+    // Prefer a sibling binary (useful when both are installed in the same dir).
+    let browser_exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|dir| dir.join("sshx-browser")))
+        .filter(|p| p.exists())
+        .map(|p| p.into_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("sshx-browser"));
+
+    let mut cmd = std::process::Command::new(&browser_exe);
+    cmd.arg("--server").arg(server)
+        .arg("--session").arg(session)
+        .arg("--token").arg(token)
+        .arg("--url").arg(url);
+
+    if let Some(bin) = browser_bin {
+        cmd.arg("--browser").arg(bin);
+    }
+
+    cmd.spawn().map_err(|e| anyhow::anyhow!("could not start sshx-browser ({browser_exe:?}): {e}"))
 }

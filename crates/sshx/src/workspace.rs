@@ -180,6 +180,57 @@ async fn run_update_file_metadata(
     Ok(())
 }
 
+/// Name of the widget-names persistence file in the workspace root.
+const WIDGET_NAMES_FILENAME: &str = ".sshx-widgets.json";
+
+/// Spawn a task that persists a widget name to `.sshx-widgets.json`.
+pub fn spawn_update_widget_name(instance_id: String, name: String) {
+    tokio::spawn(async move {
+        if let Err(e) = run_update_widget_name(instance_id, name).await {
+            warn!("update-widget-name task exited: {e:#}");
+        }
+    });
+}
+
+async fn run_update_widget_name(instance_id: String, name: String) -> Result<()> {
+    let root = std::env::current_dir()?;
+    let path = root.join(WIDGET_NAMES_FILENAME);
+    let mut map: std::collections::HashMap<String, String> = if path.exists() {
+        let raw = tokio::fs::read(&path).await?;
+        serde_json::from_slice(&raw).unwrap_or_default()
+    } else {
+        std::collections::HashMap::new()
+    };
+    if name.is_empty() {
+        map.remove(&instance_id);
+    } else {
+        map.insert(instance_id, name);
+    }
+    let json = serde_json::to_vec_pretty(&map)?;
+    tokio::fs::write(&path, json).await?;
+    Ok(())
+}
+
+/// Send persisted widget names to the server on startup.
+pub async fn send_widget_names(tx: &mpsc::Sender<ClientMessage>) {
+    let root = match std::env::current_dir() {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let path = root.join(WIDGET_NAMES_FILENAME);
+    if !path.exists() {
+        return;
+    }
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    // Validate it's a proper map before sending.
+    if serde_json::from_slice::<std::collections::HashMap<String, String>>(&bytes).is_ok() {
+        tx.send(ClientMessage::WidgetNames(bytes.into())).await.ok();
+    }
+}
+
 /// Spawn the Claude Code JSONL tracker task.
 pub fn spawn_claude_tracker(tx: mpsc::Sender<ClientMessage>) {
     tokio::spawn(async move {
@@ -419,36 +470,6 @@ async fn run_describe_files(mut paths: Vec<String>) -> Result<()> {
 // Claude Code tracker
 // ---------------------------------------------------------------------------
 
-/// Return all Claude Code JSONL transcripts for the current working directory,
-/// sorted oldest-first by modification time.
-fn find_all_claude_transcripts() -> Vec<PathBuf> {
-    let home = match dirs::home_dir() {
-        Some(h) => h,
-        None => return vec![],
-    };
-    let cwd = match std::env::current_dir() {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
-    let encoded = cwd.to_string_lossy().replace('/', "-");
-    let project_dir = home.join(".claude").join("projects").join(&encoded);
-    if !project_dir.exists() {
-        return vec![];
-    }
-    let mut entries: Vec<(PathBuf, SystemTime)> = std::fs::read_dir(&project_dir)
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
-        .filter_map(|e| {
-            let mtime = e.metadata().ok()?.modified().ok()?;
-            Some((e.path(), mtime))
-        })
-        .collect();
-    entries.sort_by_key(|(_, mtime)| *mtime);
-    entries.into_iter().map(|(p, _)| p).collect()
-}
 
 #[derive(Deserialize, Debug)]
 struct JournalEntry {
@@ -568,16 +589,31 @@ fn parse_journal_entry(entry: &JournalEntry) -> Option<ClaudeEvent> {
                 }
                 None
             }
-            serde_json::Value::String(s) => Some(ClaudeEvent {
-                kind: "user_message".into(),
-                tool: None,
-                content: s.chars().take(500).collect(),
-                timestamp,
-                session_id,
-                input_tokens: None,
-                output_tokens: None,
-                file_mtime: None,
-            }),
+            serde_json::Value::String(s) => {
+                // Detect /exit slash command → emit a synthetic session_end event.
+                if s.contains("<command-name>/exit</command-name>") {
+                    return Some(ClaudeEvent {
+                        kind: "session_end".into(),
+                        tool: None,
+                        content: String::new(),
+                        timestamp,
+                        session_id,
+                        input_tokens: None,
+                        output_tokens: None,
+                        file_mtime: None,
+                    });
+                }
+                Some(ClaudeEvent {
+                    kind: "user_message".into(),
+                    tool: None,
+                    content: s.chars().take(500).collect(),
+                    timestamp,
+                    session_id,
+                    input_tokens: None,
+                    output_tokens: None,
+                    file_mtime: None,
+                })
+            }
             _ => None,
         },
         _ => None,
@@ -701,23 +737,101 @@ pub async fn tail_transcript(
     }
 }
 
+/// Return the `~/.claude/projects/<encoded-cwd>/` directory path, or `None`.
+fn claude_project_dir() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    let cwd = std::env::current_dir().ok()?;
+    let encoded = cwd.to_string_lossy().replace('/', "-");
+    Some(home.join(".claude").join("projects").join(encoded))
+}
+
+/// Watch `project_dir` for new `.jsonl` transcripts and spawn `tail_transcript`
+/// for each one discovered.  Also does an initial scan for pre-existing files.
+/// Returns when the watcher's internal channel closes (unexpected).
+///
+/// Exported as `pub(crate)` so tests can call it directly with a `TempDir`.
+pub(crate) async fn watch_transcripts_in_dir(
+    project_dir: &Path,
+    spawned: &mut HashSet<PathBuf>,
+    tx: mpsc::Sender<ClientMessage>,
+) -> Result<()> {
+    // Helper: spawn tail_transcript for a path if not already spawned.
+    let mut spawn_tail = |path: PathBuf| {
+        if spawned.insert(path.clone()) {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = tail_transcript(path, tx).await {
+                    warn!("claude transcript tail exited: {e:#}");
+                }
+            });
+        }
+    };
+
+    // Initial scan: pick up any pre-existing .jsonl files.
+    let entries: Vec<PathBuf> = std::fs::read_dir(project_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
+        .map(|e| e.path())
+        .collect();
+    for path in entries {
+        spawn_tail(path);
+    }
+
+    // Set up a directory watcher so new files are picked up immediately.
+    let (dir_tx, mut dir_rx) = mpsc::channel::<PathBuf>(16);
+    let mut watcher = RecommendedWatcher::new(
+        move |res: notify::Result<notify::Event>| {
+            if let Ok(event) = res {
+                if matches!(event.kind, notify::EventKind::Create(_)) {
+                    for path in event.paths {
+                        if path.extension().and_then(|x| x.to_str()) == Some("jsonl") {
+                            let _ = dir_tx.try_send(path);
+                        }
+                    }
+                }
+            }
+        },
+        notify::Config::default(),
+    )?;
+    watcher.watch(project_dir, RecursiveMode::NonRecursive)?;
+
+    info!("watching Claude project dir for new transcripts: {project_dir:?}");
+
+    // Process new-file events until the channel closes (watcher dropped).
+    loop {
+        match tokio::time::timeout(Duration::from_secs(60), dir_rx.recv()).await {
+            Ok(Some(path)) => {
+                info!("new Claude transcript detected: {path:?}");
+                spawn_tail(path);
+            }
+            Ok(None) => return Ok(()), // sender dropped — caller should restart
+            Err(_) => {}               // timeout — loop back and wait again
+        }
+    }
+}
+
 async fn run_claude_tracker(tx: mpsc::Sender<ClientMessage>) -> Result<()> {
     let mut spawned: HashSet<PathBuf> = HashSet::new();
+
     loop {
-        let transcripts = find_all_claude_transcripts();
-        if transcripts.is_empty() {
-            debug!("no Claude Code transcripts found, retrying in 5s");
+        let Some(project_dir) = claude_project_dir() else {
+            debug!("cannot determine Claude project dir, retrying in 5s");
+            sleep(Duration::from_secs(5)).await;
+            continue;
+        };
+
+        if !project_dir.exists() {
+            debug!("Claude project dir not found, retrying in 5s");
+            sleep(Duration::from_secs(5)).await;
+            continue;
         }
-        for transcript in transcripts {
-            if !spawned.contains(&transcript) {
-                spawned.insert(transcript.clone());
-                let tx2 = tx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = tail_transcript(transcript, tx2).await {
-                        warn!("claude transcript tail exited: {e:#}");
-                    }
-                });
-            }
+
+        match watch_transcripts_in_dir(&project_dir, &mut spawned, tx.clone()).await {
+            Ok(()) => warn!("Claude directory watcher closed, restarting in 5s"),
+            Err(e) => warn!("Claude directory watcher error: {e:#}, restarting in 5s"),
         }
         sleep(Duration::from_secs(5)).await;
     }
@@ -833,5 +947,163 @@ async fn run_claude_pid_tracker(tx: mpsc::Sender<ClientMessage>) -> Result<()> {
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    use super::*;
+
+    /// A valid JSONL line that produces a `user_message` event.
+    const USER_LINE: &str = r#"{"type":"say","message":{"role":"user","content":"test prompt"},"sessionId":"aaaabbbb-cccc-dddd-eeee-ffffffffffff","timestamp":"2024-01-01T00:00:00.000Z"}"#;
+
+    /// A valid JSONL line that produces an `assistant_message` event.
+    const ASSISTANT_LINE: &str = r#"{"type":"say","message":{"role":"assistant","content":[{"type":"text","text":"Hello world"}]},"sessionId":"aaaabbbb-cccc-dddd-eeee-ffffffffffff","timestamp":"2024-01-01T00:00:00.000Z"}"#;
+
+    fn decode_event(msg: ClientMessage) -> ClaudeEvent {
+        match msg {
+            ClientMessage::ClaudeEvent(bytes) => serde_json::from_slice(&bytes).unwrap(),
+            other => panic!("expected ClaudeEvent, got {other:?}"),
+        }
+    }
+
+    /// Receive the next message with a 2-second timeout.
+    async fn recv_event(rx: &mut mpsc::Receiver<ClientMessage>) -> ClaudeEvent {
+        decode_event(
+            tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("timed out waiting for event")
+                .expect("channel closed"),
+        )
+    }
+
+    // ------------------------------------------------------------------
+    // tail_transcript: pre-existing lines replayed, new lines tailed
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_tail_transcript_sends_events() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("session.jsonl");
+
+        // Write 2 lines before calling tail_transcript.
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "{USER_LINE}").unwrap();
+            writeln!(f, "{ASSISTANT_LINE}").unwrap();
+        }
+
+        let (tx, mut rx) = mpsc::channel(32);
+        let path_clone = path.clone();
+        tokio::spawn(async move {
+            tail_transcript(path_clone, tx).await.ok();
+        });
+
+        // First: synthetic "transcript" event with the file path.
+        let event = recv_event(&mut rx).await;
+        assert_eq!(event.kind, "transcript");
+        assert!(
+            event.content.ends_with("session.jsonl"),
+            "transcript event content should be the file path, got: {}",
+            event.content
+        );
+
+        // Second: user_message replayed from the pre-existing line.
+        let event = recv_event(&mut rx).await;
+        assert_eq!(event.kind, "user_message");
+        assert_eq!(event.content, "test prompt");
+
+        // Third: assistant_message replayed.
+        let event = recv_event(&mut rx).await;
+        assert_eq!(event.kind, "assistant_message");
+        assert_eq!(event.content, "Hello world");
+
+        // Append a new line and verify it's tailed live.
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(
+                f,
+                "{}",
+                USER_LINE.replace("test prompt", "second prompt")
+            )
+            .unwrap();
+        }
+
+        let event = recv_event(&mut rx).await;
+        assert_eq!(event.kind, "user_message");
+        assert_eq!(event.content, "second prompt");
+    }
+
+    // ------------------------------------------------------------------
+    // watch_transcripts_in_dir: new .jsonl file triggers tail_transcript
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_watch_dir_detects_new_file() {
+        let dir = TempDir::new().unwrap();
+        let (tx, mut rx) = mpsc::channel(32);
+
+        let dir_path = dir.path().to_path_buf();
+        tokio::spawn(async move {
+            let mut spawned = HashSet::new();
+            watch_transcripts_in_dir(&dir_path, &mut spawned, tx)
+                .await
+                .ok();
+        });
+
+        // Give the watcher time to initialise.
+        sleep(Duration::from_millis(100)).await;
+
+        // Create a new .jsonl file with one valid line.
+        let transcript_path = dir.path().join("abc123.jsonl");
+        {
+            let mut f = std::fs::File::create(&transcript_path).unwrap();
+            writeln!(f, "{ASSISTANT_LINE}").unwrap();
+        }
+
+        // Collect events until we've seen both the synthetic "transcript" event
+        // and the parsed "assistant_message" event, or until a 3 s deadline.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut got_transcript = false;
+        let mut got_event = false;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(msg)) => {
+                    let event = decode_event(msg);
+                    if event.kind == "transcript" && event.content.ends_with("abc123.jsonl") {
+                        got_transcript = true;
+                    } else if event.kind == "assistant_message" && event.content == "Hello world" {
+                        got_event = true;
+                    }
+                    if got_transcript && got_event {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        assert!(
+            got_transcript,
+            "expected synthetic 'transcript' event for abc123.jsonl"
+        );
+        assert!(
+            got_event,
+            "expected 'assistant_message' event from new transcript file"
+        );
     }
 }

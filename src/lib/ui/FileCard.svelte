@@ -29,6 +29,7 @@
 
   export let collapsed: boolean = false;
   export let graphMode: boolean = false;
+  export let highlighted: boolean = false;
 
   /** Which export name is currently expanded to show its importers. */
   let selectedExport: string | null = null;
@@ -92,11 +93,15 @@
     (async () => {
       if (typeof window !== "undefined" && !(window as any).__monacoEnvSet) {
         (window as any).__monacoEnvSet = true;
-        const { default: EditorWorker } = await import(
-          "monaco-editor/esm/vs/editor/editor.worker?worker"
-        );
+        const [{ default: EditorWorker }, { default: TsWorker }] = await Promise.all([
+          import("monaco-editor/esm/vs/editor/editor.worker?worker"),
+          import("monaco-editor/esm/vs/language/typescript/ts.worker?worker"),
+        ]);
         (window as any).MonacoEnvironment = {
-          getWorker: function () {
+          getWorker: function (_: unknown, label: string) {
+            if (label === "typescript" || label === "javascript") {
+              return new TsWorker();
+            }
             return new EditorWorker();
           },
         };
@@ -219,10 +224,12 @@
 
 <div
   class="panel-window flex flex-col select-none"
+  class:highlighted
   style:width={collapsed ? "280px" : `${effectiveW}px`}
   style:height={collapsed ? "auto" : `${effectiveH}px`}
 >
   <!-- Header bar -->
+  <!-- svelte-ignore a11y-no-static-element-interactions -->
   <div
     class="flex select-none flex-shrink-0 cursor-grab active:cursor-grabbing"
     on:mousedown={(e) => dispatch("startMove", e)}
@@ -287,6 +294,7 @@
           {/each}
         </div>
         {#if file.localImports.length > 0 || file.importedBy.length > 0}
+          <!-- svelte-ignore a11y-no-static-element-interactions -->
           <div class="flex gap-1 pt-1.5 border-t border-zinc-800 mt-1" on:mousedown|stopPropagation>
             {#if file.localImports.length > 0}
               <button
@@ -390,6 +398,7 @@
 
           <!-- AI description (editable) -->
           {#if editingDescription}
+            <!-- svelte-ignore a11y-no-static-element-interactions -->
             <div class="carta-card flex flex-col gap-1" on:mousedown|stopPropagation>
               <CartaEditor
                 {carta}
@@ -446,6 +455,7 @@
 
             <!-- Claude action buttons (always visible when canWrite) -->
             {#if canWrite}
+              <!-- svelte-ignore a11y-no-static-element-interactions -->
               <div class="flex flex-wrap gap-1" on:mousedown|stopPropagation>
                 <button
                   class="text-xs text-indigo-400 hover:text-indigo-300 border border-indigo-800 hover:border-indigo-600 rounded px-2 py-0.5"
@@ -474,6 +484,7 @@
 
               <!-- Ask Claude form -->
               {#if askingClaude}
+                <!-- svelte-ignore a11y-no-static-element-interactions -->
                 <div class="flex flex-col gap-1" on:mousedown|stopPropagation>
                   <input
                     type="text"
@@ -643,6 +654,7 @@
       </div>
 
       <!-- Editor bottom bar -->
+      <!-- svelte-ignore a11y-no-static-element-interactions -->
       <div class="flex-shrink-0 border-t border-zinc-800" on:mousedown|stopPropagation>
         <!-- Ask Claude expanded form -->
         {#if editorAskingClaude}
@@ -727,7 +739,18 @@
 <style lang="postcss">
   .panel-window {
     @apply inline-flex rounded-lg border border-zinc-700 bg-zinc-800 opacity-90;
-    transition: opacity 200ms;
+    transition: opacity 200ms, border-color 200ms;
+  }
+
+  @keyframes highlight-flash {
+    0%   { border-color: theme(colors.indigo.400); box-shadow: 0 0 0 2px theme(colors.indigo.400 / 40%); }
+    50%  { border-color: theme(colors.indigo.300); box-shadow: 0 0 0 4px theme(colors.indigo.300 / 60%); }
+    100% { border-color: theme(colors.indigo.400); box-shadow: 0 0 0 2px theme(colors.indigo.400 / 40%); }
+  }
+
+  .panel-window.highlighted {
+    animation: highlight-flash 0.6s ease-in-out 3;
+    @apply opacity-100;
   }
 
   .description-clamp {

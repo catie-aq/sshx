@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use sshx_core::{Nid, Sid, Uid, Wid};
+use sshx_core::{Nid, Sid, Uid, Vid, Wid};
 
 /// Real-time message conveying the position and size of a terminal.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,7 +180,15 @@ pub enum WsWidgetKind {
     /// A Claude Code activity feed panel.
     ClaudeFeed {
         /// The Claude Code session ID this feed tracks.
+        #[serde(rename = "instanceId")]
         instance_id: String,
+    },
+    /// A pasted or uploaded image on the canvas.
+    Image {
+        /// URL of the image (served from /uploads/...).
+        url: String,
+        /// Optional alt text / filename.
+        alt: String,
     },
 }
 
@@ -201,6 +209,9 @@ pub struct WsWidget {
     /// Whether this widget is collapsed to a compact mini view.
     #[serde(default)]
     pub collapsed: bool,
+    /// User-set display name for this widget (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// Real-time message providing information about a user.
@@ -215,6 +226,57 @@ pub struct WsUser {
     pub focus: Option<Sid>,
     /// Whether the user has write permissions in the session.
     pub can_write: bool,
+}
+
+/// Metadata for an active video stream (screen share or offscreen browser).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WsVideoStream {
+    /// The user ID of the participant sharing their screen (None = offscreen browser).
+    pub owner_uid: Option<Uid>,
+    /// Human-readable label for the stream (e.g. "Alice's screen", "Browser").
+    pub label: String,
+    /// Whether this stream originates from an offscreen browser (sshx-browser).
+    pub is_browser: bool,
+    /// Canvas x position.
+    #[serde(default)]
+    pub x: i32,
+    /// Canvas y position.
+    #[serde(default)]
+    pub y: i32,
+    /// Widget width in pixels.
+    #[serde(default = "default_video_w")]
+    pub w: u32,
+    /// Widget height in pixels.
+    #[serde(default = "default_video_h")]
+    pub h: u32,
+}
+
+fn default_video_w() -> u32 { 640 }
+fn default_video_h() -> u32 { 400 }
+
+/// ICE server configuration (STUN or TURN) for WebRTC.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WsIceServer {
+    /// One or more STUN/TURN URLs for this server.
+    pub urls: Vec<String>,
+    /// TURN username (None for STUN servers).
+    pub username: Option<String>,
+    /// TURN credential (None for STUN servers).
+    pub credential: Option<String>,
+}
+
+/// ICE candidate for WebRTC negotiation.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WsIceCandidate {
+    /// The SDP candidate string.
+    pub candidate: String,
+    /// The SDP mid identifier.
+    pub sdp_mid: Option<String>,
+    /// The SDP m-line index.
+    pub sdp_mline_index: Option<u16>,
 }
 
 /// A real-time message sent from the server over WebSocket.
@@ -260,6 +322,24 @@ pub enum WsServer {
     ShellNames(Vec<(Sid, String)>),
     /// A single shell name was set or cleared.
     ShellNameDiff(Sid, String),
+    /// Snapshot of all active video streams on connect.
+    VideoStreams(Vec<(Vid, WsVideoStream)>),
+    /// A single video stream was added or removed (None = removed).
+    VideoStreamDiff(Vid, Option<WsVideoStream>),
+    /// Relay a WebRTC offer from a sharer to a viewer. (vid, target_uid, sdp)
+    RtcOffer(Vid, Uid, String),
+    /// Relay a WebRTC answer from a viewer to a sharer. (vid, target_uid, sender_uid, sdp)
+    RtcAnswer(Vid, Uid, Uid, String),
+    /// Relay an ICE candidate between peers. (vid, target_uid, sender_uid, candidate)
+    RtcIce(Vid, Uid, Uid, WsIceCandidate),
+    /// Current controller of an offscreen browser stream (None = no one).
+    BrowserControlStatus(Vid, Option<Uid>),
+    /// ICE server configuration for WebRTC (STUN/TURN). Sent once after Hello.
+    IceServers(Vec<WsIceServer>),
+    /// Broadcast a component-highlight request to all connected overlay clients.
+    HighlightComponent(String),
+    /// A raw VP8 video frame from a browser stream. (vid, timestamp_us, data, keyframe)
+    BrowserFrame(Vid, u64, Bytes, bool),
 }
 
 /// A real-time message sent from the client over WebSocket.
@@ -318,4 +398,36 @@ pub enum WsClient {
     OpenGraphView(i32, i32),
     /// Open a Claude activity feed widget at canvas position (x, y) for the given Claude session ID.
     OpenClaudeFeed(i32, i32, String),
+    /// Set a user-defined name for a canvas widget.
+    SetWidgetName(Wid, String),
+    /// Begin sharing the current user's screen (creates a new video stream).
+    StartScreenShare,
+    /// Stop sharing the current user's screen.
+    StopScreenShare,
+    /// Close a specific video stream for everyone.
+    CloseStream(Vid),
+    /// Start watching a video stream (triggers offer/answer flow).
+    WatchStream(Vid),
+    /// Stop watching a video stream.
+    UnwatchStream(Vid),
+    /// Send a WebRTC offer to a specific peer. (vid, target_uid, sdp)
+    SendRtcOffer(Vid, Uid, String),
+    /// Send a WebRTC answer to a specific peer. (vid, target_uid, sdp)
+    SendRtcAnswer(Vid, Uid, String),
+    /// Send an ICE candidate to a specific peer. (vid, target_uid, candidate)
+    SendRtcIce(Vid, Uid, WsIceCandidate),
+    /// Move a video stream widget to a new canvas position.
+    MoveVideoStream(Vid, i32, i32),
+    /// Resize a video stream widget.
+    ResizeVideoStream(Vid, u32, u32),
+    /// Forward a mouse/keyboard event to the offscreen browser controller.
+    BrowserInput(Vid, String),
+    /// Request exclusive control of an offscreen browser stream.
+    RequestBrowserControl(Vid),
+    /// Release control of an offscreen browser stream.
+    ReleaseBrowserControl(Vid),
+    /// Create an image widget at canvas position (x, y) with the given URL and alt text.
+    CreateImageWidget(i32, i32, String, String),
+    /// Request all connected overlay clients to flash a component by name.
+    HighlightComponent(String),
 }

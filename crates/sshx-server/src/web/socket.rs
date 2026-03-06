@@ -9,15 +9,15 @@ use axum::extract::{
 use axum::response::IntoResponse;
 use bytes::Bytes;
 use futures_util::SinkExt;
-use sshx_core::proto::{server_update::ServerMessage, NewShell, TerminalInput, TerminalSize};
-use sshx_core::Sid;
+use sshx_core::proto::{server_update::ServerMessage, NewShell, SetWidgetNameRequest, TerminalInput, TerminalSize};
+use sshx_core::{Sid, Vid};
 use subtle::ConstantTimeEq;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tracing::{error, info_span, warn, Instrument};
 
 use crate::session::Session;
-use crate::web::protocol::{WsClient, WsServer, WsWidget, WsWidgetKind};
+use crate::web::protocol::{WsClient, WsIceServer, WsServer, WsVideoStream, WsWidget, WsWidgetKind};
 use crate::ServerState;
 
 pub async fn get_session_ws(
@@ -30,7 +30,7 @@ pub async fn get_session_ws(
         async move {
             match state.frontend_connect(&name).await {
                 Ok(Ok(session)) => {
-                    if let Err(err) = handle_socket(&mut socket, session).await {
+                    if let Err(err) = handle_socket(&mut socket, session, state.ice_servers().to_vec()).await {
                         warn!(?err, "websocket exiting early");
                     } else {
                         socket.close().await.ok();
@@ -70,7 +70,7 @@ pub async fn get_session_ws(
 }
 
 /// Handle an incoming live WebSocket connection to a given session.
-async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<()> {
+async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>, ice_servers: Vec<WsIceServer>) -> Result<()> {
     /// Send a message to the client over WebSocket.
     async fn send(socket: &mut WebSocket, msg: WsServer) -> Result<()> {
         let mut buf = Vec::new();
@@ -95,6 +95,7 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
     let user_id = session.counter().next_uid();
     session.sync_now();
     send(socket, WsServer::Hello(user_id, metadata.name.clone())).await?;
+    send(socket, WsServer::IceServers(ice_servers)).await?;
 
     let can_write = match recv(socket).await? {
         Some(WsClient::Authenticate(bytes, write_password_bytes)) => {
@@ -146,13 +147,25 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
         send(socket, WsServer::ClaudeEvent(event)).await?;
     }
 
+    // Send video stream snapshot on connect.
+    send(socket, WsServer::VideoStreams(session.list_video_streams())).await?;
+    // Send browser controller status for all browser streams.
+    for (vid, stream) in session.list_video_streams() {
+        if stream.is_browser {
+            let ctrl = session.get_browser_controller(vid).flatten();
+            send(socket, WsServer::BrowserControlStatus(vid, ctrl)).await?;
+        }
+    }
+
     let mut subscribed = HashSet::new(); // prevent duplicate subscriptions
     let (chunks_tx, mut chunks_rx) = mpsc::channel::<(Sid, u64, Vec<Bytes>)>(1);
+    let (browser_frame_tx, mut browser_frame_rx) = mpsc::channel::<(Vid, u64, Bytes, bool)>(256);
 
     let mut shells_stream = session.subscribe_shells();
     let mut notes_stream = session.subscribe_notes();
     let mut source_files_stream = session.subscribe_source_files();
     let mut widget_stream = session.subscribe_widgets();
+    let mut video_streams_stream = session.subscribe_video_streams();
     loop {
         let msg = tokio::select! {
             _ = session.terminated() => break,
@@ -177,8 +190,16 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
                 send(socket, WsServer::Widgets(widgets)).await?;
                 continue;
             }
+            Some(video_streams) = video_streams_stream.next() => {
+                send(socket, WsServer::VideoStreams(video_streams)).await?;
+                continue;
+            }
             Some((id, seqnum, chunks)) = chunks_rx.recv() => {
                 send(socket, WsServer::Chunks(id, seqnum, chunks)).await?;
+                continue;
+            }
+            Some((vid, timestamp, data, keyframe)) = browser_frame_rx.recv() => {
+                send(socket, WsServer::BrowserFrame(vid, timestamp, data, keyframe)).await?;
                 continue;
             }
             result = recv(socket) => {
@@ -308,7 +329,7 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
                     continue;
                 }
                 let id = session.counter().next_wid();
-                let widget = WsWidget { x, y, w: 250, h: 400, kind: WsWidgetKind::FileTree { root }, collapsed: false };
+                let widget = WsWidget { x, y, w: 250, h: 400, kind: WsWidgetKind::FileTree { root }, collapsed: false, name: None };
                 if let Err(err) = session.add_widget(id, widget) {
                     send(socket, WsServer::Error(err.to_string())).await?;
                 }
@@ -319,7 +340,7 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
                     continue;
                 }
                 let id = session.counter().next_wid();
-                let widget = WsWidget { x, y, w: 320, h: 400, kind: WsWidgetKind::FileCard { path }, collapsed: false };
+                let widget = WsWidget { x, y, w: 320, h: 400, kind: WsWidgetKind::FileCard { path }, collapsed: false, name: None };
                 if let Err(err) = session.add_widget(id, widget) {
                     send(socket, WsServer::Error(err.to_string())).await?;
                 }
@@ -359,6 +380,21 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
             WsClient::SetShellName(id, name) => {
                 session.set_shell_name(id, name);
             }
+            WsClient::SetWidgetName(id, name) => {
+                // Get the instanceId before mutating (needed for CLI persistence).
+                let instance_id = session.get_widget_instance_id(id);
+                if let Err(err) = session.set_widget_name(id, name.clone()) {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                } else if let Some(iid) = instance_id {
+                    // Notify CLI to persist the name.
+                    session.update_tx().try_send(
+                        ServerMessage::SetWidgetName(SetWidgetNameRequest {
+                            instance_id: iid,
+                            name,
+                        })
+                    ).ok();
+                }
+            }
             WsClient::DescribeFiles(paths) => {
                 if let Err(e) = session.check_write_permission(user_id) {
                     send(socket, WsServer::Error(e.to_string())).await?;
@@ -390,6 +426,7 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
                     h: 520,
                     kind: WsWidgetKind::GraphView {},
                     collapsed: false,
+                    name: None,
                 };
                 if let Err(err) = session.add_widget(id, widget) {
                     send(socket, WsServer::Error(err.to_string())).await?;
@@ -400,6 +437,10 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
                     send(socket, WsServer::Error(e.to_string())).await?;
                     continue;
                 }
+                // Deduplicate: silently ignore if a feed for this instance already exists.
+                if session.claude_feed_exists(&instance_id) {
+                    continue;
+                }
                 let id = session.counter().next_wid();
                 let widget = WsWidget {
                     x,
@@ -408,6 +449,135 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>) -> Result<
                     h: 400,
                     kind: WsWidgetKind::ClaudeFeed { instance_id },
                     collapsed: false,
+                    name: None,
+                };
+                if let Err(err) = session.add_widget(id, widget) {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
+            }
+            WsClient::StartScreenShare => {
+                let vid = session.counter().next_vid();
+                let users = session.list_users();
+                let label = users
+                    .iter()
+                    .find(|(uid, _)| *uid == user_id)
+                    .map(|(_, u)| format!("{}'s screen", u.name))
+                    .unwrap_or_else(|| "Screen Share".to_string());
+                let stream = WsVideoStream {
+                    owner_uid: Some(user_id),
+                    label,
+                    is_browser: false,
+                    x: 100,
+                    y: 100,
+                    w: 640,
+                    h: 400,
+                };
+                session.add_video_stream(vid, stream);
+                // Tell the sharer their assigned vid so they can start the RTCPeerConnection.
+                send(socket, WsServer::VideoStreamDiff(vid, session.list_video_streams().into_iter().find(|(v, _)| *v == vid).map(|(_, s)| s))).await?;
+            }
+            WsClient::StopScreenShare => {
+                // Remove all video streams owned by this user.
+                let owned: Vec<Vid> = session
+                    .list_video_streams()
+                    .into_iter()
+                    .filter(|(_, s)| s.owner_uid == Some(user_id) && !s.is_browser)
+                    .map(|(v, _)| v)
+                    .collect();
+                for vid in owned {
+                    session.remove_video_stream(vid);
+                }
+            }
+            WsClient::CloseStream(vid) => {
+                // Any user can close any video stream for everyone.
+                session.remove_video_stream(vid);
+            }
+            WsClient::WatchStream(vid) => {
+                let stream_info = session.list_video_streams().into_iter().find(|(v, _)| *v == vid);
+                if let Some((_, info)) = stream_info {
+                    if info.is_browser {
+                        // Browser stream: subscribe to VP8 frames and relay them over WebSocket.
+                        let (backlog, mut frame_sub) = session.subscribe_browser_frames(vid);
+                        let ftx = browser_frame_tx.clone();
+                        // Send GOP backlog so the decoder can start immediately.
+                        for frame in backlog {
+                            ftx.send((vid, frame.timestamp, Bytes::from(frame.data), frame.keyframe)).await.ok();
+                        }
+                        tokio::spawn(async move {
+                            while let Some(frame) = frame_sub.recv().await {
+                                if ftx.send((vid, frame.timestamp, Bytes::from(frame.data), frame.keyframe)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                    } else {
+                        // P2P screen share: notify the stream owner via WebRTC signaling.
+                        if let Some(owner) = info.owner_uid {
+                            session.relay_rtc_offer(vid, owner, format!("watch:{}", user_id.0));
+                        }
+                    }
+                }
+            }
+            WsClient::UnwatchStream(_vid) => {
+                // Nothing to do server-side for P2P streams; cleanup is handled by WebRTC.
+            }
+            WsClient::SendRtcOffer(vid, target_uid, sdp) => {
+                session.relay_rtc_offer(vid, target_uid, sdp);
+            }
+            WsClient::SendRtcAnswer(vid, target_uid, sdp) => {
+                session.relay_rtc_answer(vid, target_uid, user_id, sdp);
+            }
+            WsClient::SendRtcIce(vid, target_uid, candidate) => {
+                session.relay_rtc_ice(vid, target_uid, user_id, candidate);
+            }
+            WsClient::MoveVideoStream(vid, x, y) => {
+                session.move_video_stream(vid, x, y);
+            }
+            WsClient::ResizeVideoStream(vid, w, h) => {
+                session.resize_video_stream(vid, w, h);
+            }
+            WsClient::BrowserInput(vid, event_json) => {
+                // Forward to the sshx-browser gRPC stream only if this user is the controller.
+                if let Some(Some(ctrl)) = session.get_browser_controller(vid) {
+                    if ctrl == user_id {
+                        session.send_browser_input(vid, event_json);
+                    }
+                }
+            }
+            WsClient::RequestBrowserControl(vid) => {
+                // Grant control if no one currently has it.
+                let current = session.get_browser_controller(vid);
+                if let Some(None) = current {
+                    session.set_browser_controller(vid, Some(user_id));
+                } else if current.is_none() {
+                    send(socket, WsServer::Error("video stream not found".into())).await?;
+                }
+            }
+            WsClient::ReleaseBrowserControl(vid) => {
+                // Release only if this user is the current controller.
+                if let Some(Some(ctrl)) = session.get_browser_controller(vid) {
+                    if ctrl == user_id {
+                        session.set_browser_controller(vid, None);
+                    }
+                }
+            }
+            WsClient::HighlightComponent(name) => {
+                session.broadcast_highlight(name);
+            }
+            WsClient::CreateImageWidget(x, y, url, alt) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                let id = session.counter().next_wid();
+                let widget = WsWidget {
+                    x,
+                    y,
+                    w: 400,
+                    h: 300,
+                    kind: WsWidgetKind::Image { url, alt },
+                    collapsed: false,
+                    name: None,
                 };
                 if let Err(err) = session.add_widget(id, widget) {
                     send(socket, WsServer::Error(err.to_string())).await?;

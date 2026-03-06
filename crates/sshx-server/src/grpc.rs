@@ -6,10 +6,13 @@ use std::time::{Duration, SystemTime};
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use hmac::Mac;
 use sshx_core::proto::{
+    browser_service_server::BrowserService, browser_update::BrowserMessage,
     client_update::ClientMessage, server_update::ServerMessage, sshx_service_server::SshxService,
-    ClientUpdate, CloseRequest, CloseResponse, OpenRequest, OpenResponse, ServerUpdate,
+    BrowserCommand, BrowserJoinRequest, BrowserJoinResponse, BrowserLeaveRequest,
+    BrowserLeaveResponse, BrowserUpdate, ClientUpdate, CloseRequest, CloseResponse, OpenRequest,
+    OpenResponse, ServerUpdate,
 };
-use sshx_core::{rand_alphanumeric, Sid};
+use sshx_core::{rand_alphanumeric, Sid, Vid};
 use tokio::sync::mpsc;
 use tokio::time::{self, MissedTickBehavior};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
@@ -17,7 +20,7 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{error, info, warn};
 
 use crate::session::{Metadata, Session};
-use crate::web::protocol::{WsClaudeEvent, WsComponentGraph, WsSourceFile};
+use crate::web::protocol::{WsClaudeEvent, WsComponentGraph, WsSourceFile, WsVideoStream};
 use crate::ServerState;
 
 /// Interval for synchronizing sequence numbers with the client.
@@ -90,7 +93,10 @@ impl SshxService for GrpcServer {
         };
         let session = match self.0.backend_connect(&session_name).await {
             Ok(Some(session)) => session,
-            Ok(None) => return Err(Status::not_found("session not found")),
+            Ok(None) => {
+                warn!(session = %session_name, "channel: session not found (may have expired)");
+                return Err(Status::not_found("session not found"));
+            }
             Err(err) => {
                 error!(?err, "failed to connect to backend session");
                 return Err(Status::internal(err.to_string()));
@@ -242,6 +248,12 @@ async fn handle_update(tx: &ServerTx, session: &Session, update: ClientUpdate) -
                 Err(e) => warn!("failed to decode component graph: {e}"),
             }
         }
+        Some(ClientMessage::WidgetNames(bytes)) => {
+            match serde_json::from_slice::<std::collections::HashMap<String, String>>(&bytes) {
+                Ok(names) => session.apply_widget_names(&names),
+                Err(e) => warn!("failed to decode widget names: {e}"),
+            }
+        }
         Some(ClientMessage::Pong(ts)) => {
             let latency = get_time_ms().saturating_sub(ts);
             session.send_latency_measurement(latency);
@@ -266,6 +278,129 @@ async fn send_msg(tx: &ServerTx, message: ServerMessage) -> bool {
 /// Attempt to send an error string to the client.
 async fn send_err(tx: &ServerTx, err: String) -> bool {
     send_msg(tx, ServerMessage::Error(err)).await
+}
+
+/// Server that handles gRPC requests from sshx-browser clients.
+#[derive(Clone)]
+pub struct BrowserGrpcServer(Arc<ServerState>);
+
+impl BrowserGrpcServer {
+    /// Construct a new [`BrowserGrpcServer`] instance.
+    pub fn new(state: Arc<ServerState>) -> Self {
+        Self(state)
+    }
+}
+
+#[tonic::async_trait]
+impl BrowserService for BrowserGrpcServer {
+    async fn join(&self, request: Request<BrowserJoinRequest>) -> RR<BrowserJoinResponse> {
+        let req = request.into_inner();
+        validate_token(self.0.mac(), &req.session_name, &req.token)?;
+
+        let session = match self.0.frontend_connect(&req.session_name).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(_)) => return Err(Status::not_found("session not found")),
+            Err(e) => return Err(Status::internal(e.to_string())),
+        };
+
+        let vid = session.counter().next_vid();
+        let stream_info = WsVideoStream {
+            owner_uid: None,
+            label: "Browser".to_string(),
+            is_browser: true,
+            x: 100,
+            y: 100,
+            w: 640,
+            h: 400,
+        };
+        session.add_video_stream(vid, stream_info);
+        session.set_browser_controller(vid, None);
+
+        info!(%vid, session = %req.session_name, "browser stream joined");
+        Ok(Response::new(BrowserJoinResponse { vid: vid.0 }))
+    }
+
+    type StreamStream = ReceiverStream<Result<BrowserCommand, Status>>;
+
+    async fn stream(
+        &self,
+        request: Request<tonic::Streaming<BrowserUpdate>>,
+    ) -> RR<Self::StreamStream> {
+        let mut inbound = request.into_inner();
+
+        // The first message must identify the vid.
+        let first = match inbound.next().await {
+            Some(Ok(u)) => u,
+            _ => return Err(Status::invalid_argument("expected first frame")),
+        };
+        let vid = match &first.browser_message {
+            Some(BrowserMessage::Frame(f)) => Vid(f.vid),
+            _ => return Err(Status::invalid_argument("expected first frame message")),
+        };
+
+        // Find the session that owns this vid.
+        let session = match self.find_session_for_vid(vid) {
+            Some(s) => s,
+            None => {
+                warn!(%vid, "stream: video stream not found in any session");
+                return Err(Status::not_found("video stream not found"));
+            }
+        };
+
+        // Channel for sending commands back to sshx-browser.
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Result<BrowserCommand, Status>>(32);
+
+        // Store the frame sender in session so input events can be forwarded.
+        session.register_browser_cmd_sender(vid, cmd_tx.clone());
+
+        // Spawn a task that reads inbound frames and stores/broadcasts them.
+        let session_clone = Arc::clone(&session);
+        tokio::spawn(async move {
+            // Process the first frame we already read.
+            if let Some(BrowserMessage::Frame(frame)) = first.browser_message {
+                session_clone.store_browser_frame(vid, frame);
+            }
+            while let Some(result) = inbound.next().await {
+                match result {
+                    Ok(update) => match update.browser_message {
+                        Some(BrowserMessage::Frame(frame)) => {
+                            session_clone.store_browser_frame(vid, frame);
+                        }
+                        Some(BrowserMessage::Pong(ts)) => {
+                            session_clone.send_latency_measurement(ts);
+                        }
+                        None => {}
+                    },
+                    Err(e) => {
+                        warn!("browser stream error: {e}");
+                        break;
+                    }
+                }
+            }
+            // Stream ended — remove the video stream.
+            session_clone.remove_video_stream(vid);
+            session_clone.unregister_browser_cmd_sender(vid);
+            info!(%vid, "browser stream disconnected");
+        });
+
+        Ok(Response::new(ReceiverStream::new(cmd_rx)))
+    }
+
+    async fn leave(&self, request: Request<BrowserLeaveRequest>) -> RR<BrowserLeaveResponse> {
+        let req = request.into_inner();
+        let vid = Vid(req.vid);
+        if let Some(session) = self.find_session_for_vid(vid) {
+            session.remove_video_stream(vid);
+            session.unregister_browser_cmd_sender(vid);
+        }
+        Ok(Response::new(BrowserLeaveResponse {}))
+    }
+}
+
+impl BrowserGrpcServer {
+    fn find_session_for_vid(&self, vid: Vid) -> Option<Arc<Session>> {
+        self.0.find_session_with_vid(vid)
+    }
 }
 
 fn get_time_ms() -> u64 {

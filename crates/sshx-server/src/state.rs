@@ -8,13 +8,14 @@ use anyhow::Result;
 use dashmap::DashMap;
 use hmac::{Hmac, Mac as _};
 use sha2::Sha256;
-use sshx_core::rand_alphanumeric;
+use sshx_core::{rand_alphanumeric, Vid};
 use tokio::time;
 use tokio_stream::StreamExt;
 use tracing::error;
 
 use self::mesh::StorageMesh;
 use crate::session::Session;
+use crate::web::protocol::WsIceServer;
 use crate::ServerOptions;
 
 pub mod mesh;
@@ -34,6 +35,9 @@ pub struct ServerState {
     /// Override the origin returned for the Open() RPC.
     override_origin: Option<String>,
 
+    /// ICE server configuration sent to WebRTC clients.
+    ice_servers: Vec<WsIceServer>,
+
     /// A concurrent map of session IDs to session objects.
     store: DashMap<String, Arc<Session>>,
 
@@ -49,9 +53,23 @@ impl ServerState {
             Some(url) => Some(StorageMesh::new(&url, options.host.as_deref())?),
             None => None,
         };
+        // Build ICE server list from options.
+        let mut ice_servers: Vec<WsIceServer> = options
+            .stun_servers
+            .into_iter()
+            .map(|url| WsIceServer { urls: vec![url], username: None, credential: None })
+            .collect();
+        for (url, username, credential) in options.turn_servers {
+            ice_servers.push(WsIceServer {
+                urls: vec![url],
+                username: Some(username),
+                credential: Some(credential),
+            });
+        }
         Ok(Self {
             mac: Hmac::new_from_slice(secret.as_bytes()).unwrap(),
             override_origin: options.override_origin,
+            ice_servers,
             store: DashMap::new(),
             mesh,
         })
@@ -65,6 +83,11 @@ impl ServerState {
     /// Returns the override origin for the Open() RPC.
     pub fn override_origin(&self) -> Option<String> {
         self.override_origin.clone()
+    }
+
+    /// Returns the ICE server configuration for WebRTC clients.
+    pub fn ice_servers(&self) -> &[WsIceServer] {
+        &self.ice_servers
     }
 
     /// Lookup a local session by name.
@@ -176,6 +199,16 @@ impl ServerState {
                 }
             }
         }
+    }
+
+    /// Find the session that owns the given video stream vid.
+    pub fn find_session_with_vid(&self, vid: Vid) -> Option<Arc<Session>> {
+        for entry in &self.store {
+            if entry.value().list_video_streams().iter().any(|(v, _)| *v == vid) {
+                return Some(entry.value().clone());
+            }
+        }
+        None
     }
 
     /// Send a graceful shutdown signal to every session.

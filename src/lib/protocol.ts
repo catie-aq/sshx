@@ -2,6 +2,7 @@ type Sid = number; // u32
 type Uid = number; // u32
 type Nid = number; // u32
 type Wid = number; // u32
+type Vid = number; // u32
 
 /** Source file metadata, see WsSourceFile in the Rust server. */
 export type WsSourceFile = {
@@ -34,7 +35,7 @@ export type WsFileMetadataUpdate = {
 
 /** A real-time event from a Claude Code session. */
 export type WsClaudeEvent = {
-  kind: "tool_use" | "tool_result" | "user_message" | "assistant_message" | "transcript" | "claude_pid";
+  kind: "tool_use" | "tool_result" | "user_message" | "assistant_message" | "transcript" | "claude_pid" | "session_end";
   tool: string | null;
   content: string;
   timestamp: string;
@@ -83,7 +84,8 @@ export type WsWidgetKind =
   | { type: "fileTree"; root: string }
   | { type: "fileCard"; path: string }
   | { type: "graphView" }
-  | { type: "claudeFeed"; instanceId: string };
+  | { type: "claudeFeed"; instanceId: string }
+  | { type: "image"; url: string; alt: string };
 
 /** A generic canvas widget. */
 export type WsWidget = {
@@ -94,6 +96,33 @@ export type WsWidget = {
   kind: WsWidgetKind;
   /** Whether this widget is collapsed to a compact mini view. */
   collapsed: boolean;
+  /** User-set display name for this widget (optional). */
+  name?: string;
+};
+
+/** Metadata for an active video stream (screen share or offscreen browser). */
+export type WsVideoStream = {
+  ownerUid: Uid | null;
+  label: string;
+  isBrowser: boolean;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+};
+
+/** ICE server configuration (STUN or TURN) for WebRTC. */
+export type WsIceServer = {
+  urls: string[];
+  username?: string;
+  credential?: string;
+};
+
+/** ICE candidate for WebRTC negotiation. */
+export type WsIceCandidate = {
+  candidate: string;
+  sdpMid: string | null;
+  sdpMlineIndex: number | null;
 };
 
 /** Sticky note on the canvas, see the Rust version. */
@@ -146,6 +175,24 @@ export type WsServer = {
   shellNames?: [Sid, string][];
   /** A single shell name was set. */
   shellNameDiff?: [Sid, string];
+  /** Snapshot of all active video streams on connect. */
+  videoStreams?: [Vid, WsVideoStream][];
+  /** A single video stream was added or removed (null = removed). */
+  videoStreamDiff?: [Vid, WsVideoStream | null];
+  /** Relay a WebRTC offer. [vid, targetUid, sdp] */
+  rtcOffer?: [Vid, Uid, string];
+  /** Relay a WebRTC answer. [vid, targetUid, senderUid, sdp] */
+  rtcAnswer?: [Vid, Uid, Uid, string];
+  /** Relay an ICE candidate. [vid, targetUid, senderUid, candidate] */
+  rtcIce?: [Vid, Uid, Uid, WsIceCandidate];
+  /** Current controller of an offscreen browser stream (null = no one). */
+  browserControlStatus?: [Vid, Uid | null];
+  /** ICE server configuration for WebRTC (STUN/TURN). Sent once after Hello. */
+  iceServers?: WsIceServer[];
+  /** Broadcast a component-highlight to all connected overlay clients. */
+  highlightComponent?: string;
+  /** A raw VP8 video frame from a browser stream. [vid, timestamp_us, data, is_keyframe] */
+  browserFrame?: [Vid, bigint, Uint8Array, boolean];
 };
 
 /** Client message type, see the Rust version. */
@@ -181,6 +228,38 @@ export type WsClient = {
   openGraphView?: [number, number];
   /** Open a Claude activity feed widget at canvas position (x, y) for the given Claude session ID. */
   openClaudeFeed?: [number, number, string];
+  /** Set a user-defined name for a canvas widget. */
+  setWidgetName?: [Wid, string];
+  /** Begin sharing the current user's screen. */
+  startScreenShare?: true;
+  /** Stop sharing the current user's screen. */
+  stopScreenShare?: true;
+  /** Close a specific video stream for everyone. */
+  closeStream?: Vid;
+  /** Start watching a video stream (triggers offer/answer flow). */
+  watchStream?: Vid;
+  /** Stop watching a video stream. */
+  unwatchStream?: Vid;
+  /** Send a WebRTC offer to a specific peer. [vid, targetUid, sdp] */
+  sendRtcOffer?: [Vid, Uid, string];
+  /** Send a WebRTC answer to a specific peer. [vid, targetUid, sdp] */
+  sendRtcAnswer?: [Vid, Uid, string];
+  /** Send an ICE candidate to a specific peer. [vid, targetUid, candidate] */
+  sendRtcIce?: [Vid, Uid, WsIceCandidate];
+  /** Move a video stream widget to a new canvas position. */
+  moveVideoStream?: [Vid, number, number];
+  /** Resize a video stream widget. */
+  resizeVideoStream?: [Vid, number, number];
+  /** Forward a mouse/keyboard event to the offscreen browser. [vid, jsonEvent] */
+  browserInput?: [Vid, string];
+  /** Request exclusive control of an offscreen browser stream. */
+  requestBrowserControl?: Vid;
+  /** Release control of an offscreen browser stream. */
+  releaseBrowserControl?: Vid;
+  /** Create an image widget at canvas position (x, y) with URL and alt text. */
+  createImageWidget?: [number, number, string, string];
+  /** Request all connected overlay clients to flash a component by name. */
+  highlightComponent?: string;
 };
 
 /** An item in the command-palette search list. */

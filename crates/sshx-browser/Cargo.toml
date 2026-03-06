@@ -1,0 +1,27 @@
+[package]
+name = "sshx-browser"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Offscreen Chromium browser streamer for sshx sessions."
+repository.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+edition = "2021"
+
+[[bin]]
+name = "sshx-browser"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json = "1"
+sshx-core.workspace = true
+sshx-media = { path = "../sshx-media" }
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
