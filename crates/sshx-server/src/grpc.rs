@@ -221,6 +221,8 @@ async fn handle_update(tx: &ServerTx, session: &Session, update: ClientUpdate) -
             #[derive(serde::Deserialize)]
             struct Payload {
                 root: Option<String>,
+                #[serde(default, rename = "rootPath")]
+                root_path: Option<String>,
                 files: Vec<WsSourceFile>,
             }
             match zstd::decode_all(&*bytes)
@@ -228,7 +230,11 @@ async fn handle_update(tx: &ServerTx, session: &Session, update: ClientUpdate) -
                 .and_then(|raw| serde_json::from_slice::<Payload>(&raw)
                     .map_err(|e| format!("json parse: {e}")))
             {
-                Ok(p) => session.update_source_files(p.root.unwrap_or_default(), p.files),
+                Ok(p) => session.update_source_files(
+                    p.root.unwrap_or_default(),
+                    p.root_path.unwrap_or_default(),
+                    p.files,
+                ),
                 Err(e) => warn!("failed to decode source metadata: {e}"),
             }
         }

@@ -3,16 +3,20 @@ procs:
   server:
     shell: >-
       cargo run --bin sshx-server --
-      --override-origin https://homa-server2.gaur-toad.ts.net:5173
+      --port 8052
+      --override-origin https://homa-server2.burro-piranha.ts.net:3006
       --secret dev-secret
-      --redis-url redis://localhost:12601
+      --redis-url redis://localhost:12602
       --listen 0.0.0.0
-      --host homa-server2.gaur-toad.ts.net
+      --host homa-server2.burro-piranha.ts.net
   web:
-    shell: npm run dev
+    shell: SSHX_SERVER_PORT=8052 SSHX_WEB_PORT=3006 npm run dev
     stop: SIGKILL  # TODO: Why is this necessary?
   client:
     shell: >-
       cargo run --bin sshx --
-      --server http://homa-server2.gaur-toad.ts.net:8051
+      --server http://homa-server2.burro-piranha.ts.net:8052
     autostart: false
+
+
+ 

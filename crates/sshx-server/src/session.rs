@@ -12,7 +12,7 @@ use sshx_core::{
         browser_command::BrowserCommand as BrowserCmd, server_update::ServerMessage, BrowserCommand,
         InputEvent, SequenceNumbers, VideoFrame,
     },
-    IdCounter, Nid, Sid, Uid, Vid, Wid,
+    IdCounter, Nid, Sid, Tid, Uid, Vid, Wid,
 };
 use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tonic::Status;
@@ -22,7 +22,7 @@ use tokio_stream::Stream;
 use tracing::{debug, warn};
 
 use crate::utils::Shutdown;
-use crate::web::protocol::{WsClaudeEvent, WsComponentGraph, WsIceCandidate, WsNote, WsServer, WsSourceFile, WsUser, WsVideoStream, WsWidget, WsWinsize};
+use crate::web::protocol::{WsClaudeEvent, WsComponentGraph, WsIceCandidate, WsNote, WsServer, WsSourceFile, WsTextBlock, WsUser, WsVideoStream, WsWidget, WsWinsize};
 
 mod snapshot;
 
@@ -83,11 +83,11 @@ pub struct Session {
     notes_source: watch::Sender<Vec<(Nid, WsNote)>>,
 
     /// Cached source file metadata sent by the CLI workspace analyzer.
-    /// The String is the workspace root basename (e.g. "my-project").
-    source_files: RwLock<(String, Vec<WsSourceFile>)>,
+    /// Tuple: (rootName, rootPath, files).
+    source_files: RwLock<(String, String, Vec<WsSourceFile>)>,
 
     /// Watch channel source for source file snapshots; clients get the latest on connect.
-    source_files_source: watch::Sender<(String, Vec<WsSourceFile>)>,
+    source_files_source: watch::Sender<(String, String, Vec<WsSourceFile>)>,
 
     /// In-memory widget state.
     widgets: RwLock<HashMap<Wid, WsWidget>>,
@@ -121,6 +121,12 @@ pub struct Session {
 
     /// Per-vid GOP buffer: keyframe + subsequent deltas, for new-viewer catch-up.
     browser_frame_buffers: Mutex<HashMap<Vid, Vec<VideoFrame>>>,
+
+    /// In-memory state for text blocks.
+    text_blocks: RwLock<HashMap<Tid, WsTextBlock>>,
+
+    /// Watch channel source for the ordered list of text blocks.
+    text_blocks_source: watch::Sender<Vec<(Tid, WsTextBlock)>>,
 
     /// Triggered from metadata events when an immediate snapshot is needed.
     sync_notify: Notify,
@@ -168,8 +174,8 @@ impl Session {
             update_rx,
             notes: RwLock::new(HashMap::new()),
             notes_source: watch::channel(Vec::new()).0,
-            source_files: RwLock::new((String::new(), Vec::new())),
-            source_files_source: watch::channel((String::new(), Vec::new())).0,
+            source_files: RwLock::new((String::new(), String::new(), Vec::new())),
+            source_files_source: watch::channel((String::new(), String::new(), Vec::new())).0,
             widgets: RwLock::new(HashMap::new()),
             widget_source: watch::channel(Vec::new()).0,
             shell_names: RwLock::new(HashMap::new()),
@@ -181,6 +187,8 @@ impl Session {
             browser_cmd_senders: Mutex::new(HashMap::new()),
             browser_frame_subscribers: Mutex::new(HashMap::new()),
             browser_frame_buffers: Mutex::new(HashMap::new()),
+            text_blocks: RwLock::new(HashMap::new()),
+            text_blocks_source: watch::channel(Vec::new()).0,
             sync_notify: Notify::new(),
             shutdown: Shutdown::new(),
         }
@@ -501,14 +509,73 @@ impl Session {
         }
     }
 
+    /// Subscribe to text block changes.
+    pub fn subscribe_text_blocks(&self) -> impl Stream<Item = Vec<(Tid, WsTextBlock)>> + Unpin {
+        WatchStream::new(self.text_blocks_source.subscribe())
+    }
+
+    /// List all text blocks in the session.
+    pub fn list_text_blocks(&self) -> Vec<(Tid, WsTextBlock)> {
+        self.text_blocks
+            .read()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
+    }
+
+    /// Add a new text block at the given canvas position.
+    pub fn add_text_block(&self, id: Tid, x: i32, y: i32) -> Result<()> {
+        use std::collections::hash_map::Entry::*;
+        let block = WsTextBlock {
+            x,
+            y,
+            content: String::new(),
+            font_size: "md".into(),
+            color: "#ffffff".into(),
+            align: "left".into(),
+        };
+        match self.text_blocks.write().entry(id) {
+            Occupied(_) => bail!("text block already exists with id={id}"),
+            Vacant(v) => {
+                v.insert(block.clone());
+            }
+        }
+        self.broadcast.send(WsServer::TextBlockDiff(id, Some(block))).ok();
+        self.sync_now();
+        Ok(())
+    }
+
+    /// Update all fields of an existing text block.
+    pub fn update_text_block(&self, id: Tid, block: WsTextBlock) -> Result<()> {
+        {
+            let mut text_blocks = self.text_blocks.write();
+            *text_blocks.get_mut(&id).context("text block not found")? = block.clone();
+        }
+        self.broadcast.send(WsServer::TextBlockDiff(id, Some(block))).ok();
+        self.sync_now();
+        Ok(())
+    }
+
+    /// Delete a text block by ID.
+    pub fn delete_text_block(&self, id: Tid) -> Result<()> {
+        match self.text_blocks.write().remove(&id) {
+            Some(_) => {
+                self.broadcast.send(WsServer::TextBlockDiff(id, None)).ok();
+                self.sync_now();
+                Ok(())
+            }
+            None => bail!("text block with id={id} does not exist"),
+        }
+    }
+
     /// Replace the stored source file metadata and notify all WebSocket clients.
-    pub fn update_source_files(&self, root: String, files: Vec<WsSourceFile>) {
-        *self.source_files.write() = (root.clone(), files.clone());
-        self.source_files_source.send_modify(|s| *s = (root, files));
+    pub fn update_source_files(&self, root: String, root_path: String, files: Vec<WsSourceFile>) {
+        *self.source_files.write() = (root.clone(), root_path.clone(), files.clone());
+        self.source_files_source.send_modify(|s| *s = (root, root_path, files));
     }
 
     /// Return a snapshot of the current source file metadata.
-    pub fn list_source_files(&self) -> (String, Vec<WsSourceFile>) {
+    pub fn list_source_files(&self) -> (String, String, Vec<WsSourceFile>) {
         self.source_files.read().clone()
     }
 
@@ -720,7 +787,7 @@ impl Session {
     ) -> sshx_core::proto::UpdateFileMetadata {
         let mut sf_lock = self.source_files.write();
         let mut changed = false;
-        for file in &mut sf_lock.1 {
+        for file in &mut sf_lock.2 {
             if file.path == path {
                 if let Some(ref ip) = update.image_path {
                     file.image_path = ip.clone();
@@ -756,7 +823,7 @@ impl Session {
     }
 
     /// Subscribe to source file updates (watch stream, delivers latest on connect).
-    pub fn subscribe_source_files(&self) -> impl Stream<Item = (String, Vec<WsSourceFile>)> + Unpin {
+    pub fn subscribe_source_files(&self) -> impl Stream<Item = (String, String, Vec<WsSourceFile>)> + Unpin {
         WatchStream::new(self.source_files_source.subscribe())
     }
 
@@ -877,6 +944,25 @@ impl Session {
         self.widget_source.send_modify(|s| {
             if let Some(entry) = s.iter_mut().find(|(wid, _)| *wid == id) {
                 entry.1.name = if name.is_empty() { None } else { Some(name.clone()) };
+            }
+        });
+        let updated = self.widgets.read().get(&id).cloned();
+        if let Some(widget) = updated {
+            self.broadcast.send(WsServer::WidgetDiff(id, Some(widget))).ok();
+        }
+        Ok(())
+    }
+
+    /// Replace the `kind` field of an existing widget and broadcast the update.
+    pub fn update_widget_kind(&self, id: Wid, kind: crate::web::protocol::WsWidgetKind) -> Result<()> {
+        {
+            let mut widgets = self.widgets.write();
+            let widget = widgets.get_mut(&id).context("widget not found")?;
+            widget.kind = kind.clone();
+        }
+        self.widget_source.send_modify(|s| {
+            if let Some(entry) = s.iter_mut().find(|(wid, _)| *wid == id) {
+                entry.1.kind = kind;
             }
         });
         let updated = self.widgets.read().get(&id).cloned();

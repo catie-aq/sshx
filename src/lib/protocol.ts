@@ -3,6 +3,7 @@ type Uid = number; // u32
 type Nid = number; // u32
 type Wid = number; // u32
 type Vid = number; // u32
+type Tid = number; // u32
 
 /** Source file metadata, see WsSourceFile in the Rust server. */
 export type WsSourceFile = {
@@ -85,7 +86,8 @@ export type WsWidgetKind =
   | { type: "fileCard"; path: string }
   | { type: "graphView" }
   | { type: "claudeFeed"; instanceId: string }
-  | { type: "image"; url: string; alt: string };
+  | { type: "image"; url: string; alt: string }
+  | { type: "appOverlay"; url: string; allowOpenFile: boolean; allowOpenClaude: boolean };
 
 /** A generic canvas widget. */
 export type WsWidget = {
@@ -134,6 +136,16 @@ export type WsNote = {
   pinned: boolean;
 };
 
+/** A text block on the canvas (FigJam-style rich text). */
+export type WsTextBlock = {
+  x: number;
+  y: number;
+  content: string;
+  fontSize: string;
+  color: string;
+  align: string;
+};
+
 /** Position and size of a window, see the Rust version. */
 export type WsWinsize = {
   x: number;
@@ -164,8 +176,8 @@ export type WsServer = {
   error?: string;
   notes?: [Nid, WsNote][];
   noteDiff?: [Nid, WsNote | null];
-  /** [workspaceRootName, files[]] */
-  sourceFiles?: [string, WsSourceFile[]];
+  /** [workspaceRootName, workspaceRootPath, files[]] */
+  sourceFiles?: [string, string, WsSourceFile[]];
   claudeEvent?: WsClaudeEvent;
   widgets?: [Wid, WsWidget][];
   widgetDiff?: [Wid, WsWidget | null];
@@ -193,6 +205,10 @@ export type WsServer = {
   highlightComponent?: string;
   /** A raw VP8 video frame from a browser stream. [vid, timestamp_us, data, is_keyframe] */
   browserFrame?: [Vid, bigint, Uint8Array, boolean];
+  /** Snapshot of all text blocks on connect. */
+  textBlocks?: [Tid, WsTextBlock][];
+  /** A single text block was created, updated, or deleted (null = deleted). */
+  textBlockDiff?: [Tid, WsTextBlock | null];
 };
 
 /** Client message type, see the Rust version. */
@@ -260,6 +276,16 @@ export type WsClient = {
   createImageWidget?: [number, number, string, string];
   /** Request all connected overlay clients to flash a component by name. */
   highlightComponent?: string;
+  /** Open the app overlay widget at canvas position (x, y). */
+  openAppOverlay?: [number, number];
+  /** Update the app overlay widget settings. [wid, url, allowOpenFile, allowOpenClaude] */
+  updateAppOverlay?: [Wid, string, boolean, boolean];
+  /** Create a new text block at canvas position (x, y). */
+  createTextBlock?: [number, number];
+  /** Replace all fields of an existing text block. */
+  updateTextBlock?: [Tid, WsTextBlock];
+  /** Delete a text block by ID. */
+  deleteTextBlock?: Tid;
 };
 
 /** An item in the command-palette search list. */

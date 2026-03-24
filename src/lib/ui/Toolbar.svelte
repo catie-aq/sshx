@@ -6,6 +6,7 @@
     FileTextIcon,
     FolderIcon,
     GitBranchIcon,
+    GlobeIcon,
     MessageSquareIcon,
     MonitorIcon,
     PlusCircleIcon,
@@ -28,6 +29,8 @@
   export let graphMode: boolean = false;
 
   export let isSharing: boolean = false;
+  export let appOverlayOpen: boolean = false;
+  export let textToolActive: boolean = false;
   /** Number of video streams dismissed (hidden) by the user. */
   export let hiddenStreamCount: number = 0;
 
@@ -38,6 +41,7 @@
     networkInfo: void;
     modeChange: "terminal" | "creative";
     createNote: void;
+    toggleTextTool: void;
     toggleWorkspace: void;
     openClaudeInstance: string;
     resumeClaudeInTerminal: string;
@@ -46,6 +50,7 @@
     startScreenShare: void;
     stopScreenShare: void;
     showStreams: void;
+    toggleAppOverlay: void;
   }>();
 
   let claudeDropdownOpen = false;
@@ -110,6 +115,15 @@
         >
           <PlusCircleIcon strokeWidth={1.5} class="p-0.5" />
         </button>
+        <button
+          class="icon-button"
+          class:text-tool-active={textToolActive}
+          on:click={() => dispatch("toggleTextTool")}
+          disabled={!connected || !hasWriteAccess}
+          title={textToolActive ? "Cancel text tool (Esc)" : "Add text block (T)"}
+        >
+          <span class="text-sm font-bold leading-none px-0.5">T</span>
+        </button>
       {/if}
 
       <!-- Workspace toggle — independent of mode -->
@@ -162,6 +176,17 @@
         title={isSharing ? "Stop screen share" : "Share your screen"}
       >
         <CastIcon strokeWidth={1.5} class="p-0.5" />
+      </button>
+
+      <!-- App overlay toggle -->
+      <button
+        class="icon-button"
+        class:app-active={appOverlayOpen}
+        on:click={() => dispatch("toggleAppOverlay")}
+        disabled={!connected}
+        title={appOverlayOpen ? "App overlay open" : "App overlay"}
+      >
+        <GlobeIcon strokeWidth={1.5} class="p-0.5" />
       </button>
 
       <!-- Restore hidden streams (visible only when streams are dismissed) -->
@@ -235,6 +260,14 @@
 
   .share-active {
     @apply bg-red-900 text-red-200 hover:bg-red-800;
+  }
+
+  .app-active {
+    @apply bg-purple-900 text-purple-200 hover:bg-purple-800;
+  }
+
+  .text-tool-active {
+    @apply bg-amber-900 text-amber-200 hover:bg-amber-800;
   }
 
   .streams-hidden {

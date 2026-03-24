@@ -121,14 +121,112 @@
     }
   }
 
+  // --- Browser input handling (keyboard + mouse) ---
+
+  /** Map DOM key values to X11 keysym values. */
+  const SPECIAL_KEYSYMS: Record<string, number> = {
+    Backspace: 0xff08, Tab: 0xff09, Return: 0xff0d, Enter: 0xff0d,
+    Escape: 0xff1b, Delete: 0xffff, Insert: 0xff63,
+    Home: 0xff50, End: 0xff57, PageUp: 0xff55, PageDown: 0xff56,
+    ArrowLeft: 0xff51, ArrowUp: 0xff52, ArrowRight: 0xff53, ArrowDown: 0xff54,
+    F1: 0xffbe, F2: 0xffbf, F3: 0xffc0, F4: 0xffc1, F5: 0xffc2, F6: 0xffc3,
+    F7: 0xffc4, F8: 0xffc5, F9: 0xffc6, F10: 0xffc7, F11: 0xffc8, F12: 0xffc9,
+    Shift: 0xffe1, Control: 0xffe3, Alt: 0xffe9, Meta: 0xffeb,
+    CapsLock: 0xffe5, NumLock: 0xff7f, ScrollLock: 0xff14,
+    " ": 0x0020,
+  };
+
+  function keyToKeysym(key: string): number | null {
+    if (SPECIAL_KEYSYMS[key] !== undefined) return SPECIAL_KEYSYMS[key];
+    // Single printable character: use its Unicode code point (works for Latin-1).
+    if (key.length === 1) return key.charCodeAt(0);
+    return null;
+  }
+
   function handleControlKey(e: KeyboardEvent) {
     if (!hasControl || !stream.isBrowser) return;
+    const keysym = keyToKeysym(e.key);
+    if (keysym === null) return;
     e.preventDefault();
     dispatch("browserInput", JSON.stringify({
-      type: e.type === "keydown" ? "keydown" : "keyup",
-      key: e.key,
-      code: e.code,
+      type: "key",
+      keysym,
+      pressed: e.type === "keydown",
     }));
+  }
+
+  /** Reference to the interactive container div (for focus management). */
+  let containerEl: HTMLDivElement;
+
+  /** Convert mouse coordinates to Xvfb display coordinates, accounting for
+   *  letterboxing from object-contain. */
+  function toDisplayCoords(e: MouseEvent, el: HTMLElement): { x: number; y: number } | null {
+    if (!canvasEl) return null;
+    const rect = el.getBoundingClientRect();
+    const nativeW = canvasEl.width || 1280;
+    const nativeH = canvasEl.height || 720;
+    // Compute the actual rendered area within the object-contain box.
+    const contentAspect = nativeW / nativeH;
+    const boxAspect = rect.width / rect.height;
+    let renderedW: number, renderedH: number, offsetX: number, offsetY: number;
+    if (boxAspect > contentAspect) {
+      // Box is wider → black bars on left/right.
+      renderedH = rect.height;
+      renderedW = rect.height * contentAspect;
+      offsetX = (rect.width - renderedW) / 2;
+      offsetY = 0;
+    } else {
+      // Box is taller → black bars on top/bottom.
+      renderedW = rect.width;
+      renderedH = rect.width / contentAspect;
+      offsetX = 0;
+      offsetY = (rect.height - renderedH) / 2;
+    }
+    const x = Math.round(((e.clientX - rect.left - offsetX) / renderedW) * nativeW);
+    const y = Math.round(((e.clientY - rect.top - offsetY) / renderedH) * nativeH);
+    // Clamp to valid display coords; return null if click is in the letterbox area.
+    if (x < 0 || x >= nativeW || y < 0 || y >= nativeH) return null;
+    return { x, y };
+  }
+
+  function handleMouseMove(e: MouseEvent) {
+    if (!hasControl || !stream.isBrowser) return;
+    const coords = toDisplayCoords(e, e.currentTarget as HTMLElement);
+    if (!coords) return;
+    dispatch("browserInput", JSON.stringify({ type: "mouseMove", ...coords }));
+  }
+
+  function handleMouseButton(e: MouseEvent) {
+    if (!hasControl || !stream.isBrowser) return;
+    e.preventDefault();
+    // Ensure keyboard focus stays on the container div.
+    if (e.type === "mousedown" && containerEl) containerEl.focus();
+    const coords = toDisplayCoords(e, e.currentTarget as HTMLElement);
+    if (!coords) return;
+    // Move cursor to click position first, then press/release.
+    dispatch("browserInput", JSON.stringify({ type: "mouseMove", ...coords }));
+    // DOM button: 0=left, 1=middle, 2=right → X11: 1=left, 2=middle, 3=right
+    const button = e.button + 1;
+    dispatch("browserInput", JSON.stringify({
+      type: "mouseButton",
+      button,
+      pressed: e.type === "mousedown",
+    }));
+  }
+
+  function handleWheel(e: WheelEvent) {
+    if (!hasControl || !stream.isBrowser) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dispatch("browserInput", JSON.stringify({
+      type: "scroll",
+      deltaX: e.deltaX,
+      deltaY: e.deltaY,
+    }));
+  }
+
+  function handleContextMenu(e: MouseEvent) {
+    if (hasControl && stream.isBrowser) e.preventDefault();
   }
 
   onDestroy(() => {
@@ -196,10 +294,16 @@
   <!-- Video area -->
   <!-- svelte-ignore a11y-no-noninteractive-tabindex -->
   <div
+    bind:this={containerEl}
     class="relative flex-1 bg-black overflow-hidden outline-none"
     tabindex={hasControl && stream.isBrowser ? 0 : -1}
     on:keydown={handleControlKey}
     on:keyup={handleControlKey}
+    on:mousemove={handleMouseMove}
+    on:mousedown={handleMouseButton}
+    on:mouseup={handleMouseButton}
+    on:wheel|nonpassive={handleWheel}
+    on:contextmenu={handleContextMenu}
   >
     {#if stream.isBrowser}
       <!-- Canvas-based VP8 rendering for offscreen browser streams -->

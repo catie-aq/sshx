@@ -83,6 +83,17 @@ impl Display for Vid {
     }
 }
 
+/// Unique identifier for a text block within a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Tid(pub u32);
+
+impl Display for Tid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "tid#{}", self.0)
+    }
+}
+
 /// A counter for generating unique identifiers.
 #[derive(Debug)]
 pub struct IdCounter {
@@ -91,6 +102,7 @@ pub struct IdCounter {
     next_nid: AtomicU32,
     next_wid: AtomicU32,
     next_vid: AtomicU32,
+    next_tid: AtomicU32,
 }
 
 impl Default for IdCounter {
@@ -101,6 +113,7 @@ impl Default for IdCounter {
             next_nid: AtomicU32::new(1),
             next_wid: AtomicU32::new(1),
             next_vid: AtomicU32::new(1),
+            next_tid: AtomicU32::new(1),
         }
     }
 }
@@ -129,6 +142,11 @@ impl IdCounter {
     /// Returns the next unique video stream ID.
     pub fn next_vid(&self) -> Vid {
         Vid(self.next_vid.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Returns the next unique text block ID.
+    pub fn next_tid(&self) -> Tid {
+        Tid(self.next_tid.fetch_add(1, Ordering::Relaxed))
     }
 
     /// Return the current internal values of the counter.

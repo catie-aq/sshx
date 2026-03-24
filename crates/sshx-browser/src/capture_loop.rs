@@ -7,7 +7,7 @@ use sshx_core::proto::{
 };
 use sshx_media::{
     capture::XcapSource,
-    encode::{skip_ivf_file_header, Vp8Encoder},
+    encode::Vp8Encoder,
     input::{InputEvent, XInput},
     FrameSource,
 };
@@ -111,36 +111,6 @@ fn capture_thread(
     let mut encoder = Vp8Encoder::new(width, height, fps, bitrate_kbps)
         .context("failed to create Vp8Encoder")?;
 
-    // ffmpeg only flushes the IVF file header after receiving the first input
-    // frame (pipe output is buffered). Capture and push the first frame first,
-    // then skip the header, then read back the encoded packet(s) for that frame.
-    let first_frame = match source.next_frame()? {
-        Some(f) => f,
-        None => return Ok(()),
-    };
-    encoder.push_frame(&first_frame).context("failed to push first frame to ffmpeg")?;
-
-    // Drop stdin to flush — NOT here; we still need it. ffmpeg should now have
-    // enough data to write the IVF file header to stdout.
-    skip_ivf_file_header(&mut encoder).context("failed to skip IVF header")?;
-
-    // Process the encoded output for the first frame before entering the loop.
-    let first_timestamp = first_frame.timestamp_us;
-    while let Some(packet) = encoder.read_packet()? {
-        let keyframe = Vp8Encoder::is_keyframe(&packet);
-        let update = BrowserUpdate {
-            browser_message: Some(BrowserMessage::Frame(VideoFrame {
-                vid,
-                data: packet.into(),
-                timestamp: first_timestamp,
-                keyframe,
-            })),
-        };
-        if tx.blocking_send(update).is_err() {
-            return Ok(());
-        }
-    }
-
     loop {
         // Capture next frame.
         let frame = match source.next_frame()? {
@@ -150,24 +120,39 @@ fn capture_thread(
 
         let timestamp_us = frame.timestamp_us;
 
-        // Push to encoder.
+        // Push to encoder (non-blocking write to ffmpeg stdin).
         encoder.push_frame(&frame)?;
 
-        // Read encoded packet(s).
-        while let Some(packet) = encoder.read_packet()? {
-            let keyframe = Vp8Encoder::is_keyframe(&packet);
+        // Drain all available encoded packets (the reader thread may have
+        // produced packets from this or previous frames).
+        // Use a short blocking read to wait for at least one packet after pushing.
+        if let Some(packet) = encoder.read_packet() {
             let update = BrowserUpdate {
                 browser_message: Some(BrowserMessage::Frame(VideoFrame {
                     vid,
-                    data: packet.into(),
+                    data: packet.data.into(),
                     timestamp: timestamp_us,
-                    keyframe,
+                    keyframe: packet.keyframe,
                 })),
             };
-            // Non-blocking send; drop frames if the channel is full (backpressure).
             if tx.blocking_send(update).is_err() {
                 info!("frame channel closed; stopping capture");
                 return Ok(());
+            }
+
+            // Drain any additional packets that are ready (non-blocking).
+            while let Some(extra) = encoder.try_read_packet() {
+                let update = BrowserUpdate {
+                    browser_message: Some(BrowserMessage::Frame(VideoFrame {
+                        vid,
+                        data: extra.data.into(),
+                        timestamp: timestamp_us,
+                        keyframe: extra.keyframe,
+                    })),
+                };
+                if tx.blocking_send(update).is_err() {
+                    return Ok(());
+                }
             }
         }
     }

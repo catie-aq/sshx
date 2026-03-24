@@ -243,7 +243,7 @@ export class TouchZoom {
           [y, 0]
         : // scroll = pan vertically (or in any direction on a trackpad)
           [x, y],
-      0.5,
+      1.5,
     );
 
     if (Vec.isEqual(delta, [0, 0])) return;

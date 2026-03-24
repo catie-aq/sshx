@@ -91,6 +91,25 @@
     </p>
   </section>
 
+  <div
+    class="mb-10 max-w-md border border-zinc-700 rounded-lg bg-zinc-900/80 p-5"
+  >
+    <h3 class="text-sm font-medium uppercase tracking-wide text-zinc-300 mb-2">
+      Development Build
+    </h3>
+    <p class="text-sm text-zinc-400 mb-4">
+      Latest dev binaries from the <code class="name">claude</code> branch.
+    </p>
+    <div class="flex flex-wrap gap-2">
+      <DownloadLink href="/dist/sshx-0.4.1-linux-x86_64.tar.gz"
+        >Linux x86_64</DownloadLink
+      >
+      <DownloadLink href="/dist/sshx-0.4.1-darwin-x86_64.tar.gz"
+        >macOS x86_64</DownloadLink
+      >
+    </div>
+  </div>
+
   <div class="pb-12 md:pb-36">
     <button
       class="bg-pink-700 hover:bg-pink-600 active:ring-4 active:ring-pink-500/50 text-lg font-medium px-8 py-2 rounded-full"

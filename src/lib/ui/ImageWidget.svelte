@@ -1,8 +1,6 @@
 <script lang="ts">
   import { createEventDispatcher } from "svelte";
   import type { WsWidget } from "../protocol";
-  import CircleButton from "./CircleButton.svelte";
-  import CircleButtons from "./CircleButtons.svelte";
 
   export let widget: WsWidget;
   export let canWrite: boolean;
@@ -12,56 +10,51 @@
     delete: void;
   }>();
 
+  let el: HTMLDivElement;
+
   $: imageUrl = widget.kind.type === "image" ? widget.kind.url : "";
   $: imageAlt = widget.kind.type === "image" ? widget.kind.alt : "";
-  $: title = imageAlt || imageUrl.split("/").pop()?.replace(/^[a-z0-9]{8}_/, "") || "Image";
+
+  function handleKeydown(e: KeyboardEvent) {
+    if (!canWrite) return;
+    if (e.key === "Delete" || e.key === "Backspace") {
+      e.preventDefault();
+      dispatch("delete");
+    }
+  }
+
+  function handleMousedown(e: MouseEvent) {
+    el?.focus();
+    if (canWrite) dispatch("startMove", e);
+  }
 </script>
 
+<!-- svelte-ignore a11y-no-noninteractive-tabindex -->
 <div
-  class="panel-window flex flex-col select-none"
+  bind:this={el}
+  class="image-widget"
   style:width="{widget.w}px"
   style:height="{widget.h}px"
+  tabindex="0"
+  on:keydown={handleKeydown}
+  on:mousedown={handleMousedown}
 >
-  <!-- Title bar / drag handle -->
-  <div
-    class="flex flex-shrink-0 select-none cursor-grab active:cursor-grabbing"
-    on:mousedown={(e) => { if (canWrite) dispatch("startMove", e); }}
-  >
-    <div class="flex-1 flex items-center px-3 py-1.5">
-      <CircleButtons>
-        <CircleButton
-          kind="red"
-          on:mousedown={(e) => e.button === 0 && dispatch("delete")}
-        />
-      </CircleButtons>
-    </div>
-    <div
-      class="py-2 text-sm text-zinc-300 text-center font-medium overflow-hidden whitespace-nowrap text-ellipsis w-0 flex-grow-[4] font-mono"
-    >
-      {title}
-    </div>
-    <div class="flex-1" />
-  </div>
-
-  <!-- Image body -->
-  <div class="flex-1 min-h-0 bg-zinc-900 rounded-b-lg overflow-hidden">
-    {#if imageUrl}
-      <img
-        src={imageUrl}
-        alt={imageAlt}
-        class="w-full h-full object-contain"
-        draggable="false"
-      />
-    {/if}
-  </div>
+  {#if imageUrl}
+    <img
+      src={imageUrl}
+      alt={imageAlt}
+      class="w-full h-full object-contain pointer-events-none"
+      draggable="false"
+    />
+  {/if}
 </div>
 
 <style lang="postcss">
-  .panel-window {
-    @apply inline-flex rounded-lg border border-zinc-700 bg-zinc-800 opacity-90;
-    transition: opacity 200ms;
+  .image-widget {
+    @apply inline-flex rounded border border-zinc-600 bg-zinc-900 overflow-hidden cursor-grab active:cursor-grabbing;
+    outline: none;
   }
-  .panel-window:hover {
-    @apply opacity-100;
+  .image-widget:focus {
+    @apply border-indigo-500;
   }
 </style>

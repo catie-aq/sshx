@@ -1,0 +1,72 @@
+# Services used by sshx for development.
+#
+# Usage:
+#   docker compose up -d          # Start all services in background
+#   docker compose up             # Start with logs visible
+#   docker compose logs -f web    # Follow logs for a specific service
+#   docker compose down           # Stop all services
+
+services:
+  redis-dev:
+    image: redis:7.2
+    container_name: sshx-dev-redis
+    environment:
+      - ALLOW_EMPTY_PASSWORD=yes
+    ports:
+      - 127.0.0.1:${SSHX_REDIS_PORT:-12602}:6379
+    restart: unless-stopped
+
+  backend-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend-dev
+    container_name: sshx-dev-backend
+    network_mode: host
+    working_dir: /app
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - .:/app
+      - ./${TLS_CERT:-homa-server2.burro-piranha.ts.net.crt}:/certs/server.crt:ro
+      - ./${TLS_KEY:-homa-server2.burro-piranha.ts.net.key}:/certs/server.key:ro
+      - cargo-cache-dev:/usr/local/cargo/registry
+      - cargo-target-dev:/app/target
+    command: >
+      cargo run --bin sshx-server --
+      --port ${SSHX_SERVER_PORT:-8052}
+      --override-origin https://${SSHX_HOST:-homa-server2.burro-piranha.ts.net}:${SSHX_WEB_PORT:-3006}
+      --secret ${SSHX_SECRET:-dev-secret}
+      --redis-url redis://localhost:${SSHX_REDIS_PORT:-12602}
+      --listen 0.0.0.0
+      --host ${SSHX_HOST:-homa-server2.burro-piranha.ts.net}
+    depends_on:
+      - redis-dev
+    restart: unless-stopped
+
+  web-dev:
+    image: node:18
+
+    container_name: sshx-dev-web
+    network_mode: host
+    working_dir: /app
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - .:/app
+      - ./${TLS_CERT:-homa-server2.burro-piranha.ts.net.crt}:/certs/server.crt:ro
+      - ./${TLS_KEY:-homa-server2.burro-piranha.ts.net.key}:/certs/server.key:ro
+      - node-modules-dev:/app/node_modules
+    environment:
+      - HOME=/tmp
+      - SSHX_SERVER_PORT=${SSHX_SERVER_PORT:-8052}
+      - SSHX_WEB_PORT=${SSHX_WEB_PORT:-3006}
+    command: sh -c "git config --global --add safe.directory /app && npm install && npm run dev"
+    depends_on:
+      - backend-dev
+    restart: unless-stopped
+
+volumes:
+  cargo-cache-dev:
+    name: sshx-dev-cargo-cache
+  cargo-target-dev:
+    name: sshx-dev-cargo-target
+  node-modules-dev:
+    name: sshx-dev-node-modules

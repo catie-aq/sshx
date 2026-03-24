@@ -134,8 +134,9 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>, ice_server
     let mut broadcast_stream = session.subscribe_broadcast();
     send(socket, WsServer::Users(session.list_users())).await?;
     send(socket, WsServer::Notes(session.list_notes())).await?;
-    let (sf_root, sf_files) = session.list_source_files();
-    send(socket, WsServer::SourceFiles(sf_root, sf_files)).await?;
+    send(socket, WsServer::TextBlocks(session.list_text_blocks())).await?;
+    let (sf_root, sf_root_path, sf_files) = session.list_source_files();
+    send(socket, WsServer::SourceFiles(sf_root, sf_root_path, sf_files)).await?;
     send(socket, WsServer::Widgets(session.list_widgets())).await?;
     send(socket, WsServer::ShellNames(session.list_shell_names())).await?;
     if let Some(graph) = session.get_component_graph() {
@@ -163,6 +164,7 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>, ice_server
 
     let mut shells_stream = session.subscribe_shells();
     let mut notes_stream = session.subscribe_notes();
+    let mut text_blocks_stream = session.subscribe_text_blocks();
     let mut source_files_stream = session.subscribe_source_files();
     let mut widget_stream = session.subscribe_widgets();
     let mut video_streams_stream = session.subscribe_video_streams();
@@ -182,8 +184,12 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>, ice_server
                 send(socket, WsServer::Notes(notes)).await?;
                 continue;
             }
-            Some((root, files)) = source_files_stream.next() => {
-                send(socket, WsServer::SourceFiles(root, files)).await?;
+            Some(text_blocks) = text_blocks_stream.next() => {
+                send(socket, WsServer::TextBlocks(text_blocks)).await?;
+                continue;
+            }
+            Some((root, root_path, files)) = source_files_stream.next() => {
+                send(socket, WsServer::SourceFiles(root, root_path, files)).await?;
                 continue;
             }
             Some(widgets) = widget_stream.next() => {
@@ -563,6 +569,67 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>, ice_server
             }
             WsClient::HighlightComponent(name) => {
                 session.broadcast_highlight(name);
+            }
+            WsClient::OpenAppOverlay(x, y) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                let id = session.counter().next_wid();
+                let widget = WsWidget {
+                    x,
+                    y,
+                    w: 320,
+                    h: 280,
+                    kind: WsWidgetKind::AppOverlay {
+                        url: String::new(),
+                        allow_open_file: true,
+                        allow_open_claude: true,
+                    },
+                    collapsed: false,
+                    name: None,
+                };
+                if let Err(err) = session.add_widget(id, widget) {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
+            }
+            WsClient::UpdateAppOverlay(wid, url, allow_open_file, allow_open_claude) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                let kind = WsWidgetKind::AppOverlay { url, allow_open_file, allow_open_claude };
+                if let Err(err) = session.update_widget_kind(wid, kind) {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
+            }
+            WsClient::CreateTextBlock(x, y) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                let id = session.counter().next_tid();
+                if let Err(err) = session.add_text_block(id, x, y) {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
+            }
+            WsClient::UpdateTextBlock(id, block) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                if let Err(err) = session.update_text_block(id, block) {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
+            }
+            WsClient::DeleteTextBlock(id) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                if let Err(err) = session.delete_text_block(id) {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
             }
             WsClient::CreateImageWidget(x, y, url, alt) => {
                 if let Err(e) = session.check_write_permission(user_id) {

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use sshx_core::{Nid, Sid, Uid, Vid, Wid};
+use sshx_core::{Nid, Sid, Tid, Uid, Vid, Wid};
 
 /// Real-time message conveying the position and size of a terminal.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +87,24 @@ pub struct WsNote {
     pub color: String,
     /// Whether the note is pinned (position locked).
     pub pinned: bool,
+}
+
+/// A text block on the canvas (FigJam-style rich text).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WsTextBlock {
+    /// The x-coordinate of the text block on the canvas.
+    pub x: i32,
+    /// The y-coordinate of the text block on the canvas.
+    pub y: i32,
+    /// HTML content (bold, links, colored spans, lists).
+    pub content: String,
+    /// Font size key: "xs" | "sm" | "md" | "lg" | "xl".
+    pub font_size: String,
+    /// Hex color like "#ffffff".
+    pub color: String,
+    /// Text alignment: "left" | "center" | "right".
+    pub align: String,
 }
 
 /// Metadata for a source file, extracted by the CLI workspace analyzer.
@@ -189,6 +207,15 @@ pub enum WsWidgetKind {
         url: String,
         /// Optional alt text / filename.
         alt: String,
+    },
+    /// App observability overlay panel.
+    AppOverlay {
+        /// URL of the observed application.
+        url: String,
+        /// Whether the overlay can open file cards in SSHX.
+        allow_open_file: bool,
+        /// Whether the overlay can trigger Claude Code actions.
+        allow_open_claude: bool,
     },
 }
 
@@ -308,8 +335,8 @@ pub enum WsServer {
     /// A single note was created, updated, or deleted (None = deleted).
     NoteDiff(Nid, Option<WsNote>),
     /// Snapshot of source file metadata (sent on connect and on update).
-    /// The String is the workspace root basename (e.g. "my-project").
-    SourceFiles(String, Vec<WsSourceFile>),
+    /// Fields: (rootName, rootPath, files).
+    SourceFiles(String, String, Vec<WsSourceFile>),
     /// A real-time event from a Claude Code session.
     ClaudeEvent(WsClaudeEvent),
     /// Component graph derived from the workspace analysis (sent on connect and on update).
@@ -340,6 +367,10 @@ pub enum WsServer {
     HighlightComponent(String),
     /// A raw VP8 video frame from a browser stream. (vid, timestamp_us, data, keyframe)
     BrowserFrame(Vid, u64, Bytes, bool),
+    /// Snapshot of all text blocks when a client first connects.
+    TextBlocks(Vec<(Tid, WsTextBlock)>),
+    /// A single text block was created, updated, or deleted (None = deleted).
+    TextBlockDiff(Tid, Option<WsTextBlock>),
 }
 
 /// A real-time message sent from the client over WebSocket.
@@ -430,4 +461,14 @@ pub enum WsClient {
     CreateImageWidget(i32, i32, String, String),
     /// Request all connected overlay clients to flash a component by name.
     HighlightComponent(String),
+    /// Open the app overlay widget at canvas position (x, y).
+    OpenAppOverlay(i32, i32),
+    /// Update the app overlay widget settings. (wid, url, allow_open_file, allow_open_claude)
+    UpdateAppOverlay(Wid, String, bool, bool),
+    /// Create a new text block at canvas position (x, y).
+    CreateTextBlock(i32, i32),
+    /// Replace all fields of an existing text block.
+    UpdateTextBlock(Tid, WsTextBlock),
+    /// Delete a text block by ID.
+    DeleteTextBlock(Tid),
 }

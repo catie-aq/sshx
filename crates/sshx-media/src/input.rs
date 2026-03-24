@@ -35,6 +35,7 @@ pub enum InputEvent {
         pressed: bool,
     },
     /// Mouse wheel scroll event.
+    #[serde(rename_all = "camelCase")]
     Scroll {
         /// Horizontal scroll delta (positive = right).
         delta_x: f32,

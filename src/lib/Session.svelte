@@ -13,7 +13,7 @@
   import { Encrypt } from "./encrypt";
   import { createLock } from "./lock";
   import { Srocket } from "./srocket";
-  import type { WsClient, WsClaudeEvent, WsComponentGraph, WsFileMetadataUpdate, WsIceCandidate, WsNote, WsServer, WsSourceFile, WsUser, WsVideoStream, WsWidget, WsWinsize } from "./protocol";
+  import type { WsClient, WsClaudeEvent, WsComponentGraph, WsFileMetadataUpdate, WsIceCandidate, WsNote, WsServer, WsSourceFile, WsTextBlock, WsUser, WsVideoStream, WsWidget, WsWinsize } from "./protocol";
   import { makeToast } from "./toast";
   import Chat, { type ChatMessage } from "./ui/Chat.svelte";
   import ChooseName from "./ui/ChooseName.svelte";
@@ -34,6 +34,9 @@
   import CommandPalette from "./ui/CommandPalette.svelte";
   import ScreenShareWidget from "./ui/ScreenShareWidget.svelte";
   import ImageWidget from "./ui/ImageWidget.svelte";
+  import AppOverlayWidget from "./ui/AppOverlayWidget.svelte";
+  import TextBlock from "./ui/TextBlock.svelte";
+  import ContextMenu from "./ui/ContextMenu.svelte";
   import type { SearchItem } from "./protocol";
   import { buildRuntimeEdges } from "./runtimeGraph";
   import { slide } from "./action/slide";
@@ -75,6 +78,9 @@
   let settingsOpen = false; // @hmr:keep
   let showNetworkInfo = false; // @hmr:keep
   let commandPaletteOpen = false; // @hmr:keep
+  let contextMenuVisible = false; // @hmr:keep
+  let contextMenuX = 0;
+  let contextMenuY = 0;
   let graphMode = false; // @hmr:keep
   let shellNames = new Map<number, string>(); // local-only terminal labels
 
@@ -83,6 +89,18 @@
       if ((e.metaKey || e.ctrlKey) && e.key === "k") {
         e.preventDefault();
         commandPaletteOpen = true;
+      }
+      if (e.key === "t" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        const tag = (e.target as HTMLElement)?.tagName;
+        const editable = (e.target as HTMLElement)?.isContentEditable;
+        if (tag === "INPUT" || tag === "TEXTAREA" || editable) return;
+        e.preventDefault();
+        textToolActive = !textToolActive;
+        if (!textToolActive) textToolGhost = null;
+      }
+      if (e.key === "Escape" && textToolActive) {
+        textToolActive = false;
+        textToolGhost = null;
       }
     }
     window.addEventListener("keydown", handleGlobalKey);
@@ -155,6 +173,13 @@
   let movingNote: number | null = null; // Nid being dragged
   let movingNoteOrigin = [0, 0]; // [dx, dy] offset from note origin
   let movingNotePos: { x: number; y: number } | null = null;
+
+  let textBlocks = new Map<number, WsTextBlock>(); // Tid → WsTextBlock
+  let movingTextBlock: number | null = null;
+  let movingTextBlockOrigin = [0, 0];
+  let movingTextBlockPos: { x: number; y: number } | null = null;
+  let textToolActive = false;
+  let textToolGhost: { x: number; y: number } | null = null;
 
   // Workspace intelligence state
   let workspaceRootName = "workspace"; // project folder name, e.g. "my-project"
@@ -392,8 +417,18 @@
             notes.set(nid, note);
           }
           notes = notes; // trigger reactivity
+        } else if (message.textBlocks) {
+          textBlocks = new Map(message.textBlocks);
+        } else if (message.textBlockDiff) {
+          const [tid, block] = message.textBlockDiff;
+          if (block === null) {
+            textBlocks.delete(tid);
+          } else {
+            textBlocks.set(tid, block);
+          }
+          textBlocks = textBlocks;
         } else if (message.sourceFiles) {
-          const [root, files] = message.sourceFiles;
+          const [root, _rootPath, files] = message.sourceFiles;
           workspaceRootName = root || "workspace";
           sourceFiles = new Map(files.map((f) => [f.path, f]));
         } else if (message.componentGraph) {
@@ -727,6 +762,33 @@
     graphMode = !graphMode;
   }
 
+  // Derive whether an AppOverlay widget exists and is visible.
+  $: appOverlayOpen = [...widgets.values()].some(
+    (w) => w.kind.type === "appOverlay" && !w.collapsed,
+  );
+
+  function handleToggleAppOverlay() {
+    // Find existing AppOverlay widget.
+    for (const [wid, w] of widgets) {
+      if (w.kind.type === "appOverlay") {
+        if (w.collapsed) {
+          srocket?.send({ setWidgetCollapsed: [wid, false] });
+        } else {
+          // Already visible — scroll to it.
+          const targetZoom = Math.min(zoom, INITIAL_ZOOM);
+          touchZoom.moveTo([w.x, w.y], targetZoom);
+        }
+        return;
+      }
+    }
+    // No widget exists — create one at viewport center.
+    if (!hasWriteAccess) return;
+    const [ox, oy] = getConstantOffset();
+    const x = Math.round(center[0] + window.innerWidth / 2 / zoom - ox);
+    const y = Math.round(center[1] + window.innerHeight / 2 / zoom - oy);
+    srocket?.send({ openAppOverlay: [x, y] });
+  }
+
   // Live runtime graph: links between terminals, file cards, and Claude sessions.
   $: runtimeGraph = buildRuntimeEdges(claudeInstances, widgets, shells);
 
@@ -1015,23 +1077,23 @@
     }, 80);
 
     function handleMouse(event: MouseEvent) {
+      // Use else-if so only ONE drag operation runs per frame.
+      // This prevents multiple widgets from moving simultaneously
+      // if state gets out of sync (e.g. missed mouseup).
       if (movingVideo !== null && movingVideoPos) {
         const [x, y] = normalizePosition(event);
         movingVideoPos = {
           x: Math.round(x - movingVideoOrigin[0]),
           y: Math.round(y - movingVideoOrigin[1]),
         };
-      }
-
-      if (movingLibrary !== null && movingLibraryPos) {
+        sendMove({ moveVideoStream: [movingVideo, movingVideoPos.x, movingVideoPos.y] });
+      } else if (movingLibrary !== null && movingLibraryPos) {
         const [x, y] = normalizePosition(event);
         movingLibraryPos = {
           x: Math.round(x - movingLibraryOrigin[0]),
           y: Math.round(y - movingLibraryOrigin[1]),
         };
-      }
-
-      if (resizingLibrary !== null) {
+      } else if (resizingLibrary !== null) {
         const dw = (event.clientX - resizingLibrary.startX) / zoom;
         const dh = (event.clientY - resizingLibrary.startY) / zoom;
         const panel = libraryPanels.get(resizingLibrary.name);
@@ -1040,18 +1102,14 @@
           panel.h = Math.max(120, resizingLibrary.startH + dh);
           libraryPanels = libraryPanels;
         }
-      }
-
-      if (movingWidget !== null && movingWidgetPos) {
+      } else if (movingWidget !== null && movingWidgetPos) {
         const [x, y] = normalizePosition(event);
         movingWidgetPos = {
           x: Math.round(x - movingWidgetOrigin[0]),
           y: Math.round(y - movingWidgetOrigin[1]),
         };
         sendMove({ moveWidget: [movingWidget, movingWidgetPos.x, movingWidgetPos.y] });
-      }
-
-      if (movingNote !== null && movingNotePos) {
+      } else if (movingNote !== null && movingNotePos) {
         const [x, y] = normalizePosition(event);
         movingNotePos = {
           x: Math.round(x - movingNoteOrigin[0]),
@@ -1059,9 +1117,15 @@
         };
         const base = notes.get(movingNote);
         if (base) sendMove({ updateNote: [movingNote, { ...base, ...movingNotePos }] });
-      }
-
-      if (moving !== -1 && !movingIsDone) {
+      } else if (movingTextBlock !== null && movingTextBlockPos) {
+        const [x, y] = normalizePosition(event);
+        movingTextBlockPos = {
+          x: Math.round(x - movingTextBlockOrigin[0]),
+          y: Math.round(y - movingTextBlockOrigin[1]),
+        };
+        const base = textBlocks.get(movingTextBlock);
+        if (base) sendMove({ updateTextBlock: [movingTextBlock, { ...base, ...movingTextBlockPos }] });
+      } else if (moving !== -1 && !movingIsDone) {
         const [x, y] = normalizePosition(event);
         movingSize = {
           ...movingSize,
@@ -1069,9 +1133,7 @@
           y: Math.round(y - movingOrigin[1]),
         };
         sendMove({ move: [moving, movingSize] });
-      }
-
-      if (resizing !== -1) {
+      } else if (resizing !== -1) {
         const cols = Math.max(
           Math.floor((event.pageX - resizingOrigin[0]) / resizingCell[0]),
           TERM_MIN_COLS, // Minimum number of columns.
@@ -1092,7 +1154,16 @@
 
     function handleMouseEnd(event: MouseEvent) {
       if (movingVideo !== null && movingVideoPos) {
+        sendMove.cancel();
         srocket?.send({ moveVideoStream: [movingVideo, movingVideoPos.x, movingVideoPos.y] });
+        // Update local stream position immediately to prevent jump
+        // when pos falls back to stream (before server broadcasts update).
+        const s = videoStreams.get(movingVideo);
+        if (s) {
+          s.x = movingVideoPos.x;
+          s.y = movingVideoPos.y;
+          videoStreams = videoStreams;
+        }
         movingVideo = null;
         movingVideoPos = null;
       }
@@ -1112,6 +1183,14 @@
       if (movingWidget !== null && movingWidgetPos) {
         sendMove.cancel();
         srocket?.send({ moveWidget: [movingWidget, movingWidgetPos.x, movingWidgetPos.y] });
+        // Update local widget position immediately to prevent jump
+        // when pos falls back to widget (before server broadcasts update).
+        const w = widgets.get(movingWidget);
+        if (w) {
+          w.x = movingWidgetPos.x;
+          w.y = movingWidgetPos.y;
+          widgets = widgets;
+        }
         movingWidget = null;
         movingWidgetPos = null;
       }
@@ -1119,9 +1198,28 @@
       if (movingNote !== null && movingNotePos) {
         sendMove.cancel();
         const base = notes.get(movingNote);
-        if (base) srocket?.send({ updateNote: [movingNote, { ...base, ...movingNotePos }] });
+        if (base) {
+          srocket?.send({ updateNote: [movingNote, { ...base, ...movingNotePos }] });
+          // Update local note position immediately to prevent jump.
+          base.x = movingNotePos.x;
+          base.y = movingNotePos.y;
+          notes = notes;
+        }
         movingNote = null;
         movingNotePos = null;
+      }
+
+      if (movingTextBlock !== null && movingTextBlockPos) {
+        sendMove.cancel();
+        const base = textBlocks.get(movingTextBlock);
+        if (base) {
+          srocket?.send({ updateTextBlock: [movingTextBlock, { ...base, ...movingTextBlockPos }] });
+          base.x = movingTextBlockPos.x;
+          base.y = movingTextBlockPos.y;
+          textBlocks = textBlocks;
+        }
+        movingTextBlock = null;
+        movingTextBlockPos = null;
       }
 
       if (moving !== -1) {
@@ -1208,7 +1306,7 @@
 <main
   class="p-8"
   class:cursor-nwse-resize={resizing !== -1 || resizingWidget !== null || resizingLibrary !== null}
-  class:cursor-grabbing={resizing === -1 && resizingWidget === null && (moving !== -1 || movingWidget !== null || movingNote !== null || movingLibrary !== null)}
+  class:cursor-grabbing={resizing === -1 && resizingWidget === null && (moving !== -1 || movingWidget !== null || movingNote !== null || movingTextBlock !== null || movingLibrary !== null)}
   on:wheel={(event) => event.preventDefault()}
 >
   <div
@@ -1222,11 +1320,17 @@
       {workspaceOpen}
       {graphMode}
       {isSharing}
+      {appOverlayOpen}
       hiddenStreamCount={0}
       claudeInstances={claudeInstances}
       {claudeActive}
       on:create={handleCreate}
+      {textToolActive}
       on:createNote={handleCreateNote}
+      on:toggleTextTool={() => {
+        textToolActive = !textToolActive;
+        if (!textToolActive) textToolGhost = null;
+      }}
       on:toggleWorkspace={handleToggleWorkspace}
       on:openClaudeInstance={({ detail: sid }) => {
         if (!hasWriteAccess) return;
@@ -1239,6 +1343,7 @@
         handleCreateWithInput(`claude --resume ${sid}`);
       }}
       on:openGraphView={handleOpenGraphView}
+      on:toggleAppOverlay={handleToggleAppOverlay}
       on:modeChange={({ detail }) => (mode = detail)}
       on:chat={() => {
         showChat = !showChat;
@@ -1327,7 +1432,29 @@
     </div>
   </div>
 
-  <div class="absolute inset-0 overflow-hidden touch-none" bind:this={fabricEl}>
+  <div
+    class="absolute inset-0 overflow-hidden touch-none"
+    class:cursor-crosshair={textToolActive}
+    bind:this={fabricEl}
+    on:contextmenu|preventDefault={(e) => {
+      contextMenuX = e.clientX;
+      contextMenuY = e.clientY;
+      contextMenuVisible = true;
+    }}
+    on:click={(e) => {
+      if (textToolActive && e.target === fabricEl) {
+        const [x, y] = normalizePosition(e);
+        srocket?.send({ createTextBlock: [x, y] });
+        textToolActive = false;
+        textToolGhost = null;
+      }
+    }}
+    on:mousemove={(e) => {
+      if (textToolActive) {
+        textToolGhost = { x: e.clientX, y: e.clientY };
+      }
+    }}
+  >
     {#if graphMode}
       <GraphOverlay
         {center}
@@ -1338,7 +1465,7 @@
       />
     {/if}
     {#each shells as [id, winsize] (id)}
-      {@const ws = id === moving ? movingSize : winsize}
+      {@const ws = id === resizing ? resizingSize : id === moving ? movingSize : winsize}
       <div
         class="absolute"
         style:left={OFFSET_LEFT_CSS}
@@ -1408,7 +1535,7 @@
 
         <!-- Interactable element for resizing -->
         <div
-          class="absolute w-5 h-5 -bottom-1 -right-1 cursor-nwse-resize"
+          class="absolute w-5 h-5 -bottom-1 -right-1 cursor-nwse-resize select-none"
           on:mousedown={(event) => {
             const canvasEl = termElements[id].querySelector(".xterm-screen");
             if (canvasEl) {
@@ -1449,6 +1576,36 @@
           }}
           on:delete={() => {
             srocket?.send({ deleteNote: nid });
+          }}
+        />
+      </div>
+    {/each}
+
+    {#each [...textBlocks] as [tid, block] (tid)}
+      {@const pos = tid === movingTextBlock ? movingTextBlockPos ?? block : block}
+      <div
+        class="absolute"
+        style:left={OFFSET_LEFT_CSS}
+        style:top={OFFSET_TOP_CSS}
+        style:transform-origin={OFFSET_TRANSFORM_ORIGIN_CSS}
+        transition:fade|local
+        use:slide={{ x: pos.x, y: pos.y, center, zoom, immediate: tid === movingTextBlock }}
+      >
+        <TextBlock
+          {block}
+          canWrite={hasWriteAccess ?? false}
+          on:startMove={({ detail: event }) => {
+            if (!hasWriteAccess) return;
+            const [x, y] = normalizePosition(event);
+            movingTextBlock = tid;
+            movingTextBlockOrigin = [x - block.x, y - block.y];
+            movingTextBlockPos = { x: block.x, y: block.y };
+          }}
+          on:update={({ detail: updatedBlock }) => {
+            srocket?.send({ updateTextBlock: [tid, updatedBlock] });
+          }}
+          on:delete={() => {
+            srocket?.send({ deleteTextBlock: tid });
           }}
         />
       </div>
@@ -1637,6 +1794,28 @@
             }}
             on:delete={() => srocket?.send({ closeWidget: wid })}
           />
+        {:else if widget.kind.type === "appOverlay"}
+          <AppOverlayWidget
+            {widget}
+            collapsed={widget.collapsed ?? false}
+            canWrite={hasWriteAccess ?? false}
+            on:startMove={({ detail: event }) => {
+              if (!hasWriteAccess) return;
+              const [x, y] = normalizePosition(event);
+              movingWidget = wid;
+              movingWidgetOrigin = [x - widget.x, y - widget.y];
+              movingWidgetPos = { x: widget.x, y: widget.y };
+            }}
+            on:delete={() => srocket?.send({ setWidgetCollapsed: [wid, true] })}
+            on:collapse={({ detail: newCollapsed }) => {
+              widget.collapsed = newCollapsed;
+              widgets = widgets;
+              srocket?.send({ setWidgetCollapsed: [wid, newCollapsed] });
+            }}
+            on:updateSettings={({ detail: { url, allowOpenFile, allowOpenClaude } }) => {
+              srocket?.send({ updateAppOverlay: [wid, url, allowOpenFile, allowOpenClaude] });
+            }}
+          />
         {/if}
         {#if hasWriteAccess}
           <div
@@ -1750,6 +1929,16 @@
         />
       </div>
     {/each}
+
+    {#if textToolActive && textToolGhost}
+      <div
+        class="fixed pointer-events-none z-50 text-zinc-400 text-sm bg-zinc-800/80 px-2 py-1 rounded border border-zinc-600"
+        style:left="{textToolGhost.x + 16}px"
+        style:top="{textToolGhost.y + 16}px"
+      >
+        Add text
+      </div>
+    {/if}
   </div>
 
   <CommandPalette
@@ -1757,5 +1946,16 @@
     items={searchItems}
     on:close={() => (commandPaletteOpen = false)}
     on:navigate={({ detail }) => touchZoom.moveTo([detail.x, detail.y], zoom)}
+  />
+
+  <ContextMenu
+    x={contextMenuX}
+    y={contextMenuY}
+    visible={contextMenuVisible}
+    on:close={() => (contextMenuVisible = false)}
+    on:select={({ detail }) => {
+      // Placeholder — no actions yet
+      console.log("Context menu:", detail);
+    }}
   />
 </main>

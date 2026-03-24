@@ -22,6 +22,18 @@ impl Xvfb {
     pub fn start(display_num: u32, width: u32, height: u32, depth: u8) -> Result<Self> {
         let display = format!(":{display_num}");
 
+        // Clean up stale lock files from previous runs so Xvfb can start.
+        let lock_file = format!("/tmp/.X{display_num}-lock");
+        let socket_file = format!("/tmp/.X11-unix/X{display_num}");
+        if std::path::Path::new(&lock_file).exists() {
+            warn!("removing stale lock file: {lock_file}");
+            let _ = std::fs::remove_file(&lock_file);
+        }
+        if std::path::Path::new(&socket_file).exists() {
+            warn!("removing stale socket: {socket_file}");
+            let _ = std::fs::remove_file(&socket_file);
+        }
+
         let child = Command::new("Xvfb")
             .arg(&display)
             .arg("-screen")
@@ -35,8 +47,17 @@ impl Xvfb {
         let disp = &display;
         info!("started Xvfb on display {disp} at {width}x{height}x{depth}");
 
-        // Give Xvfb a moment to initialize before clients connect.
-        std::thread::sleep(Duration::from_millis(500));
+        // Wait until the X11 socket appears (up to 3 seconds).
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if std::path::Path::new(&socket_file).exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if !std::path::Path::new(&socket_file).exists() {
+            bail!("Xvfb failed to create socket {socket_file} within 3 seconds");
+        }
 
         Ok(Self { child, display })
     }

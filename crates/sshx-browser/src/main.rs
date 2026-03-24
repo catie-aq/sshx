@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
     info!("Xvfb started on DISPLAY={}", disp.as_str());
 
     // Launch browser.
-    let _chrome = browser::launch_chromium(&disp, &opts.url, opts.width, opts.height, opts.browser.as_deref())?;
+    let _browser = browser::launch_browser(&disp, &opts.url, opts.width, opts.height, opts.browser.as_deref())?;
     info!("browser launched at {}", opts.url.as_str());
 
     // Connect to the sshx server and get our assigned vid.

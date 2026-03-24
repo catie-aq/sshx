@@ -261,8 +261,9 @@ async fn send_db(db: &AnalysisDb, tx: &mpsc::Sender<ClientMessage>) -> Result<()
         .and_then(|n| n.to_str())
         .unwrap_or("workspace")
         .to_string();
+    let root_path = db.workspace_root.clone();
     let files: Vec<SourceFile> = db.files.values().map(SourceFile::from).collect();
-    let json = serde_json::to_vec(&serde_json::json!({ "root": root, "files": files }))?;
+    let json = serde_json::to_vec(&serde_json::json!({ "root": root, "rootPath": root_path, "files": files }))?;
     let compressed = zstd::encode_all(&*json, 3)?;
     tx.send(ClientMessage::SourceMetadata(compressed.into()))
         .await
