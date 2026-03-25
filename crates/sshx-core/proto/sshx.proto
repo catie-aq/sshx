@@ -99,6 +99,12 @@ message SetWidgetNameRequest {
   string name = 2;        // User-set name (empty = remove).
 }
 
+// Push an image file to the CLI client for local storage.
+message ImageFile {
+  string name = 1; // User-defined filename (e.g., "screenshot.png").
+  bytes data = 2;  // Raw image bytes.
+}
+
 // An input event (mouse/keyboard) to be injected into an offscreen browser display.
 message BrowserInputEvent {
   uint32 vid = 1;  // Video stream ID.
@@ -119,6 +125,7 @@ message ServerUpdate {
     string error = 15;
     BrowserInputEvent browser_input = 16;              // Forward input to offscreen browser.
     SetWidgetNameRequest set_widget_name = 17;         // Persist a widget name.
+    ImageFile image_file = 18;                         // Push image bytes to CLI for local storage.
   }
 }
 

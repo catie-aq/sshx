@@ -822,6 +822,14 @@ impl Session {
         }
     }
 
+    /// Return the current `image_path` for a source file by path, if any.
+    pub fn get_source_file_image_path(&self, path: &str) -> Option<String> {
+        let sf_lock = self.source_files.read();
+        sf_lock.2.iter().find(|f| f.path == path).and_then(|f| {
+            if f.image_path.is_empty() { None } else { Some(f.image_path.clone()) }
+        })
+    }
+
     /// Subscribe to source file updates (watch stream, delivers latest on connect).
     pub fn subscribe_source_files(&self) -> impl Stream<Item = (String, String, Vec<WsSourceFile>)> + Unpin {
         WatchStream::new(self.source_files_source.subscribe())

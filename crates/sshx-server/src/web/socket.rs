@@ -9,7 +9,7 @@ use axum::extract::{
 use axum::response::IntoResponse;
 use bytes::Bytes;
 use futures_util::SinkExt;
-use sshx_core::proto::{server_update::ServerMessage, NewShell, SetWidgetNameRequest, TerminalInput, TerminalSize};
+use sshx_core::proto::{server_update::ServerMessage, ImageFile, NewShell, SetWidgetNameRequest, TerminalInput, TerminalSize};
 use sshx_core::{Sid, Vid};
 use subtle::ConstantTimeEq;
 use tokio::sync::mpsc;
@@ -418,6 +418,26 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>, ice_server
                     .update_tx()
                     .send(ServerMessage::UpdateFileMetadata(proto_msg))
                     .await?;
+                // If an image name was provided, push the image bytes to the CLI.
+                if let Some(ref name) = update.image_name {
+                    if !name.is_empty() {
+                        if let Some(img_path) = session.get_source_file_image_path(&path) {
+                            // img_path is like "/uploads/{session}/{filename}" — strip leading /
+                            let local = img_path.trim_start_matches('/');
+                            match tokio::fs::read(local).await {
+                                Ok(data) => {
+                                    session.update_tx().try_send(
+                                        ServerMessage::ImageFile(ImageFile {
+                                            name: name.clone(),
+                                            data: data.into(),
+                                        })
+                                    ).ok();
+                                }
+                                Err(e) => warn!("image push: could not read {local}: {e}"),
+                            }
+                        }
+                    }
+                }
             }
             WsClient::OpenGraphView(x, y) => {
                 if let Err(e) = session.check_write_permission(user_id) {

@@ -18,7 +18,7 @@ use tracing::{debug, error, warn};
 
 use crate::encrypt::Encrypt;
 use crate::runner::{Runner, ShellData};
-use crate::workspace::{spawn_describe_files, spawn_update_file_metadata, spawn_update_widget_name};
+use crate::workspace::{spawn_describe_files, spawn_save_image_file, spawn_update_file_metadata, spawn_update_widget_name};
 
 /// Interval for sending empty heartbeat messages to the server.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
@@ -258,6 +258,9 @@ impl Controller {
                 }
                 ServerMessage::SetWidgetName(req) => {
                     spawn_update_widget_name(req.instance_id, req.name);
+                }
+                ServerMessage::ImageFile(img) => {
+                    spawn_save_image_file(img.name, img.data.to_vec());
                 }
                 ServerMessage::Error(err) => {
                     error!(?err, "error received from server");

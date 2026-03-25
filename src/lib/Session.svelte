@@ -37,6 +37,7 @@
   import AppOverlayWidget from "./ui/AppOverlayWidget.svelte";
   import TextBlock from "./ui/TextBlock.svelte";
   import ContextMenu from "./ui/ContextMenu.svelte";
+  import OpenFileDialog from "./ui/OpenFileDialog.svelte";
   import type { SearchItem } from "./protocol";
   import { buildRuntimeEdges } from "./runtimeGraph";
   import { slide } from "./action/slide";
@@ -81,6 +82,10 @@
   let contextMenuVisible = false; // @hmr:keep
   let contextMenuX = 0;
   let contextMenuY = 0;
+  let contextMenuCanvasPos: [number, number] = [0, 0];
+  let filePickerOpen = false;
+  let filePickerScreenPos: [number, number] = [0, 0];
+  let filePickerCanvasPos: [number, number] = [0, 0];
   let graphMode = false; // @hmr:keep
   let shellNames = new Map<number, string>(); // local-only terminal labels
 
@@ -1439,6 +1444,7 @@
     on:contextmenu|preventDefault={(e) => {
       contextMenuX = e.clientX;
       contextMenuY = e.clientY;
+      contextMenuCanvasPos = normalizePosition(e);
       contextMenuVisible = true;
     }}
     on:click={(e) => {
@@ -1954,8 +1960,46 @@
     visible={contextMenuVisible}
     on:close={() => (contextMenuVisible = false)}
     on:select={({ detail }) => {
-      // Placeholder — no actions yet
-      console.log("Context menu:", detail);
+      const [cx, cy] = contextMenuCanvasPos;
+      if (detail === "new-terminal") {
+        if (!hasWriteAccess) { makeToast("error", "Write access required"); return; }
+        if (shells.length >= 14) { makeToast("error", "Maximum 14 terminals"); return; }
+        srocket?.send({ create: [cx, cy] });
+        touchZoom.moveTo([cx, cy], INITIAL_ZOOM);
+      } else if (detail === "new-text") {
+        if (!hasWriteAccess) { makeToast("error", "Write access required"); return; }
+        srocket?.send({ createTextBlock: [cx, cy] });
+      } else if (detail === "new-note") {
+        if (!hasWriteAccess) { makeToast("error", "Write access required"); return; }
+        srocket?.send({ createNote: [cx, cy] });
+      } else if (detail === "open-file") {
+        filePickerScreenPos = [contextMenuX, contextMenuY];
+        filePickerCanvasPos = [cx, cy];
+        filePickerOpen = true;
+      } else if (detail === "toggle-file-tree") {
+        if (!hasWriteAccess) { makeToast("error", "Write access required"); return; }
+        const exists = [...widgets.values()].some(w => w.kind.type === "fileTree");
+        if (!exists) {
+          srocket?.send({ openFileTree: [cx, cy, workspaceRootName] });
+        }
+        workspaceOpen = !workspaceOpen;
+      }
     }}
   />
+
+  {#if filePickerOpen}
+    <OpenFileDialog
+      x={filePickerScreenPos[0]}
+      y={filePickerScreenPos[1]}
+      files={[...sourceFiles.keys()]}
+      on:open={({ detail: path }) => {
+        filePickerOpen = false;
+        const [cx, cy] = filePickerCanvasPos;
+        if (!focusExistingFileCard(path)) {
+          srocket?.send({ openFileCard: [cx, cy, path] });
+        }
+      }}
+      on:close={() => (filePickerOpen = false)}
+    />
+  {/if}
 </main>

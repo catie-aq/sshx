@@ -21,7 +21,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use sshx_core::proto::client_update::ClientMessage;
@@ -177,6 +177,26 @@ async fn run_update_file_metadata(
     }
     db.save(&out_path)?;
     info!(path = %path, "file metadata updated in {}", out_path.display());
+    Ok(())
+}
+
+/// Spawn a task that saves image bytes received from the server into `~/.sshx/images/`.
+pub fn spawn_save_image_file(name: String, data: Vec<u8>) {
+    tokio::spawn(async move {
+        if let Err(e) = run_save_image_file(name, data).await {
+            warn!("save-image-file task exited: {e:#}");
+        }
+    });
+}
+
+async fn run_save_image_file(name: String, data: Vec<u8>) -> Result<()> {
+    let dir = dirs::home_dir()
+        .context("no home directory")?
+        .join(".sshx")
+        .join("images");
+    tokio::fs::create_dir_all(&dir).await?;
+    tokio::fs::write(dir.join(&name), &data).await?;
+    info!("image saved → ~/.sshx/images/{name}");
     Ok(())
 }
 

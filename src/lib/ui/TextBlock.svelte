@@ -1,6 +1,9 @@
 <script lang="ts">
-  import { createEventDispatcher, onMount } from "svelte";
+  import { createEventDispatcher, onMount, onDestroy } from "svelte";
   import type { WsTextBlock } from "$lib/protocol";
+  import { Editor } from "@tiptap/core";
+  import StarterKit from "@tiptap/starter-kit";
+  import Link from "@tiptap/extension-link";
 
   export let block: WsTextBlock;
   export let canWrite: boolean;
@@ -30,34 +33,109 @@
     "#fb923c",
   ];
 
+  // Three states: idle → selected → editing
+  let selected = false;
   let editing = false;
   let hovered = false;
-  let contentEl: HTMLDivElement;
+  let editorEl: HTMLDivElement;
+  let wrapperEl: HTMLDivElement;
+  let editor: Editor | null = null;
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
   let autoFocus = false;
+
+  // Toolbar active state
+  let isBold = false;
+  let isList = false;
+  let isLink = false;
+
+  // Link dialog state
+  let showLinkDialog = false;
+  let linkUrl = "";
+  let linkInputEl: HTMLInputElement;
 
   export function focusAfterCreate() {
     autoFocus = true;
   }
 
   onMount(() => {
-    if (autoFocus && contentEl && canWrite) {
+    editor = new Editor({
+      element: editorEl,
+      extensions: [
+        StarterKit,
+        Link.configure({ openOnClick: false }),
+      ],
+      content: block.content || "",
+      editable: false,
+      onTransaction: () => {
+        // Force Svelte reactivity
+        editor = editor;
+        isBold = editor!.isActive("bold");
+        isList = editor!.isActive("bulletList");
+        isLink = editor!.isActive("link");
+      },
+      onUpdate: () => handleInput(),
+    });
+
+    if (autoFocus && canWrite) {
+      selected = true;
       editing = true;
-      requestAnimationFrame(() => contentEl?.focus());
+      editor.setEditable(true);
+      requestAnimationFrame(() => editor?.commands.focus());
     }
+
+    document.addEventListener("mousedown", handleDocumentClick);
+    document.addEventListener("keydown", handleKeydown);
   });
 
-  $: {
-    // Sync content from server when not editing.
-    if (contentEl && !editing && contentEl.innerHTML !== block.content) {
-      contentEl.innerHTML = block.content || "";
+  onDestroy(() => {
+    editor?.destroy();
+    document.removeEventListener("mousedown", handleDocumentClick);
+    document.removeEventListener("keydown", handleKeydown);
+  });
+
+  // Sync content from server when not editing
+  $: if (editor && !editing && block.content !== editor.getHTML()) {
+    editor.commands.setContent(block.content || "");
+  }
+
+  // Toggle editable based on editing state
+  $: if (editor) editor.setEditable(editing);
+
+  // Click outside → deselect
+  function handleDocumentClick(e: MouseEvent) {
+    if (!wrapperEl) return;
+    if (!wrapperEl.contains(e.target as Node)) {
+      if (editing) {
+        editing = false;
+        flushUpdate();
+      }
+      selected = false;
+      showLinkDialog = false;
+    }
+  }
+
+  // Escape: editing → selected, selected → idle
+  function handleKeydown(e: KeyboardEvent) {
+    if (e.key !== "Escape") return;
+    if (showLinkDialog) {
+      e.stopPropagation();
+      cancelLink();
+    } else if (editing) {
+      e.stopPropagation();
+      editing = false;
+      flushUpdate();
+      editor?.commands.blur();
+      // Stay selected
+    } else if (selected) {
+      e.stopPropagation();
+      selected = false;
     }
   }
 
   function startEditing() {
     if (!canWrite) return;
     editing = true;
-    requestAnimationFrame(() => contentEl?.focus());
+    requestAnimationFrame(() => editor?.commands.focus());
   }
 
   function flushUpdate() {
@@ -65,13 +143,9 @@
       clearTimeout(debounceTimer);
       debounceTimer = null;
     }
-    const content = contentEl?.innerHTML ?? "";
+    const content = editor?.getHTML() ?? "";
+    localContent = content;
     dispatch("update", { ...block, content });
-  }
-
-  function handleBlur() {
-    editing = false;
-    flushUpdate();
   }
 
   function handleInput() {
@@ -79,9 +153,25 @@
     debounceTimer = setTimeout(flushUpdate, 500);
   }
 
+  // Click on the text content area
+  function handleContentClick(event: MouseEvent) {
+    if (editing) return; // let text cursor work normally
+
+    if (!selected) {
+      // First click: select
+      selected = true;
+      event.preventDefault();
+    } else {
+      // Second click (already selected): enter editing
+      startEditing();
+    }
+  }
+
+  // Mousedown for drag-move (only when selected but not editing)
   function handleMousedown(event: MouseEvent) {
     if (editing) return; // let text cursor work
     if (!canWrite) return;
+    if (!selected) return; // must be selected first to drag
     event.preventDefault();
     dispatch("startMove", event);
   }
@@ -99,36 +189,59 @@
   }
 
   function toggleBold() {
-    document.execCommand("bold");
+    editor?.chain().focus().toggleBold().run();
     handleInput();
   }
 
   function toggleList() {
-    document.execCommand("insertUnorderedList");
+    editor?.chain().focus().toggleBulletList().run();
     handleInput();
   }
 
-  function insertLink() {
-    const url = prompt("Enter URL:");
-    if (url) {
-      document.execCommand("createLink", false, url);
-      handleInput();
-    }
+  function openLinkDialog() {
+    const attrs = editor?.getAttributes("link");
+    linkUrl = attrs?.href ?? "";
+    showLinkDialog = true;
+    requestAnimationFrame(() => linkInputEl?.focus());
   }
 
+  function confirmLink() {
+    if (linkUrl.trim()) {
+      editor?.chain().focus().setLink({ href: linkUrl.trim() }).run();
+    } else {
+      editor?.chain().focus().unsetLink().run();
+    }
+    showLinkDialog = false;
+    linkUrl = "";
+    handleInput();
+  }
+
+  function cancelLink() {
+    showLinkDialog = false;
+    linkUrl = "";
+    editor?.commands.focus();
+  }
+
+  // Track local content so isEmpty stays correct between editing and server roundtrip.
+  let localContent = block.content;
+  $: localContent = block.content || localContent;
+
   $: fontSize = FONT_SIZES[block.fontSize] ?? FONT_SIZES.md;
-  $: isEmpty = !block.content && !editing;
+  $: isEmpty = !localContent && !editing;
 </script>
 
 <!-- svelte-ignore a11y-no-static-element-interactions -->
 <div
+  bind:this={wrapperEl}
   class="text-block-wrapper"
+  class:selected
+  class:editing
   on:pointerdown={(e) => e.stopPropagation()}
   on:mouseenter={() => (hovered = true)}
   on:mouseleave={() => (hovered = false)}
 >
-  <!-- Floating toolbar -->
-  {#if (hovered || editing) && canWrite}
+  <!-- Floating toolbar: show when selected or editing -->
+  {#if (selected || editing) && canWrite}
     <div class="toolbar">
       <!-- Font size -->
       <select
@@ -146,12 +259,12 @@
       <div class="toolbar-sep" />
 
       <!-- Bold -->
-      <button class="toolbar-btn" title="Bold" on:click={toggleBold}>
+      <button class="toolbar-btn" class:active={isBold} title="Bold" on:click={toggleBold}>
         <strong>B</strong>
       </button>
 
       <!-- Link -->
-      <button class="toolbar-btn" title="Insert link" on:click={insertLink}>
+      <button class="toolbar-btn" class:active={isLink} title="Insert link" on:click={openLinkDialog}>
         <svg
           xmlns="http://www.w3.org/2000/svg"
           width="14"
@@ -169,7 +282,7 @@
       </button>
 
       <!-- List -->
-      <button class="toolbar-btn" title="Bullet list" on:click={toggleList}>
+      <button class="toolbar-btn" class:active={isList} title="Bullet list" on:click={toggleList}>
         <svg
           xmlns="http://www.w3.org/2000/svg"
           width="14"
@@ -250,30 +363,41 @@
         </svg>
       </button>
     </div>
+
+    <!-- Link dialog -->
+    {#if showLinkDialog}
+      <!-- svelte-ignore a11y-no-static-element-interactions -->
+      <div class="link-dialog" on:mousedown|stopPropagation>
+        <input
+          bind:this={linkInputEl}
+          bind:value={linkUrl}
+          type="url"
+          placeholder="https://..."
+          on:keydown={(e) => {
+            if (e.key === "Enter") { e.preventDefault(); confirmLink(); }
+            if (e.key === "Escape") { e.preventDefault(); cancelLink(); }
+          }}
+        />
+        <button class="toolbar-btn" on:click={cancelLink}>✕</button>
+        <button class="toolbar-btn active" on:click={confirmLink}>↵</button>
+      </div>
+    {/if}
   {/if}
 
-  <!-- Text content -->
+  <!-- TipTap mount point -->
   <!-- svelte-ignore a11y-click-events-have-key-events -->
   <div
-    bind:this={contentEl}
+    bind:this={editorEl}
     class="text-content"
+    class:selected={selected && !editing}
     class:editing
     class:empty={isEmpty}
     style:font-size={fontSize}
     style:color={block.color}
     style:text-align={block.align}
-    contenteditable={editing}
     on:mousedown={handleMousedown}
-    on:dblclick={startEditing}
-    on:input={handleInput}
-    on:blur={handleBlur}
-    role="textbox"
-    tabindex="0"
-  >
-    {#if isEmpty}
-      <span class="placeholder">Type here...</span>
-    {/if}
-  </div>
+    on:click={handleContentClick}
+  />
 </div>
 
 <style lang="postcss">
@@ -317,15 +441,56 @@
     @apply w-3.5 h-3.5 rounded-full border border-zinc-500 hover:scale-125 transition-transform cursor-pointer;
   }
 
+  .link-dialog {
+    @apply absolute flex items-center gap-1 px-2 py-1 bg-zinc-800 rounded-lg border border-zinc-700 shadow-lg;
+    top: calc(100% + 8px);
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 10;
+    white-space: nowrap;
+  }
+
+  .link-dialog input {
+    @apply bg-zinc-700 text-zinc-200 text-xs rounded px-2 py-0.5 border border-zinc-600 focus:outline-none focus:border-indigo-500;
+    width: 200px;
+  }
+
   .text-content {
     @apply outline-none leading-snug;
-    cursor: grab;
+    cursor: default;
     min-height: 1.2em;
     word-break: break-word;
+    padding: 4px 6px;
+    border: 2px solid transparent;
+    border-radius: 4px;
+    transition: border-color 0.15s ease;
+  }
+
+  .text-content.selected {
+    border-color: #60a5fa;
+    cursor: grab;
   }
 
   .text-content.editing {
+    border-color: #818cf8;
     cursor: text;
+  }
+
+  .text-content :global(.tiptap) {
+    outline: none;
+    min-height: 1.2em;
+  }
+
+  .text-content :global(.tiptap p) {
+    margin: 0;
+  }
+
+  .text-content :global(.tiptap p.is-editor-empty:first-child::before) {
+    content: "Type here...";
+    @apply text-zinc-500 italic;
+    pointer-events: none;
+    float: left;
+    height: 0;
   }
 
   .text-content :global(a) {
@@ -341,9 +506,5 @@
   .text-content :global(ol) {
     list-style-type: decimal;
     padding-left: 1.2em;
-  }
-
-  .placeholder {
-    @apply text-zinc-500 italic pointer-events-none select-none;
   }
 </style>

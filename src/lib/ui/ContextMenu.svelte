@@ -13,18 +13,12 @@
     | { type: "separator" };
 
   const items: MenuItem[] = [
-    { type: "item", label: "New Terminal", key: "new-terminal", shortcut: "Ctrl+Shift+N" },
-    { type: "item", label: "New Sticky Note", key: "new-note" },
+    { type: "item", label: "Nouveau terminal", key: "new-terminal" },
+    { type: "item", label: "Nouveau texte",    key: "new-text" },
+    { type: "item", label: "Nouvelle note",    key: "new-note" },
     { type: "separator" },
-    { type: "item", label: "Paste", key: "paste", shortcut: "Ctrl+V" },
-    { type: "item", label: "Select All", key: "select-all", shortcut: "Ctrl+A", disabled: true },
-    { type: "separator" },
-    { type: "item", label: "Fit to Screen", key: "fit-screen" },
-    { type: "item", label: "Reset Zoom", key: "reset-zoom" },
-    { type: "separator" },
-    { type: "item", label: "Toggle File Tree", key: "toggle-file-tree" },
-    { type: "item", label: "Toggle Chat", key: "toggle-chat" },
-    { type: "item", label: "Command Palette", key: "command-palette", shortcut: "Ctrl+K" },
+    { type: "item", label: "Open file",        key: "open-file" },
+    { type: "item", label: "Toggle file tree", key: "toggle-file-tree" },
   ];
 
   let menuEl: HTMLDivElement;
@@ -61,7 +55,7 @@
 
   // Clamp position so menu doesn't overflow viewport
   $: clampedX = Math.min(x, window.innerWidth - 200);
-  $: clampedY = Math.min(y, window.innerHeight - 320);
+  $: clampedY = Math.min(y, window.innerHeight - 160);
 </script>
 
 {#if visible}

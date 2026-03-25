@@ -155,6 +155,8 @@ pub struct WsFileMetadataUpdate {
     pub widget_w: Option<u32>,
     /// Updated widget height (None = no change).
     pub widget_h: Option<u32>,
+    /// User-defined filename to save the image as on the CLI (None = no push).
+    pub image_name: Option<String>,
 }
 
 /// A real-time event from a running Claude Code session.

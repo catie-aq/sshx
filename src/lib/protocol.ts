@@ -32,6 +32,8 @@ export type WsFileMetadataUpdate = {
   description?: string;
   widgetW?: number;
   widgetH?: number;
+  /** User-defined filename to save the image as on the CLI (triggers byte push). */
+  imageName?: string;
 };
 
 /** A real-time event from a Claude Code session. */

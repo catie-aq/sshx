@@ -49,6 +49,9 @@
   // Image drag-over state
   let dragOver = false;
 
+  // Image name input state
+  let imageName = "";
+
   // Monaco editor state
   let editorInstance: MonacoType.editor.IStandaloneCodeEditor | null = null;
   let editorFontSize = 12;
@@ -220,6 +223,11 @@
     if (!file) return;
     dispatch("updateMetadata", { path: file.path, update: { imagePath: "" } });
   }
+
+  function submitImageName() {
+    if (!file || !imageName.trim()) return;
+    dispatch("updateMetadata", { path: file.path, update: { imageName: imageName.trim() } });
+  }
 </script>
 
 <div
@@ -348,6 +356,18 @@
                 </button>
               {/if}
             </div>
+            {#if canWrite}
+              <div class="flex items-center gap-1.5" on:mousedown|stopPropagation>
+                <input
+                  type="text"
+                  bind:value={imageName}
+                  placeholder="Save as… (e.g. screenshot.png)"
+                  class="flex-1 bg-zinc-800 border border-zinc-700 rounded px-2 py-0.5 text-[11px] text-zinc-300 placeholder-zinc-600 focus:outline-none focus:border-indigo-500"
+                  on:keydown={(e) => e.key === "Enter" && submitImageName()}
+                  on:blur={submitImageName}
+                />
+              </div>
+            {/if}
           {:else if canWrite}
             <!-- Image drop zone -->
             <!-- svelte-ignore a11y-no-static-element-interactions -->

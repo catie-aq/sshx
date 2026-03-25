@@ -16,6 +16,10 @@ export default defineConfig({
 
   plugins: [sveltekit()],
 
+  optimizeDeps: {
+    include: ["@tiptap/core", "@tiptap/starter-kit", "@tiptap/extension-link"],
+  },
+
   server: {
     port: webPort,
     strictPort: true,
