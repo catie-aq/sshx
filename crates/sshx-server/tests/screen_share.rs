@@ -31,6 +31,7 @@ async fn open_session_raw(
             encrypted_zeros: encrypted_zeros.into(),
             name: "test-session".into(),
             write_password_hash: None,
+            restore_snapshot: None,
         })
         .await?
         .into_inner();
@@ -42,7 +43,7 @@ async fn open_session_raw(
 async fn test_screen_share_lifecycle() -> Result<()> {
     let server = TestServer::new().await;
 
-    let mut controller = Controller::new(&server.endpoint(), "", Runner::Echo, false).await?;
+    let mut controller = Controller::new(&server.endpoint(), "", Runner::Echo, false, None, None, None).await?;
     let name = controller.name().to_owned();
     let key = controller.encryption_key().to_owned();
     tokio::spawn(async move { controller.run().await });
@@ -87,7 +88,7 @@ async fn test_screen_share_lifecycle() -> Result<()> {
 async fn test_p2p_signaling_relay() -> Result<()> {
     let server = TestServer::new().await;
 
-    let mut controller = Controller::new(&server.endpoint(), "", Runner::Echo, false).await?;
+    let mut controller = Controller::new(&server.endpoint(), "", Runner::Echo, false, None, None, None).await?;
     let name = controller.name().to_owned();
     let key = controller.encryption_key().to_owned();
     tokio::spawn(async move { controller.run().await });
@@ -413,7 +414,7 @@ async fn test_browser_control() -> Result<()> {
 async fn test_video_stream_move_resize() -> Result<()> {
     let server = TestServer::new().await;
 
-    let mut controller = Controller::new(&server.endpoint(), "", Runner::Echo, false).await?;
+    let mut controller = Controller::new(&server.endpoint(), "", Runner::Echo, false, None, None, None).await?;
     let name = controller.name().to_owned();
     let key = controller.encryption_key().to_owned();
     tokio::spawn(async move { controller.run().await });

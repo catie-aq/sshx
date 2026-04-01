@@ -71,6 +71,18 @@ struct Args {
     /// Only used when --with-browser is set.
     #[clap(long, value_name = "BIN", env = "SSHX_BROWSER")]
     browser_bin: Option<String>,
+
+    /// Path to the `openvscode-server` binary. When set, enables the IDE
+    /// tunnel feature: browsers can access VS Code at `/ide/s/{session}/`.
+    /// Overrides --ide auto-download.
+    #[clap(long, value_name = "PATH", env = "SSHX_OPENVSCODE_BIN")]
+    openvscode_bin: Option<PathBuf>,
+
+    /// Enable the embedded VS Code IDE. Downloads OpenVSCode Server to
+    /// ~/.sshx/openvscode-server/ on first use. Use --openvscode-bin to
+    /// point to a custom binary instead.
+    #[clap(long)]
+    ide: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -269,16 +281,38 @@ async fn run_session(args: Args) -> Result<()> {
     });
 
     let runner = Runner::Shell(shell.clone());
+    let workspace_root = args
+        .workspace
+        .clone()
+        .or_else(|| std::env::current_dir().ok());
+
+    // Resolve the OpenVSCode Server binary path.
+    let openvscode_bin = if let Some(bin) = args.openvscode_bin.clone() {
+        // Explicit override — use as-is.
+        Some(bin)
+    } else if args.ide {
+        // Auto-download / verify.
+        let path = sshx::openvscode::ensure_binary().await?;
+        Some(path)
+    } else {
+        None
+    };
+
     let mut controller =
-        Controller::new(&args.server, &name, runner, args.enable_readers).await?;
+        Controller::new(
+            &args.server,
+            &name,
+            runner,
+            args.enable_readers,
+            Some(std::path::PathBuf::from(sshx::controller::SESSION_DIR)),
+            openvscode_bin,
+            workspace_root.clone(),
+        )
+        .await?;
 
     // Spawn workspace intelligence tasks.
     if !args.no_workspace {
-        let workspace_root = args
-            .workspace
-            .clone()
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
+        let workspace_root = workspace_root.unwrap_or_else(|| PathBuf::from("."));
         spawn_source_analyzer(workspace_root, controller.output_sender());
     }
     if !args.no_claude_tracking {

@@ -9,6 +9,9 @@
 pub mod analyze;
 pub mod controller;
 pub mod encrypt;
+pub mod ide;
+pub mod openvscode;
 pub mod runner;
 pub mod terminal;
+pub mod tunnel;
 pub mod workspace;

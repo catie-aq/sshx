@@ -12,7 +12,7 @@ use sshx_core::{
         browser_command::BrowserCommand as BrowserCmd, server_update::ServerMessage, BrowserCommand,
         InputEvent, SequenceNumbers, VideoFrame,
     },
-    IdCounter, Nid, Sid, Tid, Uid, Vid, Wid,
+    Did, IdCounter, Nid, Sid, Slid, Tid, Uid, Vid, Wid,
 };
 use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tonic::Status;
@@ -22,9 +22,9 @@ use tokio_stream::Stream;
 use tracing::{debug, warn};
 
 use crate::utils::Shutdown;
-use crate::web::protocol::{WsClaudeEvent, WsComponentGraph, WsIceCandidate, WsNote, WsServer, WsSourceFile, WsTextBlock, WsUser, WsVideoStream, WsWidget, WsWinsize};
+use crate::web::protocol::{WsClaudeEvent, WsDrawing, WsEditLock, WsIceCandidate, WsIdeState, WsNote, WsServer, WsSlide, WsSourceFile, WsTextBlock, WsUser, WsVideoStream, WsWidget, WsWidgetKind, WsWinsize};
 
-mod snapshot;
+pub mod snapshot;
 
 /// Store a rolling buffer with at most this quantity of output, per shell.
 const SHELL_STORED_BYTES: u64 = 1 << 21; // 2 MiB
@@ -101,9 +101,6 @@ pub struct Session {
     /// Ring buffer of the last 200 Claude events for browser reconnect replay.
     claude_events: Mutex<VecDeque<WsClaudeEvent>>,
 
-    /// Latest component graph sent by the CLI workspace analyzer.
-    component_graph: RwLock<Option<WsComponentGraph>>,
-
     /// Active video streams (screen shares + offscreen browser streams).
     video_streams: RwLock<HashMap<Vid, WsVideoStream>>,
 
@@ -128,11 +125,38 @@ pub struct Session {
     /// Watch channel source for the ordered list of text blocks.
     text_blocks_source: watch::Sender<Vec<(Tid, WsTextBlock)>>,
 
+    /// In-memory state for drawing strokes.
+    drawings: RwLock<HashMap<Did, WsDrawing>>,
+
+    /// Watch channel source for the ordered list of drawings.
+    drawings_source: watch::Sender<Vec<(Did, WsDrawing)>>,
+
+    /// In-memory state for slides (slideshow mode).
+    slides: RwLock<HashMap<Slid, WsSlide>>,
+
     /// Triggered from metadata events when an immediate snapshot is needed.
     sync_notify: Notify,
 
     /// Set when this session has been closed and removed.
     shutdown: Shutdown,
+
+    /// Next tunnel ID for HTTP tunnel requests.
+    next_tunnel_id: std::sync::atomic::AtomicU32,
+
+    /// Pending HTTP tunnel responses: tunnel_id → sender for assembled response chunks.
+    tunnel_responses: dashmap::DashMap<u32, mpsc::UnboundedSender<sshx_core::proto::HttpTunnelResponse>>,
+
+    /// Active WebSocket tunnels: tunnel_id → sender for frames from CLI to browser.
+    ws_tunnels: dashmap::DashMap<u32, mpsc::UnboundedSender<sshx_core::proto::WsTunnelFrame>>,
+
+    /// Whether the CLI has IDE support available.
+    ide_available: std::sync::atomic::AtomicBool,
+
+    /// Per-widget IDE editor state (open files, cursors, selections), keyed by Wid.
+    ide_states: RwLock<HashMap<Wid, WsIdeState>>,
+
+    /// Current edit lock for collaborative IDE editing.
+    edit_lock: RwLock<WsEditLock>,
 }
 
 /// Internal state for each shell.
@@ -180,7 +204,6 @@ impl Session {
             widget_source: watch::channel(Vec::new()).0,
             shell_names: RwLock::new(HashMap::new()),
             claude_events: Mutex::new(VecDeque::new()),
-            component_graph: RwLock::new(None),
             video_streams: RwLock::new(HashMap::new()),
             video_streams_source: watch::channel(Vec::new()).0,
             browser_controllers: RwLock::new(HashMap::new()),
@@ -189,8 +212,17 @@ impl Session {
             browser_frame_buffers: Mutex::new(HashMap::new()),
             text_blocks: RwLock::new(HashMap::new()),
             text_blocks_source: watch::channel(Vec::new()).0,
+            drawings: RwLock::new(HashMap::new()),
+            drawings_source: watch::channel(Vec::new()).0,
+            slides: RwLock::new(HashMap::new()),
             sync_notify: Notify::new(),
             shutdown: Shutdown::new(),
+            next_tunnel_id: std::sync::atomic::AtomicU32::new(1),
+            tunnel_responses: dashmap::DashMap::new(),
+            ws_tunnels: dashmap::DashMap::new(),
+            ide_available: std::sync::atomic::AtomicBool::new(false),
+            ide_states: RwLock::new(HashMap::new()),
+            edit_lock: RwLock::new(WsEditLock::default()),
         }
     }
 
@@ -221,6 +253,11 @@ impl Session {
         &self,
     ) -> impl Stream<Item = Result<WsServer, BroadcastStreamRecvError>> + Unpin {
         BroadcastStream::new(self.broadcast.subscribe())
+    }
+
+    /// Return the current set of active (non-closed) shells.
+    pub fn list_shells(&self) -> Vec<(Sid, WsWinsize)> {
+        self.source.borrow().clone()
     }
 
     /// Receive a notification every time the set of shells is changed.
@@ -416,6 +453,9 @@ impl Session {
             warn!(%id, "invariant violation: removed user that does not exist");
         }
         self.broadcast.send(WsServer::UserDiff(id, None)).ok();
+        // Clean up edit lock on browser user disconnect.
+        self.force_release_edit_lock(id);
+        // Note: IDE states are keyed by Wid (not Uid), cleaned up when CLI disconnects.
     }
 
     /// Check if a user has write permission in the session.
@@ -469,6 +509,9 @@ impl Session {
             text: String::new(),
             color: "yellow".into(),
             pinned: false,
+            w: 0,
+            h: 0,
+            font: String::new(),
         };
         match self.notes.write().entry(id) {
             Occupied(_) => bail!("note already exists with id={id}"),
@@ -533,6 +576,7 @@ impl Session {
             font_size: "md".into(),
             color: "#ffffff".into(),
             align: "left".into(),
+            font: String::new(),
         };
         match self.text_blocks.write().entry(id) {
             Occupied(_) => bail!("text block already exists with id={id}"),
@@ -540,7 +584,7 @@ impl Session {
                 v.insert(block.clone());
             }
         }
-        self.broadcast.send(WsServer::TextBlockDiff(id, Some(block))).ok();
+        self.text_blocks_source.send_modify(|s| s.push((id, block)));
         self.sync_now();
         Ok(())
     }
@@ -551,7 +595,11 @@ impl Session {
             let mut text_blocks = self.text_blocks.write();
             *text_blocks.get_mut(&id).context("text block not found")? = block.clone();
         }
-        self.broadcast.send(WsServer::TextBlockDiff(id, Some(block))).ok();
+        self.text_blocks_source.send_modify(|s| {
+            if let Some(idx) = s.iter().position(|&(tid, _)| tid == id) {
+                s[idx].1 = block;
+            }
+        });
         self.sync_now();
         Ok(())
     }
@@ -560,12 +608,104 @@ impl Session {
     pub fn delete_text_block(&self, id: Tid) -> Result<()> {
         match self.text_blocks.write().remove(&id) {
             Some(_) => {
-                self.broadcast.send(WsServer::TextBlockDiff(id, None)).ok();
+                self.text_blocks_source
+                    .send_modify(|s| s.retain(|&(tid, _)| tid != id));
                 self.sync_now();
                 Ok(())
             }
             None => bail!("text block with id={id} does not exist"),
         }
+    }
+
+    // --- Drawing methods ---
+
+    /// Receive a notification every time the set of drawings is changed.
+    pub fn subscribe_drawings(&self) -> impl Stream<Item = Vec<(Did, WsDrawing)>> + Unpin {
+        WatchStream::new(self.drawings_source.subscribe())
+    }
+
+    /// Add a new drawing stroke.
+    pub fn add_drawing(&self, id: Did, drawing: WsDrawing) -> Result<()> {
+        self.drawings.write().insert(id, drawing.clone());
+        self.drawings_source.send_modify(|s| s.push((id, drawing)));
+        self.sync_now();
+        Ok(())
+    }
+
+    /// Delete a drawing stroke.
+    pub fn delete_drawing(&self, id: Did) -> Result<()> {
+        match self.drawings.write().remove(&id) {
+            Some(_) => {
+                self.drawings_source
+                    .send_modify(|s| s.retain(|&(did, _)| did != id));
+                self.sync_now();
+                Ok(())
+            }
+            None => bail!("drawing with id={id} does not exist"),
+        }
+    }
+
+    /// Return a snapshot of all drawings.
+    pub fn list_drawings(&self) -> Vec<(Did, WsDrawing)> {
+        self.drawings.read().iter().map(|(&k, v)| (k, v.clone())).collect()
+    }
+
+    // --- Slide methods ---
+
+    /// Add a new slide.
+    pub fn add_slide(&self, id: Slid, slide: WsSlide) -> Result<()> {
+        self.slides.write().insert(id, slide.clone());
+        self.broadcast.send(WsServer::SlideDiff(id, Some(slide))).ok();
+        self.sync_now();
+        Ok(())
+    }
+
+    /// Update an existing slide.
+    pub fn update_slide(&self, id: Slid, slide: WsSlide) -> Result<()> {
+        {
+            let mut slides = self.slides.write();
+            *slides.get_mut(&id).context("slide not found")? = slide.clone();
+        }
+        self.broadcast.send(WsServer::SlideDiff(id, Some(slide))).ok();
+        self.sync_now();
+        Ok(())
+    }
+
+    /// Delete a slide.
+    pub fn delete_slide(&self, id: Slid) -> Result<()> {
+        match self.slides.write().remove(&id) {
+            Some(_) => {
+                self.broadcast.send(WsServer::SlideDiff(id, None)).ok();
+                self.sync_now();
+                Ok(())
+            }
+            None => bail!("slide with id={id} does not exist"),
+        }
+    }
+
+    /// Reorder slides.
+    pub fn reorder_slides(&self, orders: Vec<(Slid, u32)>) -> Result<()> {
+        let mut slides = self.slides.write();
+        for &(ref id, order) in &orders {
+            if let Some(s) = slides.get_mut(id) {
+                s.order = order;
+            }
+        }
+        // Broadcast all changed slides
+        for &(id, _) in &orders {
+            if let Some(s) = slides.get(&id) {
+                let slide: WsSlide = s.clone();
+                self.broadcast.send(WsServer::SlideDiff(id, Some(slide))).ok();
+            }
+        }
+        drop(slides);
+        self.sync_now();
+        Ok(())
+    }
+
+    /// Return a snapshot of all slides.
+    pub fn list_slides(&self) -> Vec<(Slid, WsSlide)> {
+        self.slides.read().iter().map(|(&k, v): (&Slid, &WsSlide)| (k, v.clone())).collect()
     }
 
     /// Replace the stored source file metadata and notify all WebSocket clients.
@@ -577,19 +717,6 @@ impl Session {
     /// Return a snapshot of the current source file metadata.
     pub fn list_source_files(&self) -> (String, String, Vec<WsSourceFile>) {
         self.source_files.read().clone()
-    }
-
-    /// Store a new component graph received from the CLI workspace analyzer.
-    ///
-    /// Broadcasts `WsServer::ComponentGraph` to all connected WebSocket clients.
-    pub fn update_component_graph(&self, graph: WsComponentGraph) {
-        *self.component_graph.write() = Some(graph.clone());
-        let _ = self.broadcast.send(WsServer::ComponentGraph(graph));
-    }
-
-    /// Return the current component graph, or `None` if not yet received.
-    pub fn get_component_graph(&self) -> Option<WsComponentGraph> {
-        self.component_graph.read().clone()
     }
 
     /// Subscribe to video stream list updates (watch stream, delivers latest on connect).
@@ -853,6 +980,18 @@ impl Session {
         self.claude_events.lock().iter().cloned().collect()
     }
 
+    /// Request the CLI to capture and return a context snapshot.
+    ///
+    /// Enqueues a `ContextSnapshotRequest` gRPC message to the CLI.
+    pub fn request_context_snapshot(&self) {
+        self.update_tx.try_send(ServerMessage::ContextSnapshotRequest(bytes::Bytes::new())).ok();
+    }
+
+    /// Broadcast a received context snapshot to all connected WebSocket clients.
+    pub fn deliver_context_snapshot(&self, ansi: String) {
+        self.broadcast.send(WsServer::ContextSnapshot(ansi)).ok();
+    }
+
     /// Subscribe to canvas widget updates (watch stream, delivers latest on connect).
     pub fn subscribe_widgets(&self) -> impl Stream<Item = Vec<(Wid, WsWidget)>> + Unpin {
         WatchStream::new(self.widget_source.subscribe())
@@ -971,6 +1110,31 @@ impl Session {
         self.widget_source.send_modify(|s| {
             if let Some(entry) = s.iter_mut().find(|(wid, _)| *wid == id) {
                 entry.1.kind = kind;
+            }
+        });
+        let updated = self.widgets.read().get(&id).cloned();
+        if let Some(widget) = updated {
+            self.broadcast.send(WsServer::WidgetDiff(id, Some(widget))).ok();
+        }
+        Ok(())
+    }
+
+    /// Update an image widget's URL and name atomically.
+    pub fn update_image_widget(&self, id: Wid, new_url: String, new_name: String) -> Result<()> {
+        {
+            let mut widgets = self.widgets.write();
+            let widget = widgets.get_mut(&id).context("widget not found")?;
+            if let WsWidgetKind::Image { ref mut url, .. } = widget.kind {
+                *url = new_url.clone();
+            }
+            widget.name = if new_name.is_empty() { None } else { Some(new_name.clone()) };
+        }
+        self.widget_source.send_modify(|s| {
+            if let Some(entry) = s.iter_mut().find(|(wid, _)| *wid == id) {
+                if let WsWidgetKind::Image { ref mut url, .. } = entry.1.kind {
+                    *url = new_url;
+                }
+                entry.1.name = if new_name.is_empty() { None } else { Some(new_name) };
             }
         });
         let updated = self.widgets.read().get(&id).cloned();
@@ -1099,5 +1263,194 @@ impl Session {
     /// Resolves when the session has received a shutdown signal.
     pub async fn terminated(&self) {
         self.shutdown.wait().await
+    }
+
+    // ---- HTTP Tunnel ----
+
+    /// Allocate the next unique tunnel ID.
+    pub fn next_tunnel_id(&self) -> u32 {
+        self.next_tunnel_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Register a response channel for a pending HTTP tunnel request.
+    pub fn register_tunnel_response(
+        &self,
+        tunnel_id: u32,
+        tx: mpsc::UnboundedSender<sshx_core::proto::HttpTunnelResponse>,
+    ) {
+        self.tunnel_responses.insert(tunnel_id, tx);
+    }
+
+    /// Remove a tunnel response channel.
+    pub fn remove_tunnel_response(&self, tunnel_id: u32) {
+        self.tunnel_responses.remove(&tunnel_id);
+    }
+
+    /// Deliver an HTTP tunnel response chunk from the CLI.
+    pub fn deliver_tunnel_response(&self, resp: sshx_core::proto::HttpTunnelResponse) {
+        let tunnel_id = resp.tunnel_id;
+        if let Some(tx) = self.tunnel_responses.get(&tunnel_id) {
+            tx.send(resp).ok();
+        } else {
+            debug!("tunnel response for unknown tunnel_id={tunnel_id}");
+        }
+    }
+
+    /// Register a WebSocket tunnel frame channel.
+    pub fn register_ws_tunnel(
+        &self,
+        tunnel_id: u32,
+        tx: mpsc::UnboundedSender<sshx_core::proto::WsTunnelFrame>,
+    ) {
+        self.ws_tunnels.insert(tunnel_id, tx);
+    }
+
+    /// Remove a WebSocket tunnel.
+    pub fn remove_ws_tunnel(&self, tunnel_id: u32) {
+        self.ws_tunnels.remove(&tunnel_id);
+    }
+
+    /// Deliver a WebSocket tunnel frame from the CLI.
+    pub fn deliver_ws_tunnel_frame(&self, frame: sshx_core::proto::WsTunnelFrame) {
+        let tunnel_id = frame.tunnel_id;
+        if let Some(tx) = self.ws_tunnels.get(&tunnel_id) {
+            tx.send(frame).ok();
+        }
+    }
+
+    /// Set whether the IDE is available on this session's CLI client.
+    pub fn set_ide_available(&self, available: bool) {
+        self.ide_available
+            .store(available, std::sync::atomic::Ordering::Relaxed);
+        self.broadcast.send(WsServer::IdeAvailable(available)).ok();
+    }
+
+    /// Check if the IDE is available.
+    pub fn ide_available(&self) -> bool {
+        self.ide_available
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    // --- IDE state sync methods ---
+
+    /// Return a snapshot of all IDE states (keyed by Wid).
+    pub fn list_ide_states(&self) -> Vec<(Wid, WsIdeState)> {
+        self.ide_states
+            .read()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
+    }
+
+    /// Update an IDE widget's state and broadcast the diff.
+    ///
+    /// Also relays the state to the CLI via gRPC so the VS Code extension
+    /// can receive remote state via SSE. Includes `ide_id` so the extension
+    /// can filter out its own echoes.
+    pub fn update_ide_state(&self, wid: Wid, state: WsIdeState) {
+        self.ide_states.write().insert(wid, state.clone());
+        self.broadcast
+            .send(WsServer::IdeStateDiff(wid, Some(state.clone())))
+            .ok();
+
+        // Relay IDE state to the CLI extension with the ide_id.
+        if let Ok(json) = serde_json::to_vec(&state) {
+            use sshx_core::proto::{server_update::ServerMessage, IdeStateUpdate};
+            let msg = ServerMessage::IdeState(IdeStateUpdate {
+                json: json.into(),
+                ide_id: wid.0,
+            });
+            self.update_tx.try_send(msg).ok();
+        }
+    }
+
+    /// Remove an IDE widget's state and broadcast the removal.
+    pub fn remove_ide_state(&self, wid: Wid) {
+        if self.ide_states.write().remove(&wid).is_some() {
+            self.broadcast
+                .send(WsServer::IdeStateDiff(wid, None))
+                .ok();
+        }
+    }
+
+    /// Clear all IDE states (called when CLI disconnects).
+    pub fn clear_ide_states(&self) {
+        let wids: Vec<Wid> = self.ide_states.read().keys().copied().collect();
+        for wid in wids {
+            self.remove_ide_state(wid);
+        }
+    }
+
+    /// Return the current edit lock state.
+    pub fn get_edit_lock(&self) -> WsEditLock {
+        self.edit_lock.read().clone()
+    }
+
+    /// Try to acquire the edit lock for a user on a file.
+    ///
+    /// Returns `Ok(lock)` if granted, `Err(msg)` if held by someone else.
+    /// Auto-expires stale locks.
+    pub fn request_edit_lock(&self, uid: Uid, file: String) -> Result<WsEditLock> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let lock_duration_ms = 5_000; // 5 seconds
+
+        let mut lock = self.edit_lock.write();
+
+        // Check if the lock is held and not expired.
+        if let Some(holder) = lock.holder {
+            if holder != uid && lock.expires_at > now_ms {
+                bail!(
+                    "edit lock held by user {} on {:?} (expires in {}ms)",
+                    holder,
+                    lock.file,
+                    lock.expires_at.saturating_sub(now_ms)
+                );
+            }
+        }
+
+        // Grant or renew the lock.
+        lock.holder = Some(uid);
+        lock.file = Some(file);
+        lock.expires_at = now_ms + lock_duration_ms;
+        let new_lock = lock.clone();
+        drop(lock);
+
+        self.broadcast
+            .send(WsServer::EditLock(new_lock.clone()))
+            .ok();
+        // Also relay lock status to the CLI extension.
+        self.relay_edit_lock_to_cli(&new_lock);
+        Ok(new_lock)
+    }
+
+    /// Release the edit lock if held by the given user.
+    pub fn release_edit_lock(&self, uid: Uid) {
+        let mut lock = self.edit_lock.write();
+        if lock.holder == Some(uid) {
+            *lock = WsEditLock::default();
+            let new_lock = lock.clone();
+            drop(lock);
+            self.broadcast.send(WsServer::EditLock(new_lock.clone())).ok();
+            self.relay_edit_lock_to_cli(&new_lock);
+        }
+    }
+
+    /// Send edit lock status to the CLI via the gRPC channel.
+    fn relay_edit_lock_to_cli(&self, lock: &WsEditLock) {
+        if let Ok(json) = serde_json::to_vec(lock) {
+            use sshx_core::proto::server_update::ServerMessage;
+            self.update_tx
+                .try_send(ServerMessage::EditLockStatus(json.into()))
+                .ok();
+        }
+    }
+
+    /// Release the edit lock unconditionally for a disconnecting user.
+    pub fn force_release_edit_lock(&self, uid: Uid) {
+        self.release_edit_lock(uid);
     }
 }

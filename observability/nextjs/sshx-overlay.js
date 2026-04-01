@@ -6,6 +6,7 @@
 
   // ── Inspector state ────────────────────────────────────────────────────────
   var active = false;
+  var locked = false; // true when a click has pinned the badge
   var currentTarget = null;
   var badge = null;
 
@@ -226,6 +227,7 @@
 
   // ── Inspector event handlers ──────────────────────────────────────────────
   function onMouseMove(e) {
+    if (locked) return; // badge is pinned — don't change selection
     var target = e.target;
     if (isOverlayElement(target)) return;
     if (target === currentTarget) return;
@@ -236,6 +238,25 @@
     var info = getComponentInfo(target);
     if (info) {
       highlightElement(target);
+    }
+  }
+
+  function onMouseClick(e) {
+    var target = e.target;
+    if (isOverlayElement(target)) return; // let badge button clicks through
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    // Reset lock so we can re-evaluate the new target.
+    locked = false;
+    unhighlightElement(currentTarget);
+    currentTarget = target;
+
+    var info = getComponentInfo(target);
+    if (info) {
+      highlightElement(target);
+      locked = true;
       showBadge(e.clientX, e.clientY, info);
     } else {
       hideBadge();
@@ -247,6 +268,7 @@
       unhighlightElement(currentTarget);
       hideBadge();
       currentTarget = null;
+      locked = false;
     }
     if ((e.altKey || e.metaKey) && e.key === 'i') {
       e.preventDefault();
@@ -258,12 +280,15 @@
     active = !active;
     if (active) {
       document.addEventListener('mousemove', onMouseMove, true);
-      console.log('[SSHX overlay] inspector active');
+      document.addEventListener('click', onMouseClick, true);
+      console.log('[SSHX overlay] inspector active — click to select');
     } else {
       document.removeEventListener('mousemove', onMouseMove, true);
+      document.removeEventListener('click', onMouseClick, true);
       unhighlightElement(currentTarget);
       hideBadge();
       currentTarget = null;
+      locked = false;
       console.log('[SSHX overlay] inspector inactive');
     }
     updatePanelUI();

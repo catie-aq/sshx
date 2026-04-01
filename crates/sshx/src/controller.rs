@@ -1,6 +1,7 @@
 //! Network gRPC client allowing server control of terminals.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::pin::pin;
 
 use anyhow::{Context, Result};
@@ -14,17 +15,25 @@ use tokio::task;
 use tokio::time::{self, Duration, Instant, MissedTickBehavior};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tonic::transport::Channel;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::encrypt::Encrypt;
+use crate::ide::{self, IdeManager, IdeSyncHandle};
 use crate::runner::{Runner, ShellData};
-use crate::workspace::{spawn_describe_files, spawn_save_image_file, spawn_update_file_metadata, spawn_update_widget_name};
+use crate::tunnel::HttpTunnel;
+use crate::workspace::{spawn_context_snapshot, spawn_describe_files, spawn_save_image_file, spawn_update_file_metadata, spawn_update_widget_name};
 
 /// Interval for sending empty heartbeat messages to the server.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Interval to automatically reestablish connections.
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Default directory name for session state persistence.
+pub const SESSION_DIR: &str = ".sshx";
+
+/// Filename for the session state JSON.
+const SESSION_FILE: &str = "session.json";
 
 /// Handles a single session's communication with the remote server.
 pub struct Controller {
@@ -38,21 +47,44 @@ pub struct Controller {
     url: String,
     write_url: Option<String>,
 
+    /// Path to the session state directory, or None to disable persistence.
+    session_dir: Option<PathBuf>,
+
     /// Channels with backpressure routing messages to each shell task.
     shells_tx: HashMap<Sid, mpsc::Sender<ShellData>>,
     /// Channel shared with tasks to allow them to output client messages.
     output_tx: mpsc::Sender<ClientMessage>,
     /// Owned receiving end of the `output_tx` channel.
     output_rx: mpsc::Receiver<ClientMessage>,
+
+    /// Path to the openvscode-server binary (None = IDE feature disabled).
+    openvscode_bin: Option<PathBuf>,
+    /// Default workspace directory for new IDE instances.
+    workspace_dir: Option<PathBuf>,
+    /// HTTP tunnels per IDE instance ID (lazily created).
+    http_tunnels: HashMap<u32, HttpTunnel>,
+    /// IDE managers per IDE instance ID (lazily created).
+    ide_managers: HashMap<u32, IdeManager>,
+    /// IDE sync server handle for the sshx-collab extension.
+    ide_sync: Option<IdeSyncHandle>,
 }
 
 impl Controller {
     /// Construct a new controller, connecting to the remote server.
+    ///
+    /// If `session_dir` is `Some`, the controller will load/save session state
+    /// from `<session_dir>/session.json`. Pass `None` to disable persistence.
+    ///
+    /// If `openvscode_bin` is `Some`, the controller can start an OpenVSCode
+    /// Server and tunnel its HTTP traffic through gRPC.
     pub async fn new(
         origin: &str,
         name: &str,
         runner: Runner,
         enable_readers: bool,
+        session_dir: Option<PathBuf>,
+        openvscode_bin: Option<PathBuf>,
+        workspace_dir: Option<PathBuf>,
     ) -> Result<Self> {
         debug!(%origin, "connecting to server");
         let encryption_key = rand_alphanumeric(14); // 83.3 bits of entropy
@@ -81,11 +113,33 @@ impl Controller {
             None
         };
 
+        // Load existing session snapshot for restore.
+        let restore_snapshot = if let Some(ref dir) = session_dir {
+            let session_file = dir.join(SESSION_FILE);
+            if session_file.exists() {
+                match tokio::fs::read(&session_file).await {
+                    Ok(data) => {
+                        info!("restoring session from {}", session_file.display());
+                        Some(data)
+                    }
+                    Err(e) => {
+                        warn!("failed to read session file: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let req = OpenRequest {
             origin: origin.into(),
             encrypted_zeros: encrypt.zeros().into(),
             name: name.into(),
             write_password_hash,
+            restore_snapshot: restore_snapshot.map(Into::into),
         };
         let mut resp = client.open(req).await?.into_inner();
         resp.url = resp.url + "#" + &encryption_key;
@@ -97,6 +151,20 @@ impl Controller {
         };
 
         let (output_tx, output_rx) = mpsc::channel(64);
+
+        // Spawn IDE sync server if IDE binary is configured.
+        let ide_sync = if openvscode_bin.is_some() {
+            match ide::spawn_sync_server(output_tx.clone()) {
+                Ok(handle) => Some(handle),
+                Err(e) => {
+                    warn!("failed to start IDE sync server: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             origin: origin.into(),
             runner,
@@ -106,9 +174,15 @@ impl Controller {
             token: resp.token,
             url: resp.url,
             write_url,
+            session_dir,
             shells_tx: HashMap::new(),
             output_tx,
             output_rx,
+            openvscode_bin,
+            workspace_dir,
+            http_tunnels: HashMap::new(),
+            ide_managers: HashMap::new(),
+            ide_sync,
         })
     }
 
@@ -168,7 +242,11 @@ impl Controller {
     async fn try_channel(&mut self) -> Result<()> {
         let (tx, rx) = mpsc::channel(16);
 
-        let hello = ClientMessage::Hello(format!("{},{}", self.name, self.token));
+        let hello = if self.openvscode_bin.is_some() {
+            ClientMessage::Hello(format!("{},{},ide", self.name, self.token))
+        } else {
+            ClientMessage::Hello(format!("{},{}", self.name, self.token))
+        };
         send_msg(&tx, hello).await?;
 
         let mut client = Self::connect(&self.origin).await?;
@@ -262,13 +340,73 @@ impl Controller {
                 ServerMessage::ImageFile(img) => {
                     spawn_save_image_file(img.name, img.data.to_vec());
                 }
+                ServerMessage::SessionSnapshot(bytes) => {
+                    self.save_session_snapshot(&bytes).await;
+                }
                 ServerMessage::Error(err) => {
                     error!(?err, "error received from server");
                 }
                 ServerMessage::BrowserInput(_) => {
                     // sshx-browser handles this, not the sshx CLI client.
                 }
+                ServerMessage::IdeState(update) => {
+                    // Relay remote IDE state to the sync server's SSE clients.
+                    if let Some(ref sync) = self.ide_sync {
+                        if let Ok(state) = serde_json::from_slice::<serde_json::Value>(&update.json) {
+                            let event = ide::RemoteIdeEvent {
+                                kind: "state".into(),
+                                data: state,
+                                source_ide_id: update.ide_id,
+                            };
+                            sync.remote_tx.send(event).ok();
+                        }
+                    }
+                }
+                ServerMessage::EditLockStatus(json) => {
+                    // Relay edit lock status to the extension via SSE.
+                    if let Some(ref sync) = self.ide_sync {
+                        if let Ok(lock) = serde_json::from_slice::<serde_json::Value>(&json) {
+                            let event = ide::RemoteIdeEvent {
+                                kind: "lock".into(),
+                                data: lock,
+                                source_ide_id: 0, // edit locks are global, not per-IDE
+                            };
+                            sync.remote_tx.send(event).ok();
+                        }
+                    }
+                }
+                ServerMessage::HttpTunnelRequest(req) => {
+                    self.handle_tunnel_request(req).await;
+                }
+                ServerMessage::WsTunnelFrame(frame) => {
+                    // Route to the correct IDE tunnel by trying all active tunnels.
+                    // The one that owns this tunnel_id will forward it; others silently drop it.
+                    for tunnel in self.http_tunnels.values() {
+                        tunnel.handle_ws_frame(frame.clone()).await;
+                    }
+                }
+                ServerMessage::ContextSnapshotRequest(_) => {
+                    spawn_context_snapshot(self.output_tx.clone());
+                }
             }
+        }
+    }
+
+    /// Save a session snapshot to `<session_dir>/session.json`.
+    async fn save_session_snapshot(&self, data: &[u8]) {
+        let dir = match &self.session_dir {
+            Some(d) => d,
+            None => return, // Persistence disabled.
+        };
+        if let Err(e) = tokio::fs::create_dir_all(dir).await {
+            warn!("failed to create session dir: {e}");
+            return;
+        }
+        let path = dir.join(SESSION_FILE);
+        if let Err(e) = tokio::fs::write(&path, data).await {
+            warn!("failed to write session file: {e}");
+        } else {
+            debug!("saved session snapshot to {}", path.display());
         }
     }
 
@@ -298,6 +436,71 @@ impl Controller {
             }
             output_tx.send(ClientMessage::ClosedShell(id.0)).await.ok();
         });
+    }
+
+    /// Returns true if the IDE feature is available (binary configured).
+    pub fn has_ide(&self) -> bool {
+        self.openvscode_bin.is_some()
+    }
+
+    /// Handle an HTTP tunnel request: start the correct IDE instance if needed, then forward.
+    async fn handle_tunnel_request(&mut self, req: sshx_core::proto::HttpTunnelRequest) {
+        use sshx_core::proto::HttpTunnelResponse;
+
+        let ide_id = req.ide_id;
+        let tunnel_id = req.tunnel_id;
+
+        // Lazy-start the IDE instance for this ide_id on first request.
+        if !self.http_tunnels.contains_key(&ide_id) {
+            let bin = match &self.openvscode_bin {
+                Some(b) => b.clone(),
+                None => {
+                    warn!("received tunnel request but no IDE binary configured");
+                    let resp = HttpTunnelResponse {
+                        tunnel_id,
+                        status_code: 503,
+                        headers: Default::default(),
+                        body_chunk: bytes::Bytes::from_static(b"IDE not configured"),
+                        done: true,
+                        websocket_accepted: false,
+                    };
+                    self.output_tx.send(ClientMessage::HttpTunnelResponse(resp)).await.ok();
+                    return;
+                }
+            };
+            let ws_dir = self
+                .workspace_dir
+                .clone()
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            let mut ide = IdeManager::new(bin, ide_id, &self.name, ws_dir);
+            if let Some(ref sync) = self.ide_sync {
+                ide.set_sync_port(sync.port);
+            }
+            if let Err(e) = ide.spawn().await {
+                error!("failed to start IDE instance {ide_id}: {e:#}");
+                let resp = HttpTunnelResponse {
+                    tunnel_id,
+                    status_code: 502,
+                    headers: Default::default(),
+                    body_chunk: bytes::Bytes::from(format!("Failed to start IDE: {e:#}")),
+                    done: true,
+                    websocket_accepted: false,
+                };
+                self.output_tx.send(ClientMessage::HttpTunnelResponse(resp)).await.ok();
+                return;
+            }
+            let tunnel = HttpTunnel::new(ide.local_addr());
+            self.http_tunnels.insert(ide_id, tunnel);
+            self.ide_managers.insert(ide_id, ide);
+        }
+
+        if let Some(tunnel) = self.http_tunnels.get(&ide_id) {
+            let output_tx = self.output_tx.clone();
+            let tunnel_clone = tunnel.clone_for_request();
+            tokio::spawn(async move {
+                tunnel_clone.handle_http_request(req, &output_tx).await;
+            });
+        }
     }
 
     /// Returns a sender that can inject `ClientMessage`s into the gRPC stream.

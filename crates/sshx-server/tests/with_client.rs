@@ -14,7 +14,7 @@ pub mod common;
 #[tokio::test]
 async fn test_handshake() -> Result<()> {
     let server = TestServer::new().await;
-    let controller = Controller::new(&server.endpoint(), "", Runner::Echo, false).await?;
+    let controller = Controller::new(&server.endpoint(), "", Runner::Echo, false, None, None, None).await?;
     controller.close().await?;
     Ok(())
 }
@@ -23,7 +23,7 @@ async fn test_handshake() -> Result<()> {
 async fn test_command() -> Result<()> {
     let server = TestServer::new().await;
     let runner = Runner::Shell("/bin/bash".into());
-    let mut controller = Controller::new(&server.endpoint(), "", runner, false).await?;
+    let mut controller = Controller::new(&server.endpoint(), "", runner, false, None, None, None).await?;
 
     let session = server
         .state()
@@ -71,7 +71,7 @@ async fn test_ws_missing() -> Result<()> {
 async fn test_ws_basic() -> Result<()> {
     let server = TestServer::new().await;
 
-    let mut controller = Controller::new(&server.endpoint(), "", Runner::Echo, false).await?;
+    let mut controller = Controller::new(&server.endpoint(), "", Runner::Echo, false, None, None, None).await?;
     let name = controller.name().to_owned();
     let key = controller.encryption_key().to_owned();
     tokio::spawn(async move { controller.run().await });
@@ -103,7 +103,7 @@ async fn test_ws_basic() -> Result<()> {
 async fn test_ws_resize() -> Result<()> {
     let server = TestServer::new().await;
 
-    let mut controller = Controller::new(&server.endpoint(), "", Runner::Echo, false).await?;
+    let mut controller = Controller::new(&server.endpoint(), "", Runner::Echo, false, None, None, None).await?;
     let name = controller.name().to_owned();
     let key = controller.encryption_key().to_owned();
     tokio::spawn(async move { controller.run().await });
@@ -147,7 +147,7 @@ async fn test_ws_resize() -> Result<()> {
 async fn test_users_join() -> Result<()> {
     let server = TestServer::new().await;
 
-    let mut controller = Controller::new(&server.endpoint(), "", Runner::Echo, false).await?;
+    let mut controller = Controller::new(&server.endpoint(), "", Runner::Echo, false, None, None, None).await?;
     let name = controller.name().to_owned();
     let key = controller.encryption_key().to_owned();
     tokio::spawn(async move { controller.run().await });
@@ -176,7 +176,7 @@ async fn test_users_join() -> Result<()> {
 async fn test_users_metadata() -> Result<()> {
     let server = TestServer::new().await;
 
-    let mut controller = Controller::new(&server.endpoint(), "", Runner::Echo, false).await?;
+    let mut controller = Controller::new(&server.endpoint(), "", Runner::Echo, false, None, None, None).await?;
     let name = controller.name().to_owned();
     let key = controller.encryption_key().to_owned();
     tokio::spawn(async move { controller.run().await });
@@ -201,7 +201,7 @@ async fn test_users_metadata() -> Result<()> {
 async fn test_chat_messages() -> Result<()> {
     let server = TestServer::new().await;
 
-    let mut controller = Controller::new(&server.endpoint(), "", Runner::Echo, false).await?;
+    let mut controller = Controller::new(&server.endpoint(), "", Runner::Echo, false, None, None, None).await?;
     let name = controller.name().to_owned();
     let key = controller.encryption_key().to_owned();
     tokio::spawn(async move { controller.run().await });
@@ -234,7 +234,7 @@ async fn test_read_write_permissions() -> Result<()> {
     let server = TestServer::new().await;
 
     // create controller with read-only mode enabled
-    let mut controller = Controller::new(&server.endpoint(), "", Runner::Echo, true).await?;
+    let mut controller = Controller::new(&server.endpoint(), "", Runner::Echo, true, None, None, None).await?;
     let name = controller.name().to_owned();
     let key = controller.encryption_key().to_owned();
     let write_url = controller
@@ -280,6 +280,72 @@ async fn test_read_write_permissions() -> Result<()> {
         1,
         "Reader should still see the existing shell"
     );
+
+    Ok(())
+}
+
+/// Verify that sending `RequestContextSnapshot` does NOT disconnect the WebSocket.
+///
+/// If socket.rs fails to deserialize this message, it closes the socket with an
+/// error. This test catches that regression.
+#[tokio::test]
+async fn test_context_snapshot_no_disconnect() -> Result<()> {
+    let server = TestServer::new().await;
+    let mut controller =
+        Controller::new(&server.endpoint(), "", Runner::Echo, false, None, None, None).await?;
+    let name = controller.name().to_owned();
+    let key = controller.encryption_key().to_owned();
+    tokio::spawn(async move { controller.run().await });
+
+    let mut s = ClientSocket::connect(&server.ws_endpoint(&name), &key, None).await?;
+    s.flush().await;
+
+    // This must NOT close the WebSocket.
+    s.send(WsClient::RequestContextSnapshot).await;
+    s.flush().await;
+
+    // Verify the connection is still alive by sending a Ping and getting a Pong.
+    s.send(WsClient::Ping(999)).await;
+    // Give the server a moment to reply.
+    time::sleep(Duration::from_millis(100)).await;
+    s.flush().await;
+
+    // If the socket disconnected, recv() would return None and flush() would
+    // exit early. We can't easily assert pong arrived via flush(), so just
+    // assert we didn't panic getting here, and additionally send a Create to
+    // confirm the socket still works for write operations.
+    s.send(WsClient::Create(0, 0)).await;
+    s.flush().await;
+    assert_eq!(s.shells.len(), 1, "WebSocket must remain connected after RequestContextSnapshot");
+
+    Ok(())
+}
+
+/// Verify the full context snapshot delivery path:
+/// server-side `deliver_context_snapshot()` broadcasts to all WebSocket clients.
+#[tokio::test]
+async fn test_context_snapshot_delivered() -> Result<()> {
+    let server = TestServer::new().await;
+    let mut controller =
+        Controller::new(&server.endpoint(), "", Runner::Echo, false, None, None, None).await?;
+    let name = controller.name().to_owned();
+    let key = controller.encryption_key().to_owned();
+    tokio::spawn(async move { controller.run().await });
+
+    let session = server.state().lookup(&name).context("session not found")?;
+
+    let mut s = ClientSocket::connect(&server.ws_endpoint(&name), &key, None).await?;
+    s.flush().await;
+
+    // Directly inject a snapshot (simulates the CLI completing its capture).
+    session.deliver_context_snapshot("test ANSI output \x1b[32mgreen\x1b[0m".to_string());
+
+    // Allow the broadcast to propagate.
+    time::sleep(Duration::from_millis(100)).await;
+    s.flush().await;
+
+    assert_eq!(s.context_snapshots.len(), 1);
+    assert_eq!(s.context_snapshots[0], "test ANSI output \x1b[32mgreen\x1b[0m");
 
     Ok(())
 }

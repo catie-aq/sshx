@@ -13,6 +13,7 @@ use tracing::warn;
 
 use crate::ServerState;
 
+pub mod ide_proxy;
 pub mod protocol;
 mod socket;
 
@@ -32,6 +33,7 @@ pub fn app() -> Router<Arc<ServerState>> {
     let uploads_dir = ServeDir::new("uploads");
 
     Router::new()
+        .nest("/ide", ide_proxy::routes())
         .nest("/api", backend())
         .nest_service("/uploads", get_service(uploads_dir))
         .fallback_service(get_service(static_files))

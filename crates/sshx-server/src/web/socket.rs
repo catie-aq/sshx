@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use axum::extract::{
     ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     Path, State,
@@ -96,6 +96,7 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>, ice_server
     session.sync_now();
     send(socket, WsServer::Hello(user_id, metadata.name.clone())).await?;
     send(socket, WsServer::IceServers(ice_servers)).await?;
+    send(socket, WsServer::IdeAvailable(session.ide_available())).await?;
 
     let can_write = match recv(socket).await? {
         Some(WsClient::Authenticate(bytes, write_password_bytes)) => {
@@ -135,14 +136,13 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>, ice_server
     send(socket, WsServer::Users(session.list_users())).await?;
     send(socket, WsServer::Notes(session.list_notes())).await?;
     send(socket, WsServer::TextBlocks(session.list_text_blocks())).await?;
+    send(socket, WsServer::Drawings(session.list_drawings())).await?;
+    send(socket, WsServer::Slides(session.list_slides())).await?;
     let (sf_root, sf_root_path, sf_files) = session.list_source_files();
     send(socket, WsServer::SourceFiles(sf_root, sf_root_path, sf_files)).await?;
     send(socket, WsServer::Widgets(session.list_widgets())).await?;
     send(socket, WsServer::ShellNames(session.list_shell_names())).await?;
-    if let Some(graph) = session.get_component_graph() {
-        send(socket, WsServer::ComponentGraph(graph)).await?;
-    }
-
+    send(socket, WsServer::Shells(session.list_shells())).await?;
     // Replay stored Claude events so reconnecting browsers see recent history.
     for event in session.list_claude_events() {
         send(socket, WsServer::ClaudeEvent(event)).await?;
@@ -158,6 +158,10 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>, ice_server
         }
     }
 
+    // Send IDE state snapshot and edit lock on connect.
+    send(socket, WsServer::IdeStates(session.list_ide_states())).await?;
+    send(socket, WsServer::EditLock(session.get_edit_lock())).await?;
+
     let mut subscribed = HashSet::new(); // prevent duplicate subscriptions
     let (chunks_tx, mut chunks_rx) = mpsc::channel::<(Sid, u64, Vec<Bytes>)>(1);
     let (browser_frame_tx, mut browser_frame_rx) = mpsc::channel::<(Vid, u64, Bytes, bool)>(256);
@@ -165,6 +169,7 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>, ice_server
     let mut shells_stream = session.subscribe_shells();
     let mut notes_stream = session.subscribe_notes();
     let mut text_blocks_stream = session.subscribe_text_blocks();
+    let mut drawings_stream = session.subscribe_drawings();
     let mut source_files_stream = session.subscribe_source_files();
     let mut widget_stream = session.subscribe_widgets();
     let mut video_streams_stream = session.subscribe_video_streams();
@@ -172,8 +177,17 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>, ice_server
         let msg = tokio::select! {
             _ = session.terminated() => break,
             Some(result) = broadcast_stream.next() => {
-                let msg = result.context("client fell behind on broadcast stream")?;
-                send(socket, msg).await?;
+                let msg = match result {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        tracing::warn!("broadcast recv error: {e}");
+                        continue;
+                    }
+                };
+                if let Err(e) = send(socket, msg).await {
+                    tracing::warn!("broadcast send failed: {e}");
+                    continue;
+                }
                 continue;
             }
             Some(shells) = shells_stream.next() => {
@@ -186,6 +200,10 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>, ice_server
             }
             Some(text_blocks) = text_blocks_stream.next() => {
                 send(socket, WsServer::TextBlocks(text_blocks)).await?;
+                continue;
+            }
+            Some(drawings) = drawings_stream.next() => {
+                send(socket, WsServer::Drawings(drawings)).await?;
                 continue;
             }
             Some((root, root_path, files)) = source_files_stream.next() => {
@@ -426,36 +444,18 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>, ice_server
                             let local = img_path.trim_start_matches('/');
                             match tokio::fs::read(local).await {
                                 Ok(data) => {
-                                    session.update_tx().try_send(
-                                        ServerMessage::ImageFile(ImageFile {
+                                    session.update_tx()
+                                        .send(ServerMessage::ImageFile(ImageFile {
                                             name: name.clone(),
                                             data: data.into(),
-                                        })
-                                    ).ok();
+                                        }))
+                                        .await
+                                        .ok();
                                 }
                                 Err(e) => warn!("image push: could not read {local}: {e}"),
                             }
                         }
                     }
-                }
-            }
-            WsClient::OpenGraphView(x, y) => {
-                if let Err(e) = session.check_write_permission(user_id) {
-                    send(socket, WsServer::Error(e.to_string())).await?;
-                    continue;
-                }
-                let id = session.counter().next_wid();
-                let widget = WsWidget {
-                    x,
-                    y,
-                    w: 640,
-                    h: 520,
-                    kind: WsWidgetKind::GraphView {},
-                    collapsed: false,
-                    name: None,
-                };
-                if let Err(err) = session.add_widget(id, widget) {
-                    send(socket, WsServer::Error(err.to_string())).await?;
                 }
             }
             WsClient::OpenClaudeFeed(x, y, instance_id) => {
@@ -651,7 +651,100 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>, ice_server
                     send(socket, WsServer::Error(err.to_string())).await?;
                 }
             }
-            WsClient::CreateImageWidget(x, y, url, alt) => {
+            WsClient::CreateDrawing(drawing) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                let id = session.counter().next_did();
+                if let Err(err) = session.add_drawing(id, drawing) {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
+            }
+            WsClient::DeleteDrawing(id) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                if let Err(err) = session.delete_drawing(id) {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
+            }
+            WsClient::CreateSlide(slide) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                let id = session.counter().next_slid();
+                if let Err(err) = session.add_slide(id, slide) {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
+            }
+            WsClient::UpdateSlide(id, slide) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                if let Err(err) = session.update_slide(id, slide) {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
+            }
+            WsClient::DeleteSlide(id) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                if let Err(err) = session.delete_slide(id) {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
+            }
+            WsClient::ReorderSlides(orders) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                if let Err(err) = session.reorder_slides(orders) {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
+            }
+            WsClient::OpenIdeEditor(x, y, workspace_label) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                if !session.ide_available() {
+                    send(socket, WsServer::Error("IDE not available".into())).await?;
+                    continue;
+                }
+                let id = session.counter().next_wid();
+                let widget = WsWidget {
+                    x,
+                    y,
+                    w: 900,
+                    h: 600,
+                    kind: WsWidgetKind::IdeEditor { workspace_label, ide_id: id.0 },
+                    collapsed: false,
+                    name: None,
+                };
+                if let Err(err) = session.add_widget(id, widget) {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
+            }
+            WsClient::UpdateIdeState(wid, state) => {
+                session.update_ide_state(wid, state);
+            }
+            WsClient::RequestEditLock(file) => {
+                match session.request_edit_lock(user_id, file) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        send(socket, WsServer::Error(e.to_string())).await?;
+                    }
+                }
+            }
+            WsClient::ReleaseEditLock => {
+                session.release_edit_lock(user_id);
+            }
+            WsClient::CreateImageWidget(x, y, url, alt, auto_name) => {
                 if let Err(e) = session.check_write_permission(user_id) {
                     send(socket, WsServer::Error(e.to_string())).await?;
                     continue;
@@ -662,17 +755,114 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>, ice_server
                     y,
                     w: 400,
                     h: 300,
-                    kind: WsWidgetKind::Image { url, alt },
+                    kind: WsWidgetKind::Image { url: url.clone(), alt },
                     collapsed: false,
-                    name: None,
+                    name: auto_name.clone().filter(|n| !n.is_empty()),
                 };
                 if let Err(err) = session.add_widget(id, widget) {
                     send(socket, WsServer::Error(err.to_string())).await?;
+                } else if let Some(name) = auto_name.filter(|n| !n.is_empty()) {
+                    // Auto-push image bytes to CLI (use .send().await to avoid silent drops).
+                    let local = url.trim_start_matches('/');
+                    match tokio::fs::read(local).await {
+                        Ok(data) => {
+                            session.update_tx()
+                                .send(ServerMessage::ImageFile(ImageFile {
+                                    name,
+                                    data: data.into(),
+                                }))
+                                .await
+                                .ok();
+                        }
+                        Err(e) => warn!("image push: could not read {local}: {e}"),
+                    }
+                }
+            }
+            WsClient::RequestContextSnapshot => {
+                session.request_context_snapshot();
+            }
+            WsClient::PushImageWidget(wid, new_name) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                if new_name.is_empty() { continue; }
+                // Look up the widget's image URL and current name.
+                let info = session.list_widgets().into_iter()
+                    .find(|(id, _)| *id == wid)
+                    .and_then(|(_, w)| match w.kind {
+                        WsWidgetKind::Image { url, .. } => Some((url, w.name)),
+                        _ => None,
+                    });
+                if let Some((url, _old_name)) = info {
+                    // Rename the file on disk if the name changed.
+                    let local = url.trim_start_matches('/');
+                    let new_url = rename_upload_file(local, &new_name).await.unwrap_or_else(|| url.clone());
+                    // Update the widget kind with the new URL and name.
+                    session.update_image_widget(wid, new_url, new_name.clone()).ok();
+                    // Push image bytes to CLI (use .send().await to avoid silent drops).
+                    let new_local = session.list_widgets().into_iter()
+                        .find(|(id, _)| *id == wid)
+                        .and_then(|(_, w)| match w.kind {
+                            WsWidgetKind::Image { url, .. } => Some(url),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    let read_path = new_local.trim_start_matches('/');
+                    match tokio::fs::read(read_path).await {
+                        Ok(data) => {
+                            session.update_tx()
+                                .send(ServerMessage::ImageFile(ImageFile {
+                                    name: new_name,
+                                    data: data.into(),
+                                }))
+                                .await
+                                .ok();
+                        }
+                        Err(e) => warn!("image push: could not read {read_path}: {e}"),
+                    }
                 }
             }
         }
     }
     Ok(())
+}
+
+/// Rename an uploaded file on disk to match a new user-chosen name.
+/// Returns the new URL path (e.g. `/uploads/session/newname.png`) or None on failure.
+async fn rename_upload_file(current_path: &str, new_name: &str) -> Option<String> {
+    use rand::Rng;
+
+    let path = std::path::Path::new(current_path);
+    if !path.exists() {
+        return None;
+    }
+    let parent = path.parent()?;
+    // Sanitize: keep alphanumeric, dot, dash, underscore.
+    let sanitized: String = new_name
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
+        .collect();
+    if sanitized.is_empty() {
+        return None;
+    }
+    let new_path = parent.join(&sanitized);
+    // Don't rename if it's the same path.
+    if new_path == path {
+        return None;
+    }
+    let final_path = if new_path.exists() {
+        // Add a short random prefix to avoid collisions.
+        let prefix: u32 = rand::thread_rng().gen();
+        parent.join(format!("{:08x}_{sanitized}", prefix))
+    } else {
+        new_path
+    };
+    if let Err(e) = tokio::fs::rename(path, &final_path).await {
+        warn!("rename upload: {e}");
+        return None;
+    }
+    Some(format!("/{}", final_path.display()))
 }
 
 /// Transparently reverse-proxy a WebSocket connection to a different host.

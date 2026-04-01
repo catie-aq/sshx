@@ -1,10 +1,8 @@
 //! Serializable types sent and received by the web server.
 
-use std::collections::HashMap;
-
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use sshx_core::{Nid, Sid, Tid, Uid, Vid, Wid};
+use sshx_core::{Did, Nid, Sid, Slid, Tid, Uid, Vid, Wid};
 
 /// Real-time message conveying the position and size of a terminal.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,48 +29,6 @@ impl Default for WsWinsize {
     }
 }
 
-/// A node in the component graph, representing one source file.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct WsGraphNode {
-    /// Relative path from the workspace root (matches the map key).
-    pub path: String,
-    /// File kind: "component"|"hook"|"utility"|"config"|"type"|"other".
-    pub kind: String,
-    /// Filename portion of the path, for display labels.
-    pub label: String,
-    /// AI-generated or empty description.
-    pub description: String,
-    /// Total source lines.
-    pub line_count: u32,
-}
-
-/// A directed edge in the component graph.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct WsGraphEdge {
-    /// Source node path (the file that imports).
-    pub from: String,
-    /// Target node path (the file being imported).
-    pub to: String,
-}
-
-/// Component graph with nodes and two edge sets.
-///
-/// Nodes are keyed by relative file path for O(1) adjacency look-up.
-/// `codeEdges` encodes static import relationships; `displayEdges` is
-/// reserved for UI-level render-tree relationships (populated later).
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct WsComponentGraph {
-    /// Nodes keyed by relative file path.
-    pub nodes: HashMap<String, WsGraphNode>,
-    /// Directed code-dependency edges (importer → importee).
-    pub code_edges: Vec<WsGraphEdge>,
-    /// Directed display/render-tree edges (placeholder).
-    pub display_edges: Vec<WsGraphEdge>,
-}
-
 /// Real-time message representing a sticky note on the canvas.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -81,12 +37,21 @@ pub struct WsNote {
     pub x: i32,
     /// The y-coordinate of the note on the canvas.
     pub y: i32,
-    /// The text content of the note.
+    /// The text content of the note (HTML rich text).
     pub text: String,
     /// Color key: "yellow" | "pink" | "blue" | "green" | "purple"
     pub color: String,
     /// Whether the note is pinned (position locked).
     pub pinned: bool,
+    /// Width of the note in pixels (0 = default 260px).
+    #[serde(default)]
+    pub w: u32,
+    /// Height of the note in pixels (0 = auto).
+    #[serde(default)]
+    pub h: u32,
+    /// Font family ID (e.g. "inter", "caveat"). Empty = default.
+    #[serde(default)]
+    pub font: String,
 }
 
 /// A text block on the canvas (FigJam-style rich text).
@@ -105,6 +70,9 @@ pub struct WsTextBlock {
     pub color: String,
     /// Text alignment: "left" | "center" | "right".
     pub align: String,
+    /// Font family ID (e.g. "inter", "caveat"). Empty = default.
+    #[serde(default)]
+    pub font: String,
 }
 
 /// Metadata for a source file, extracted by the CLI workspace analyzer.
@@ -179,6 +147,12 @@ pub struct WsClaudeEvent {
     /// Output token count from the model usage field (assistant events only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u32>,
+    /// Cache-read token count (prompt-cache hit tokens).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u32>,
+    /// Cache-creation token count (tokens written into the prompt cache).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u32>,
 }
 
 /// The content/kind of a canvas widget.
@@ -195,8 +169,6 @@ pub enum WsWidgetKind {
         /// The file path this card represents.
         path: String,
     },
-    /// Force-directed component graph visualization.
-    GraphView {},
     /// A Claude Code activity feed panel.
     ClaudeFeed {
         /// The Claude Code session ID this feed tracks.
@@ -215,9 +187,21 @@ pub enum WsWidgetKind {
         /// URL of the observed application.
         url: String,
         /// Whether the overlay can open file cards in SSHX.
+        #[serde(rename = "allowOpenFile")]
         allow_open_file: bool,
         /// Whether the overlay can trigger Claude Code actions.
+        #[serde(rename = "allowOpenClaude")]
         allow_open_claude: bool,
+    },
+    /// Embedded IDE editor (OpenVSCode Server in an iframe).
+    IdeEditor {
+        /// Human-readable workspace label.
+        #[serde(rename = "workspaceLabel")]
+        workspace_label: String,
+        /// Unique IDE instance ID. Encoded in the proxy URL `/ide/s/{session}/{ide_id}/`.
+        /// Defaults to 0 for legacy widgets created before multi-IDE support.
+        #[serde(default, rename = "ideId")]
+        ide_id: u32,
     },
 }
 
@@ -308,6 +292,91 @@ pub struct WsIceCandidate {
     pub sdp_mline_index: Option<u16>,
 }
 
+/// A freehand drawing stroke on the canvas (pencil or highlighter).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WsDrawing {
+    /// Tool type: "pencil" or "highlighter".
+    pub tool: String,
+    /// Flat array of points: [x0, y0, x1, y1, ...] in canvas coordinates.
+    pub points: Vec<f32>,
+    /// CSS color string (e.g. "#ff0000" or "rgba(255,0,255,0.5)").
+    pub color: String,
+    /// Stroke width in pixels.
+    pub width: f32,
+    /// Opacity (0.0 to 1.0). Highlighter typically uses ~0.4.
+    pub opacity: f32,
+}
+
+/// IDE editor state for a single user (open files, cursors, selections, etc.).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WsIdeState {
+    /// Ordered list of open file paths (tab order).
+    pub open_files: Vec<String>,
+    /// Currently focused/active file path.
+    pub active_file: Option<String>,
+    /// Cursor positions: (path, line, col).
+    pub cursors: Vec<(String, u32, u32)>,
+    /// Selections: (path, startLine, startCol, endLine, endCol).
+    pub selections: Vec<(String, u32, u32, u32, u32)>,
+    /// Visible ranges: (path, startLine, endLine).
+    pub visible_ranges: Vec<(String, u32, u32)>,
+    /// Whether the sidebar is visible.
+    pub sidebar_visible: bool,
+    /// Active sidebar view: "explorer", "search", "git", etc.
+    pub sidebar_view: Option<String>,
+    /// Whether the bottom panel is visible.
+    pub panel_visible: bool,
+    /// Workspace folder name (for "project opened" sync).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_folder: Option<String>,
+    /// Workspace folder path on the host machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
+}
+
+/// Edit lock state — simple mutex for collaborative editing.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WsEditLock {
+    /// Who holds the lock (None = free).
+    pub holder: Option<Uid>,
+    /// Which file is locked.
+    pub file: Option<String>,
+    /// Expiry timestamp in milliseconds since epoch (auto-release).
+    pub expires_at: u64,
+}
+
+impl Default for WsEditLock {
+    fn default() -> Self {
+        WsEditLock {
+            holder: None,
+            file: None,
+            expires_at: 0,
+        }
+    }
+}
+
+/// A slide region (rectangle) for slideshow mode.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WsSlide {
+    /// Top-left x coordinate.
+    pub x: i32,
+    /// Top-left y coordinate.
+    pub y: i32,
+    /// Width of the slide region.
+    pub w: u32,
+    /// Height of the slide region.
+    pub h: u32,
+    /// Display order (1-based).
+    pub order: u32,
+    /// Optional label/title.
+    #[serde(default)]
+    pub label: String,
+}
+
 /// A real-time message sent from the server over WebSocket.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -341,8 +410,6 @@ pub enum WsServer {
     SourceFiles(String, String, Vec<WsSourceFile>),
     /// A real-time event from a Claude Code session.
     ClaudeEvent(WsClaudeEvent),
-    /// Component graph derived from the workspace analysis (sent on connect and on update).
-    ComponentGraph(WsComponentGraph),
     /// Snapshot of all canvas widgets when a client first connects.
     Widgets(Vec<(Wid, WsWidget)>),
     /// A single widget was created, moved, or removed (None = removed).
@@ -373,6 +440,24 @@ pub enum WsServer {
     TextBlocks(Vec<(Tid, WsTextBlock)>),
     /// A single text block was created, updated, or deleted (None = deleted).
     TextBlockDiff(Tid, Option<WsTextBlock>),
+    /// Snapshot of all drawings when a client first connects.
+    Drawings(Vec<(Did, WsDrawing)>),
+    /// A single drawing was created or deleted (None = deleted).
+    DrawingDiff(Did, Option<WsDrawing>),
+    /// Snapshot of all slides when a client first connects.
+    Slides(Vec<(Slid, WsSlide)>),
+    /// A single slide was created, updated, or deleted (None = deleted).
+    SlideDiff(Slid, Option<WsSlide>),
+    /// Whether the CLI client has IDE (OpenVSCode Server) support available.
+    IdeAvailable(bool),
+    /// Snapshot of all IDE states when a client first connects (keyed by Wid).
+    IdeStates(Vec<(Wid, WsIdeState)>),
+    /// A single IDE widget's state was updated or removed (None = removed).
+    IdeStateDiff(Wid, Option<WsIdeState>),
+    /// Current edit lock state.
+    EditLock(WsEditLock),
+    /// Raw ANSI output from the CLI's `/context` command (for the Context tab).
+    ContextSnapshot(String),
 }
 
 /// A real-time message sent from the client over WebSocket.
@@ -427,8 +512,6 @@ pub enum WsClient {
     UpdateFileMetadata(String, WsFileMetadataUpdate),
     /// Set a human-readable name for a shell window.
     SetShellName(Sid, String),
-    /// Open a graph-view widget at canvas position (x, y).
-    OpenGraphView(i32, i32),
     /// Open a Claude activity feed widget at canvas position (x, y) for the given Claude session ID.
     OpenClaudeFeed(i32, i32, String),
     /// Set a user-defined name for a canvas widget.
@@ -459,8 +542,10 @@ pub enum WsClient {
     RequestBrowserControl(Vid),
     /// Release control of an offscreen browser stream.
     ReleaseBrowserControl(Vid),
-    /// Create an image widget at canvas position (x, y) with the given URL and alt text.
-    CreateImageWidget(i32, i32, String, String),
+    /// Create an image widget at canvas position (x, y) with URL, alt text, and optional filename for auto-push.
+    CreateImageWidget(i32, i32, String, String, Option<String>),
+    /// Push an ImageWidget's image to the CLI with the given filename.
+    PushImageWidget(Wid, String),
     /// Request all connected overlay clients to flash a component by name.
     HighlightComponent(String),
     /// Open the app overlay widget at canvas position (x, y).
@@ -473,4 +558,26 @@ pub enum WsClient {
     UpdateTextBlock(Tid, WsTextBlock),
     /// Delete a text block by ID.
     DeleteTextBlock(Tid),
+    /// Create a new drawing stroke on the canvas.
+    CreateDrawing(WsDrawing),
+    /// Delete a drawing stroke by ID.
+    DeleteDrawing(Did),
+    /// Create a new slide region on the canvas.
+    CreateSlide(WsSlide),
+    /// Update an existing slide.
+    UpdateSlide(Slid, WsSlide),
+    /// Delete a slide by ID.
+    DeleteSlide(Slid),
+    /// Reorder slides: list of (Slid, new_order) pairs.
+    ReorderSlides(Vec<(Slid, u32)>),
+    /// Open an IDE editor widget at canvas position (x, y) with a workspace label.
+    OpenIdeEditor(i32, i32, String),
+    /// Report local IDE editor state, scoped by widget ID.
+    UpdateIdeState(Wid, WsIdeState),
+    /// Request the edit lock on a file path.
+    RequestEditLock(String),
+    /// Explicitly release the edit lock.
+    ReleaseEditLock,
+    /// Request the CLI to capture and return the current context window summary.
+    RequestContextSnapshot,
 }

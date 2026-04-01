@@ -182,3 +182,129 @@ sshx --server http://homa-server2.gaur-toad.ts.net:8051
 - ✅ Web Crypto API (`crypto.subtle`) available for encryption
 - ✅ Accessible from any device on your Tailscale network
 - ✅ Certificates auto-renewable via Tailscale
+
+
+## VS Code IDE Integration
+
+sshx can embed a full VS Code editor ([OpenVSCode Server](https://github.com/gitpod-io/openvscode-server)) in the browser canvas, with real-time state sync between all participants.
+
+### Quick start
+
+```shell
+sshx --server http://localhost:8051 --ide
+```
+
+That's it. On first run, sshx automatically downloads OpenVSCode Server (~73 MB) to `~/.sshx/openvscode-server/` and manages it from there. Subsequent runs reuse the cached binary instantly.
+
+Once connected, click the **IDE** button in the browser toolbar to place a VS Code widget on the canvas.
+
+### How auto-download works
+
+When you pass `--ide`, sshx:
+
+1. Checks `~/.sshx/openvscode-server/.version` — if it matches the pinned version (currently **v1.109.5**), uses the cached binary
+2. If missing or version mismatch, downloads the correct tarball from [gitpod-io/openvscode-server releases](https://github.com/gitpod-io/openvscode-server/releases)
+3. Extracts to `~/.sshx/openvscode-server.tmp/`, verifies, then atomically renames to `~/.sshx/openvscode-server/`
+4. Starts the server and passes `SSHX_SYNC_PORT` to enable the `sshx-collab` extension
+
+Platform is detected automatically:
+
+| OS | Arch | Tarball |
+|---|---|---|
+| Linux | x86_64 | `linux-x64` |
+| Linux | aarch64 | `linux-arm64` |
+| macOS | x86_64 (Intel) | `darwin-x64` |
+| macOS | aarch64 (Apple Silicon) | `darwin-arm64` |
+
+### Storage layout
+
+```
+~/.sshx/
+├── openvscode-server/         # Auto-downloaded release (managed by sshx)
+│   ├── .version               # "1.109.5" — version marker for upgrade detection
+│   ├── bin/openvscode-server  # Shell script launcher
+│   ├── node                   # Bundled Node.js binary
+│   ├── out/server-main.js     # VS Code server
+│   ├── node_modules/
+│   └── extensions/            # Built-in VS Code extensions (languages, themes)
+└── vscode-data/               # User settings, state (persisted across sessions)
+```
+
+When sshx is upgraded and pins a newer OpenVSCode version, the old install is automatically replaced on next `--ide` run.
+
+### Advanced usage
+
+**Override with a custom binary** (skips auto-download):
+
+```shell
+sshx --server http://localhost:8051 \
+     --openvscode-bin /path/to/openvscode-server/bin/openvscode-server
+
+# Or via env var
+export SSHX_OPENVSCODE_BIN=/path/to/openvscode-server/bin/openvscode-server
+sshx --server http://localhost:8051
+```
+
+**With Tailscale:**
+
+```shell
+sshx --server http://homa-server2.gaur-toad.ts.net:8051 --ide
+```
+
+### What syncs
+
+The `sshx-collab` extension (in `extensions/sshx-collab/`, auto-loaded by sshx) syncs the following:
+
+| Feature | Direction | Description |
+|---|---|---|
+| **Project/folder opened** | IDE → Browser | Workspace folder name and path shown in the IDE widget |
+| **Open files** | IDE → Browser, IDE ↔ IDE | List of open tabs synced in real time |
+| **Active file** | IDE → Browser, IDE ↔ IDE | Currently focused file highlighted for all participants |
+| **File scroll position** | IDE → Browser, IDE ↔ IDE | Visible line range synced so collaborators can follow along |
+| **Cursor positions** | IDE ↔ IDE | Remote cursors shown as colored decorations in the editor |
+| **Selections** | IDE ↔ IDE | Multi-cursor selections visible to all participants |
+| **Edit lock** | IDE ↔ Browser ↔ IDE | Mutex-style lock (5s auto-expiry) prevents conflicting edits |
+
+### Architecture
+
+```
+VS Code Extension (sshx-collab)
+  │  POST /state  (every 100ms, debounced)
+  │  POST /lock   (on text change)
+  │  GET  /events (SSE stream for remote state)
+  ▼
+IDE Sync Server (127.0.0.1:$SSHX_SYNC_PORT)
+  │  Runs inside the sshx CLI process
+  │  Forwards state as gRPC ClientMessage
+  ▼
+sshx-server
+  │  Stores IDE state per-user
+  │  Broadcasts IdeStateDiff to WebSocket clients
+  │  Relays browser IDE state back to CLI via gRPC
+  ▼
+Browser (IdeEditorWidget)
+  │  Shows collaborator dots, active files, lock status
+  │  Sends UpdateIdeState for browser-side IDE changes
+```
+
+### Key files
+
+```
+sshx/
+├── extensions/sshx-collab/              # VS Code extension (auto-loaded)
+│   ├── package.json
+│   └── src/extension.js                 # State sync, cursors, scroll, locks
+├── crates/sshx/src/openvscode.rs        # Auto-download + version management
+├── crates/sshx/src/ide.rs               # Sync HTTP server + IDE process manager
+├── crates/sshx-server/src/web/protocol.rs  # WsIdeState, WsEditLock types
+└── src/lib/ui/IdeEditorWidget.svelte    # Browser-side IDE widget
+```
+
+### Troubleshooting
+
+- **Download fails**: Check your internet connection. sshx downloads from `github.com` — if behind a proxy, set `HTTPS_PROXY`. A failed download leaves no broken state (uses a temp directory).
+- **Extension not activating**: Open a terminal inside the IDE widget and run `echo $SSHX_SYNC_PORT` — it should print a port number. If empty, the sync server didn't start.
+- **No sync visible**: Open browser DevTools and look for `ideStateDiff` in WebSocket frames. If absent, the extension isn't sending state.
+- **Lock not working**: Edit locks auto-expire after 5 seconds. The extension requests a lock on every text change; if another user holds it, the request is silently denied.
+- **Extension not found**: sshx looks for `extensions/` next to the `sshx` binary first, then in the workspace root. Check logs for `using bundled extensions dir`.
+- **Force re-download**: Delete `~/.sshx/openvscode-server/` and run with `--ide` again.

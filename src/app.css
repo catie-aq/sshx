@@ -21,4 +21,7 @@
   .panel {
     @apply border border-zinc-800 bg-zinc-900/90 backdrop-blur-sm rounded-xl pointer-events-auto;
   }
+  .canvas-focus-ring {
+    @apply ring-2 ring-indigo-400 rounded-lg;
+  }
 }

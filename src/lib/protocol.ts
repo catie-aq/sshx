@@ -4,6 +4,8 @@ type Nid = number; // u32
 type Wid = number; // u32
 type Vid = number; // u32
 type Tid = number; // u32
+type Did = number; // u32 - drawing ID
+type Slid = number; // u32 - slide ID
 
 /** Source file metadata, see WsSourceFile in the Rust server. */
 export type WsSourceFile = {
@@ -47,49 +49,22 @@ export type WsClaudeEvent = {
   inputTokens?: number;
   /** Output token count (present on tool_use and assistant_message events). */
   outputTokens?: number;
+  /** Cache-read token count (prompt-cache hit tokens). */
+  cacheReadTokens?: number;
+  /** Cache-creation token count (tokens written into the prompt cache). */
+  cacheCreationTokens?: number;
   /** UNIX timestamp (seconds) of the transcript file — only on synthetic "transcript" events. */
   fileMtime?: number;
-};
-
-/** A node in the component graph, keyed by file path. */
-export type WsGraphNode = {
-  path: string;
-  kind: string;
-  /** Filename portion of the path, for display labels. */
-  label: string;
-  description: string;
-  lineCount: number;
-};
-
-/** A directed edge in the component graph. */
-export type WsGraphEdge = {
-  /** Source node path (the file that imports). */
-  from: string;
-  /** Target node path (the file being imported). */
-  to: string;
-};
-
-/**
- * Component dependency graph derived from workspace analysis.
- *
- * `nodes` is a path→node map for O(1) adjacency look-up.
- * `codeEdges` encodes static import relationships.
- * `displayEdges` is reserved for UI render-tree relationships (populated later).
- */
-export type WsComponentGraph = {
-  nodes: Record<string, WsGraphNode>;
-  codeEdges: WsGraphEdge[];
-  displayEdges: WsGraphEdge[];
 };
 
 /** The kind/content of a canvas widget. */
 export type WsWidgetKind =
   | { type: "fileTree"; root: string }
   | { type: "fileCard"; path: string }
-  | { type: "graphView" }
   | { type: "claudeFeed"; instanceId: string }
   | { type: "image"; url: string; alt: string }
-  | { type: "appOverlay"; url: string; allowOpenFile: boolean; allowOpenClaude: boolean };
+  | { type: "appOverlay"; url: string; allowOpenFile: boolean; allowOpenClaude: boolean }
+  | { type: "ideEditor"; workspaceLabel: string; ideId: number };
 
 /** A generic canvas widget. */
 export type WsWidget = {
@@ -136,6 +111,12 @@ export type WsNote = {
   text: string;
   color: string;
   pinned: boolean;
+  /** Width in pixels (0 = default 260px). */
+  w: number;
+  /** Height in pixels (0 = auto). */
+  h: number;
+  /** Font family ID (e.g. "inter", "caveat"). Empty = default. */
+  font: string;
 };
 
 /** A text block on the canvas (FigJam-style rich text). */
@@ -146,6 +127,56 @@ export type WsTextBlock = {
   fontSize: string;
   color: string;
   align: string;
+  /** Font family ID (e.g. "inter", "caveat"). Empty = default. */
+  font: string;
+};
+
+/** A freehand drawing stroke on the canvas (pencil or highlighter). */
+export type WsDrawing = {
+  tool: "pencil" | "highlighter";
+  /** Flat array: [x0, y0, x1, y1, ...] in canvas coordinates. */
+  points: number[];
+  color: string;
+  width: number;
+  opacity: number;
+};
+
+/** A slide region for slideshow mode. */
+export type WsSlide = {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  /** Display order (1-based). */
+  order: number;
+  label: string;
+};
+
+/** IDE editor state for a single user (open files, cursors, selections). */
+export type WsIdeState = {
+  openFiles: string[];
+  activeFile: string | null;
+  /** Cursor positions: [path, line, col]. */
+  cursors: [string, number, number][];
+  /** Selections: [path, startLine, startCol, endLine, endCol]. */
+  selections: [string, number, number, number, number][];
+  /** Visible ranges: [path, startLine, endLine]. */
+  visibleRanges: [string, number, number][];
+  sidebarVisible: boolean;
+  sidebarView: string | null;
+  panelVisible: boolean;
+  /** Workspace folder name (for "project opened" sync). */
+  workspaceFolder?: string | null;
+  /** Workspace folder path on the host machine. */
+  workspacePath?: string | null;
+};
+
+/** Edit lock state — simple mutex for collaborative editing. */
+export type WsEditLock = {
+  holder: Uid | null;
+  file: string | null;
+  /** Expiry timestamp in ms since epoch. */
+  expiresAt: number;
 };
 
 /** Position and size of a window, see the Rust version. */
@@ -183,8 +214,6 @@ export type WsServer = {
   claudeEvent?: WsClaudeEvent;
   widgets?: [Wid, WsWidget][];
   widgetDiff?: [Wid, WsWidget | null];
-  /** Component graph derived from workspace analysis. */
-  componentGraph?: WsComponentGraph;
   /** Snapshot of all shell names on connect. */
   shellNames?: [Sid, string][];
   /** A single shell name was set. */
@@ -211,6 +240,24 @@ export type WsServer = {
   textBlocks?: [Tid, WsTextBlock][];
   /** A single text block was created, updated, or deleted (null = deleted). */
   textBlockDiff?: [Tid, WsTextBlock | null];
+  /** Snapshot of all drawings on connect. */
+  drawings?: [Did, WsDrawing][];
+  /** A single drawing was created or deleted (null = deleted). */
+  drawingDiff?: [Did, WsDrawing | null];
+  /** Snapshot of all slides on connect. */
+  slides?: [Slid, WsSlide][];
+  /** A single slide was created, updated, or deleted (null = deleted). */
+  slideDiff?: [Slid, WsSlide | null];
+  /** Whether the CLI client has IDE (OpenVSCode Server) support available. */
+  ideAvailable?: boolean;
+  /** Snapshot of all IDE states on connect (keyed by Wid). */
+  ideStates?: [Wid, WsIdeState][];
+  /** A single IDE widget's state was updated or removed (null = removed). */
+  ideStateDiff?: [Wid, WsIdeState | null];
+  /** Current edit lock state. */
+  editLock?: WsEditLock;
+  /** Raw ANSI output from the CLI's /context command (for the Context tab). */
+  contextSnapshot?: string;
 };
 
 /** Client message type, see the Rust version. */
@@ -242,8 +289,6 @@ export type WsClient = {
   updateFileMetadata?: [string, WsFileMetadataUpdate];
   /** Set a human-readable name for a shell window. */
   setShellName?: [Sid, string];
-  /** Open a graph-view widget at canvas position (x, y). */
-  openGraphView?: [number, number];
   /** Open a Claude activity feed widget at canvas position (x, y) for the given Claude session ID. */
   openClaudeFeed?: [number, number, string];
   /** Set a user-defined name for a canvas widget. */
@@ -274,8 +319,10 @@ export type WsClient = {
   requestBrowserControl?: Vid;
   /** Release control of an offscreen browser stream. */
   releaseBrowserControl?: Vid;
-  /** Create an image widget at canvas position (x, y) with URL and alt text. */
-  createImageWidget?: [number, number, string, string];
+  /** Create an image widget at canvas position (x, y) with URL, alt text, and optional filename for auto-push. */
+  createImageWidget?: [number, number, string, string, string | null];
+  /** Push an ImageWidget's image to the CLI with a given filename. */
+  pushImageWidget?: [Wid, string];
   /** Request all connected overlay clients to flash a component by name. */
   highlightComponent?: string;
   /** Open the app overlay widget at canvas position (x, y). */
@@ -288,6 +335,28 @@ export type WsClient = {
   updateTextBlock?: [Tid, WsTextBlock];
   /** Delete a text block by ID. */
   deleteTextBlock?: Tid;
+  /** Create a drawing stroke on the canvas. */
+  createDrawing?: WsDrawing;
+  /** Delete a drawing stroke by ID. */
+  deleteDrawing?: Did;
+  /** Create a new slide region. */
+  createSlide?: WsSlide;
+  /** Update an existing slide. */
+  updateSlide?: [Slid, WsSlide];
+  /** Delete a slide by ID. */
+  deleteSlide?: Slid;
+  /** Reorder slides: [slid, newOrder][] */
+  reorderSlides?: [Slid, number][];
+  /** Open an IDE editor widget at canvas position (x, y) with workspace label. */
+  openIdeEditor?: [number, number, string];
+  /** Report local IDE editor state, scoped by widget ID. */
+  updateIdeState?: [Wid, WsIdeState];
+  /** Request the edit lock on a file path. */
+  requestEditLock?: string;
+  /** Explicitly release the edit lock. */
+  releaseEditLock?: true;
+  /** Request the CLI to capture and return the current context window summary. */
+  requestContextSnapshot?: true;
 };
 
 /** An item in the command-palette search list. */

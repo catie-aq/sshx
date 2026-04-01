@@ -13,7 +13,7 @@
   import { Encrypt } from "./encrypt";
   import { createLock } from "./lock";
   import { Srocket } from "./srocket";
-  import type { WsClient, WsClaudeEvent, WsComponentGraph, WsFileMetadataUpdate, WsIceCandidate, WsNote, WsServer, WsSourceFile, WsTextBlock, WsUser, WsVideoStream, WsWidget, WsWinsize } from "./protocol";
+  import type { WsClient, WsClaudeEvent, WsDrawing, WsFileMetadataUpdate, WsIceCandidate, WsNote, WsServer, WsSlide, WsSourceFile, WsTextBlock, WsUser, WsVideoStream, WsWidget, WsWinsize } from "./protocol";
   import { makeToast } from "./toast";
   import Chat, { type ChatMessage } from "./ui/Chat.svelte";
   import ChooseName from "./ui/ChooseName.svelte";
@@ -28,23 +28,30 @@
   import FileTreePanel from "./ui/FileTreePanel.svelte";
   import FileCard from "./ui/FileCard.svelte";
   import ClaudeActivityFeed from "./ui/ClaudeActivityFeed.svelte";
-  import GraphView from "./ui/GraphView.svelte";
-  import GraphOverlay from "./ui/GraphOverlay.svelte";
+  import ClaudeExecutionGraph from "./ui/ClaudeExecutionGraph.svelte";
   import LibraryCard from "./ui/LibraryCard.svelte";
   import CommandPalette from "./ui/CommandPalette.svelte";
   import ScreenShareWidget from "./ui/ScreenShareWidget.svelte";
   import ImageWidget from "./ui/ImageWidget.svelte";
   import AppOverlayWidget from "./ui/AppOverlayWidget.svelte";
+  import IdeEditorWidget from "./ui/IdeEditorWidget.svelte";
+  import CircleButton from "./ui/CircleButton.svelte";
+  import CircleButtons from "./ui/CircleButtons.svelte";
   import TextBlock from "./ui/TextBlock.svelte";
+  import DrawingLayer from "./ui/DrawingLayer.svelte";
+  import SlideRegion from "./ui/SlideRegion.svelte";
+  import Timeline from "./ui/Timeline.svelte";
   import ContextMenu from "./ui/ContextMenu.svelte";
   import OpenFileDialog from "./ui/OpenFileDialog.svelte";
   import type { SearchItem } from "./protocol";
-  import { buildRuntimeEdges } from "./runtimeGraph";
   import { slide } from "./action/slide";
   import { TouchZoom, INITIAL_ZOOM } from "./action/touchZoom";
   import { arrangeNewTerminal } from "./arrange";
   import { settings } from "./settings";
   import { EyeIcon } from "svelte-feather-icons";
+  import "$lib/fonts"; // Load all font CSS
+  import { type SelectionItem, type SelectionRect, normalizeRect, rectContainsPoint } from "$lib/selection";
+  import { UndoHistory, type HistoryAction } from "$lib/history";
 
   export let id: string;
 
@@ -86,7 +93,6 @@
   let filePickerOpen = false;
   let filePickerScreenPos: [number, number] = [0, 0];
   let filePickerCanvasPos: [number, number] = [0, 0];
-  let graphMode = false; // @hmr:keep
   let shellNames = new Map<number, string>(); // local-only terminal labels
 
   onMount(() => {
@@ -95,17 +101,130 @@
         e.preventDefault();
         commandPaletteOpen = true;
       }
-      if (e.key === "t" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      // When a terminal is focused, let it capture all keys except Ctrl+K (command palette).
+      if (focused.length > 0) return;
+      // Edition hotkeys — auto-activate edition major mode
+      if (!e.metaKey && !e.ctrlKey && !e.altKey) {
         const tag = (e.target as HTMLElement)?.tagName;
         const editable = (e.target as HTMLElement)?.isContentEditable;
-        if (tag === "INPUT" || tag === "TEXTAREA" || editable) return;
-        e.preventDefault();
-        textToolActive = !textToolActive;
-        if (!textToolActive) textToolGhost = null;
+        if (tag !== "INPUT" && tag !== "TEXTAREA" && !editable) {
+          if (e.key === "t") {
+            e.preventDefault();
+            majorMode = "edition";
+            textToolActive = !textToolActive;
+            if (!textToolActive) textToolGhost = null;
+            else { drawingTool = null; }
+          }
+          if (e.key === "n") {
+            e.preventDefault();
+            majorMode = "edition";
+            handleCreateNote();
+          }
+          if (e.key === "l") {
+            e.preventDefault();
+            majorMode = "edition";
+            drawingTool = drawingTool === "pencil" ? null : "pencil";
+            if (drawingTool) { textToolActive = false; textToolGhost = null; }
+          }
+          if (e.key === "h" && !e.shiftKey) {
+            e.preventDefault();
+            majorMode = "edition";
+            drawingTool = drawingTool === "highlighter" ? null : "highlighter";
+            if (drawingTool) { textToolActive = false; textToolGhost = null; }
+          }
+        }
       }
       if (e.key === "Escape" && textToolActive) {
         textToolActive = false;
         textToolGhost = null;
+      }
+      if (e.key === "Escape" && drawingTool) {
+        drawingTool = null;
+      }
+      if (e.key === "Escape" && slideshowPlaying) {
+        stopSlideshowPlay();
+      }
+      // Arrow key navigation in slideshow play mode
+      if (slideshowPlaying) {
+        if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+          e.preventDefault();
+          navigateToSlide(Math.min(currentSlideIndex + 1, sortedSlides.length - 1));
+        }
+        if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+          e.preventDefault();
+          navigateToSlide(Math.max(currentSlideIndex - 1, 0));
+        }
+      }
+      if (e.key === "Escape" && selectedItems.length > 0) {
+        selectedItems = [];
+      }
+      // Ctrl+C: copy selected items
+      if ((e.metaKey || e.ctrlKey) && e.key === "c" && selectedItems.length > 0) {
+        const tag = (e.target as HTMLElement)?.tagName;
+        const editable = (e.target as HTMLElement)?.isContentEditable;
+        if (tag === "INPUT" || tag === "TEXTAREA" || editable) return;
+        e.preventDefault();
+        clipboard = selectedItems.map((item) => {
+          if (item.type === "note") return { type: "note", data: { ...notes.get(item.id) } };
+          if (item.type === "textBlock") return { type: "textBlock", data: { ...textBlocks.get(item.id) } };
+          if (item.type === "drawing") return { type: "drawing", data: { ...drawings.get(item.id) } };
+          return { type: item.type, data: null };
+        }).filter((c) => c.data !== null);
+      }
+      // Ctrl+V: paste clipboard
+      if ((e.metaKey || e.ctrlKey) && e.key === "v" && clipboard.length > 0) {
+        const tag = (e.target as HTMLElement)?.tagName;
+        const editable = (e.target as HTMLElement)?.isContentEditable;
+        if (tag === "INPUT" || tag === "TEXTAREA" || editable) return;
+        e.preventDefault();
+        const offset = 40;
+        for (const item of clipboard) {
+          if (item.type === "note" && item.data) {
+            srocket?.send({ createNote: [item.data.x + offset, item.data.y + offset] });
+          } else if (item.type === "textBlock" && item.data) {
+            srocket?.send({ createTextBlock: [item.data.x + offset, item.data.y + offset] });
+          } else if (item.type === "drawing" && item.data) {
+            const d = item.data;
+            const shifted = [...d.points];
+            for (let i = 0; i < shifted.length; i += 2) {
+              shifted[i] += offset;
+              shifted[i + 1] += offset;
+            }
+            srocket?.send({ createDrawing: { ...d, points: shifted } });
+          }
+        }
+      }
+      // Ctrl+Z: undo
+      if ((e.metaKey || e.ctrlKey) && e.key === "z" && !e.shiftKey) {
+        const tag = (e.target as HTMLElement)?.tagName;
+        const editable = (e.target as HTMLElement)?.isContentEditable;
+        if (tag === "INPUT" || tag === "TEXTAREA" || editable) return;
+        e.preventDefault();
+        const action = undoHistory.undo();
+        if (action) applyUndoAction(action);
+      }
+      // Ctrl+Shift+Z: redo
+      if ((e.metaKey || e.ctrlKey) && e.key === "z" && e.shiftKey) {
+        const tag = (e.target as HTMLElement)?.tagName;
+        const editable = (e.target as HTMLElement)?.isContentEditable;
+        if (tag === "INPUT" || tag === "TEXTAREA" || editable) return;
+        e.preventDefault();
+        const action = undoHistory.redo();
+        if (action) applyRedoAction(action);
+      }
+      // Delete/Backspace: delete selected items
+      if ((e.key === "Delete" || e.key === "Backspace") && selectedItems.length > 0) {
+        const tag = (e.target as HTMLElement)?.tagName;
+        const editable = (e.target as HTMLElement)?.isContentEditable;
+        if (tag === "INPUT" || tag === "TEXTAREA" || editable) return;
+        e.preventDefault();
+        for (const item of selectedItems) {
+          if (item.type === "note") srocket?.send({ deleteNote: item.id });
+          else if (item.type === "textBlock") srocket?.send({ deleteTextBlock: item.id });
+          else if (item.type === "widget") srocket?.send({ closeWidget: item.id });
+          else if (item.type === "drawing") srocket?.send({ deleteDrawing: item.id });
+        }
+        selectedItems = [];
       }
     }
     window.addEventListener("keydown", handleGlobalKey);
@@ -172,12 +291,47 @@
   let resizingCell = [0, 0]; // Pixel dimensions of a single terminal cell.
   let resizingSize: WsWinsize; // Last resize message sent.
 
-  let mode: "terminal" | "creative" = "terminal";
+  let majorMode: "none" | "edition" | "slides" = "none";
   let workspaceOpen = false;
   let notes = new Map<number, WsNote>(); // Nid → WsNote
   let movingNote: number | null = null; // Nid being dragged
   let movingNoteOrigin = [0, 0]; // [dx, dy] offset from note origin
   let movingNotePos: { x: number; y: number } | null = null;
+
+  // Note resize state
+  let resizingNote: { nid: number; startW: number; startH: number; startX: number; startY: number } | null = null;
+
+  function startNoteResize(e: MouseEvent, nid: number, note: WsNote) {
+    const w = note.w || 260;
+    const h = note.h || 160;
+    resizingNote = { nid, startW: w, startH: h, startX: e.clientX, startY: e.clientY };
+    window.addEventListener("pointermove", onNoteResizeMove);
+    window.addEventListener("pointerup", onNoteResizeEnd, { once: true });
+  }
+
+  function onNoteResizeMove(e: PointerEvent) {
+    if (!resizingNote) return;
+    const dw = (e.clientX - resizingNote.startX) / zoom;
+    const dh = (e.clientY - resizingNote.startY) / zoom;
+    const w = Math.max(140, resizingNote.startW + dw);
+    const h = Math.max(80, resizingNote.startH + dh);
+    const note = notes.get(resizingNote.nid);
+    if (note) { note.w = Math.round(w); note.h = Math.round(h); notes = notes; }
+  }
+
+  function onNoteResizeEnd(e: PointerEvent) {
+    if (!resizingNote) return;
+    const dw = (e.clientX - resizingNote.startX) / zoom;
+    const dh = (e.clientY - resizingNote.startY) / zoom;
+    const w = Math.round(Math.max(140, resizingNote.startW + dw));
+    const h = Math.round(Math.max(80, resizingNote.startH + dh));
+    const note = notes.get(resizingNote.nid);
+    if (note) {
+      srocket?.send({ updateNote: [resizingNote.nid, { ...note, w, h }] });
+    }
+    resizingNote = null;
+    window.removeEventListener("pointermove", onNoteResizeMove);
+  }
 
   let textBlocks = new Map<number, WsTextBlock>(); // Tid → WsTextBlock
   let movingTextBlock: number | null = null;
@@ -185,12 +339,243 @@
   let movingTextBlockPos: { x: number; y: number } | null = null;
   let textToolActive = false;
   let textToolGhost: { x: number; y: number } | null = null;
+  let pendingAutoFocusPos: [number, number] | null = null;
+  let pendingAutoFocusTid: number | null = null;
+
+  // Drawing state
+  let drawings = new Map<number, WsDrawing>();
+  let drawingTool: "pencil" | "highlighter" | null = null;
+  let drawingColor = "#ffffff";
+
+  // Slide state
+  let slides = new Map<number, WsSlide>();
+  let slideshowMode = false;
+  let slideshowPlaying = false;
+  let currentSlideIndex = 0;
+  let movingSlide: number | null = null;
+  let movingSlideOrigin = [0, 0];
+  let movingSlidePos: { x: number; y: number } | null = null;
+  let resizingSlide: { slid: number; startW: number; startH: number; startX: number; startY: number } | null = null;
+
+  $: sortedSlides = [...slides.entries()].sort(([, a], [, b]) => a.order - b.order);
+
+  function handleCreateSlide() {
+    const [ox, oy] = getConstantOffset();
+    const cx = Math.round(center[0] + window.innerWidth / 2 / zoom - ox);
+    const cy = Math.round(center[1] + window.innerHeight / 2 / zoom - oy);
+    const order = slides.size + 1;
+    srocket?.send({ createSlide: { x: cx - 480, y: cy - 270, w: 960, h: 540, order, label: "" } });
+  }
+
+  function navigateToSlide(index: number) {
+    const sorted = sortedSlides;
+    if (index < 0 || index >= sorted.length) return;
+    currentSlideIndex = index;
+    const [, slide] = sorted[index];
+    // Center viewport on slide, compensating for the constant CSS offset
+    const zoomTarget = Math.min(
+      window.innerWidth / slide.w,
+      window.innerHeight / slide.h,
+    ) * 0.85;
+    touchZoom.moveTo([
+      slide.x + slide.w / 2 - CONSTANT_OFFSET_LEFT / zoomTarget,
+      slide.y + slide.h / 2 - CONSTANT_OFFSET_TOP / zoomTarget,
+    ], zoomTarget);
+  }
+
+  function startSlideshowPlay() {
+    slideshowPlaying = true;
+    if (sortedSlides.length > 0) navigateToSlide(0);
+  }
+
+  function stopSlideshowPlay() {
+    slideshowPlaying = false;
+  }
+
+  let pdfExporting = false;
+
+  async function handleExportPdf() {
+    if (pdfExporting || sortedSlides.length === 0) return;
+    pdfExporting = true;
+
+    try {
+      const [{ default: html2canvas }, { jsPDF }] = await Promise.all([
+        import("html2canvas"),
+        import("jspdf"),
+      ]);
+
+      // Save current viewport state
+      const savedCenter = [...touchZoom.center];
+      const savedZoom = touchZoom.zoom;
+
+      // Hide UI overlays during capture
+      const overlays = fabricEl.parentElement?.querySelectorAll<HTMLElement>(
+        ".absolute.top-20, .absolute.bottom-4, .absolute.top-4"
+      );
+      overlays?.forEach((el) => (el.style.visibility = "hidden"));
+
+      const captures: { canvas: HTMLCanvasElement; w: number; h: number }[] = [];
+
+      for (let i = 0; i < sortedSlides.length; i++) {
+        const [, sl] = sortedSlides[i];
+
+        // Navigate to slide (this animates over 350ms)
+        navigateToSlide(i);
+        // Wait for animation + render settle
+        await new Promise((r) => setTimeout(r, 500));
+        await tick();
+
+        // Capture the full viewport
+        const captured = await html2canvas(fabricEl, {
+          backgroundColor: null,
+          scale: 2,
+          useCORS: true,
+          logging: false,
+        });
+
+        captures.push({ canvas: captured, w: sl.w, h: sl.h });
+      }
+
+      // Restore UI overlays
+      overlays?.forEach((el) => (el.style.visibility = ""));
+
+      // Restore viewport
+      touchZoom.center = savedCenter;
+      touchZoom.zoom = savedZoom;
+
+      // Build PDF — use first slide's aspect ratio as page size
+      if (captures.length === 0) return;
+
+      // Use landscape A4-ish sizing based on viewport aspect ratio
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const orientation = vw >= vh ? "landscape" : "portrait";
+      const pdf = new jsPDF({
+        orientation,
+        unit: "px",
+        format: [vw, vh],
+        hotfixes: ["px_scaling"],
+      });
+
+      for (let i = 0; i < captures.length; i++) {
+        if (i > 0) pdf.addPage([vw, vh], orientation);
+        const imgData = captures[i].canvas.toDataURL("image/png");
+        pdf.addImage(imgData, "PNG", 0, 0, vw, vh);
+      }
+
+      pdf.save("slides-export.pdf");
+      makeToast({ kind: "success", message: `Exported ${captures.length} slide(s) to PDF` });
+    } catch (err) {
+      console.error("PDF export failed:", err);
+      makeToast({ kind: "error", message: "PDF export failed — see console for details" });
+    } finally {
+      pdfExporting = false;
+    }
+  }
+
+  // Selection state
+  let selectedItems: SelectionItem[] = [];
+  let selectionRect: SelectionRect | null = null;
+  let isSelecting = false;
+
+  // Undo/redo
+  const undoHistory = new UndoHistory();
+
+  // Clipboard (local, for copy/paste)
+  let clipboard: { type: string; data: any }[] = [];
+
+  // Alt+drag duplication tracking
+  let altDragActive = false;
+
+  function applyUndoAction(action: HistoryAction) {
+    switch (action.type) {
+      case "createNote":
+        srocket?.send({ deleteNote: action.id });
+        break;
+      case "deleteNote":
+        srocket?.send({ createNote: [action.data.x, action.data.y] });
+        break;
+      case "updateNote":
+        srocket?.send({ updateNote: [action.id, action.before] });
+        break;
+      case "createTextBlock":
+        srocket?.send({ deleteTextBlock: action.id });
+        break;
+      case "deleteTextBlock":
+        srocket?.send({ createTextBlock: [action.data.x, action.data.y] });
+        break;
+      case "updateTextBlock":
+        srocket?.send({ updateTextBlock: [action.id, action.before] });
+        break;
+      case "createDrawing":
+        srocket?.send({ deleteDrawing: action.id });
+        break;
+      case "deleteDrawing":
+        srocket?.send({ createDrawing: action.data });
+        break;
+      case "batch":
+        for (const a of action.actions) applyUndoAction(a);
+        break;
+    }
+  }
+
+  function applyRedoAction(action: HistoryAction) {
+    switch (action.type) {
+      case "createNote":
+        srocket?.send({ createNote: [action.data.x, action.data.y] });
+        break;
+      case "deleteNote":
+        srocket?.send({ deleteNote: action.id });
+        break;
+      case "updateNote":
+        srocket?.send({ updateNote: [action.id, action.after] });
+        break;
+      case "createTextBlock":
+        srocket?.send({ createTextBlock: [action.data.x, action.data.y] });
+        break;
+      case "deleteTextBlock":
+        srocket?.send({ deleteTextBlock: action.id });
+        break;
+      case "updateTextBlock":
+        srocket?.send({ updateTextBlock: [action.id, action.after] });
+        break;
+      case "createDrawing":
+        srocket?.send({ createDrawing: action.data });
+        break;
+      case "deleteDrawing":
+        srocket?.send({ deleteDrawing: action.id });
+        break;
+      case "batch":
+        for (const a of action.actions) applyRedoAction(a);
+        break;
+    }
+  }
+
+  /** Compute items inside a selection rectangle. */
+  function computeSelection(rect: SelectionRect): SelectionItem[] {
+    const nr = normalizeRect(rect);
+    const items: SelectionItem[] = [];
+    for (const [nid, note] of notes) {
+      if (rectContainsPoint(nr, note.x, note.y, note.w || 260, note.h || 160)) {
+        items.push({ type: "note", id: nid });
+      }
+    }
+    for (const [tid, block] of textBlocks) {
+      if (rectContainsPoint(nr, block.x, block.y, 200, 40)) {
+        items.push({ type: "textBlock", id: tid });
+      }
+    }
+    for (const [wid, widget] of widgets) {
+      if (rectContainsPoint(nr, widget.x, widget.y, widget.w, widget.h)) {
+        items.push({ type: "widget", id: wid });
+      }
+    }
+    return items;
+  }
 
   // Workspace intelligence state
   let workspaceRootName = "workspace"; // project folder name, e.g. "my-project"
   let sourceFiles = new Map<string, WsSourceFile>(); // path → metadata
-  let componentGraph: WsComponentGraph | null = null; // code + display dependency graph
-
   // Per-Claude-session activity state
   type ClaudeInstance = {
     sessionId: string;
@@ -212,6 +597,12 @@
   // PID of the running claude process, null if not found.
   let claudePid: string | null = null;
   let claudePidDead = false;
+
+  // Latest context snapshot from the CLI (markdown), or null if none received.
+  let latestContextSnapshot: string | null = null;
+  // Increments on each new snapshot arrival so the child component always reacts,
+  // even when the snapshot content is identical to the previous one.
+  let contextSnapshotVersion = 0;
 
   // Per-shell input buffers for detecting the "claude" command.
   const inputBuffers: Record<number, string> = {};
@@ -430,14 +821,38 @@
             textBlocks.delete(tid);
           } else {
             textBlocks.set(tid, block);
+            // Auto-focus newly created text block
+            if (pendingAutoFocusPos && block.x === pendingAutoFocusPos[0] && block.y === pendingAutoFocusPos[1]) {
+              pendingAutoFocusTid = tid;
+              pendingAutoFocusPos = null;
+              requestAnimationFrame(() => { pendingAutoFocusTid = null; });
+            }
           }
           textBlocks = textBlocks;
+        } else if (message.drawings) {
+          drawings = new Map(message.drawings);
+        } else if (message.drawingDiff) {
+          const [did, drawing] = message.drawingDiff;
+          if (drawing === null) {
+            drawings.delete(did);
+          } else {
+            drawings.set(did, drawing);
+          }
+          drawings = drawings;
+        } else if (message.slides) {
+          slides = new Map(message.slides);
+        } else if (message.slideDiff) {
+          const [slid, slide] = message.slideDiff;
+          if (slide === null) {
+            slides.delete(slid);
+          } else {
+            slides.set(slid, slide);
+          }
+          slides = slides;
         } else if (message.sourceFiles) {
           const [root, _rootPath, files] = message.sourceFiles;
           workspaceRootName = root || "workspace";
           sourceFiles = new Map(files.map((f) => [f.path, f]));
-        } else if (message.componentGraph) {
-          componentGraph = message.componentGraph;
         } else if (message.claudeEvent) {
           const ev = message.claudeEvent;
           if (ev.kind === "transcript") {
@@ -526,6 +941,9 @@
           if (widget === null) {
             widgets.delete(wid);
           } else {
+            if (widget.kind?.type === "ideEditor") {
+              console.log("[sshx] IDE widget received:", JSON.stringify(widget.kind));
+            }
             widgets.set(wid, widget);
             // Propagate custom widget name into claudeInstances so the dropdown shows it.
             if (widget.kind.type === "claudeFeed" && widget.kind.instanceId) {
@@ -630,6 +1048,24 @@
             ...(s.username !== undefined && { username: s.username }),
             ...(s.credential !== undefined && { credential: s.credential }),
           }));
+        } else if (message.ideAvailable !== undefined) {
+          ideAvailable = message.ideAvailable;
+        } else if (message.ideStates) {
+          ideStates = new Map(message.ideStates);
+          ideStates = ideStates; // trigger reactivity
+        } else if (message.ideStateDiff) {
+          const [wid, state] = message.ideStateDiff;
+          if (state) {
+            ideStates.set(wid, state);
+          } else {
+            ideStates.delete(wid);
+          }
+          ideStates = ideStates; // trigger reactivity
+        } else if (message.editLock) {
+          editLock = message.editLock;
+        } else if (message.contextSnapshot !== undefined) {
+          latestContextSnapshot = message.contextSnapshot;
+          contextSnapshotVersion++;
         } else if (message.highlightComponent) {
           // Forward to any connected overlay tabs (e.g. Next.js dev server).
           try {
@@ -763,9 +1199,13 @@
     }
   }
 
-  function handleOpenGraphView() {
-    graphMode = !graphMode;
-  }
+  // Derive list of active IDE editor widgets for the toolbar dropdown.
+  $: ideEditors = [...widgets.entries()]
+    .filter(([, w]) => w.kind.type === "ideEditor")
+    .map(([wid, w]): [number, string] => [
+      wid,
+      w.kind.type === "ideEditor" ? w.kind.workspaceLabel : "IDE",
+    ]);
 
   // Derive whether an AppOverlay widget exists and is visible.
   $: appOverlayOpen = [...widgets.values()].some(
@@ -793,9 +1233,6 @@
     const y = Math.round(center[1] + window.innerHeight / 2 / zoom - oy);
     srocket?.send({ openAppOverlay: [x, y] });
   }
-
-  // Live runtime graph: links between terminals, file cards, and Claude sessions.
-  $: runtimeGraph = buildRuntimeEdges(claudeInstances, widgets, shells);
 
   /**
    * If a FileCard for `path` already exists on the canvas, navigate to it,
@@ -908,6 +1345,16 @@
   // --- Screen share / WebRTC helpers ---
 
   let iceServers: RTCIceServer[] = [{ urls: "stun:stun.l.google.com:19302" }];
+  let ideAvailable = false;
+  /** Wid of the IDE widget currently shown fullscreen (local-only, not synced). */
+  let fullscreenIdeWid: number | null = null;
+  /** Map from wid to IdeEditorWidget component instance, for programmatic file opens. */
+  let ideEditorRefs: Record<number, { openFile: (path: string) => void }> = {};
+
+  // --- IDE state sync ---
+  import type { WsIdeState, WsEditLock } from "./protocol";
+  let ideStates: Map<number, WsIdeState> = new Map();
+  let editLock: WsEditLock | null = null;
 
   function createPeerConnection(vid: number): RTCPeerConnection {
     const pc = new RTCPeerConnection({ iceServers });
@@ -1153,11 +1600,70 @@
         }
       }
 
+      // Slide move
+      if (movingSlide !== null && movingSlidePos) {
+        const [x, y] = normalizePosition(event);
+        movingSlidePos = {
+          x: Math.round(x - movingSlideOrigin[0]),
+          y: Math.round(y - movingSlideOrigin[1]),
+        };
+      }
+
+      // Slide resize
+      if (resizingSlide !== null) {
+        const dw = (event.clientX - resizingSlide.startX) / zoom;
+        const dh = (event.clientY - resizingSlide.startY) / zoom;
+        const sl = slides.get(resizingSlide.slid);
+        if (sl) {
+          sl.w = Math.max(200, Math.round(resizingSlide.startW + dw));
+          sl.h = Math.max(150, Math.round(resizingSlide.startH + dh));
+          slides = slides;
+        }
+      }
+
+      // Rubber band selection
+      if (isSelecting && selectionRect) {
+        const [x, y] = normalizePosition(event);
+        selectionRect = { ...selectionRect, x2: x, y2: y };
+        selectedItems = computeSelection(selectionRect);
+      }
+
       lastCanvasMousePos = normalizePosition(event);
       sendCursor({ setCursor: lastCanvasMousePos });
     }
 
     function handleMouseEnd(event: MouseEvent) {
+      // End rubber band selection
+      if (isSelecting) {
+        isSelecting = false;
+        if (selectionRect) {
+          selectedItems = computeSelection(selectionRect);
+        }
+        selectionRect = null;
+      }
+
+      // End slide move
+      if (movingSlide !== null && movingSlidePos) {
+        const sl = slides.get(movingSlide);
+        if (sl) {
+          srocket?.send({ updateSlide: [movingSlide, { ...sl, x: movingSlidePos.x, y: movingSlidePos.y }] });
+          sl.x = movingSlidePos.x;
+          sl.y = movingSlidePos.y;
+          slides = slides;
+        }
+        movingSlide = null;
+        movingSlidePos = null;
+      }
+
+      // End slide resize
+      if (resizingSlide !== null) {
+        const sl = slides.get(resizingSlide.slid);
+        if (sl) {
+          srocket?.send({ updateSlide: [resizingSlide.slid, sl] });
+        }
+        resizingSlide = null;
+      }
+
       if (movingVideo !== null && movingVideoPos) {
         sendMove.cancel();
         srocket?.send({ moveVideoStream: [movingVideo, movingVideoPos.x, movingVideoPos.y] });
@@ -1285,7 +1791,8 @@
               srocket?.send({ updateFileMetadata: [hoveredFilePath, { imagePath: url }] });
             } else {
               const [cx, cy] = lastCanvasMousePos ?? [0, 0];
-              srocket?.send({ createImageWidget: [cx, cy, url, blob.name || ""] });
+              const defaultName = blob.name || `paste-${Date.now()}.png`;
+              srocket?.send({ createImageWidget: [cx, cy, url, defaultName, defaultName] });
             }
           } catch (err) {
             console.error("Image paste upload failed:", err);
@@ -1310,8 +1817,9 @@
 <!-- Wheel handler stops native macOS Chrome zooming on pinch. -->
 <main
   class="p-8"
-  class:cursor-nwse-resize={resizing !== -1 || resizingWidget !== null || resizingLibrary !== null}
+  class:cursor-nwse-resize={resizing !== -1 || resizingWidget !== null || resizingLibrary !== null || resizingNote !== null}
   class:cursor-grabbing={resizing === -1 && resizingWidget === null && (moving !== -1 || movingWidget !== null || movingNote !== null || movingTextBlock !== null || movingLibrary !== null)}
+  class:select-none={resizing !== -1 || resizingWidget !== null || resizingLibrary !== null || resizingNote !== null || resizingSlide !== null || moving !== -1 || movingWidget !== null || movingNote !== null || movingTextBlock !== null || movingLibrary !== null || movingSlide !== null}
   on:wheel={(event) => event.preventDefault()}
 >
   <div
@@ -1321,9 +1829,7 @@
       {connected}
       {newMessages}
       {hasWriteAccess}
-      {mode}
       {workspaceOpen}
-      {graphMode}
       {isSharing}
       {appOverlayOpen}
       hiddenStreamCount={0}
@@ -1331,11 +1837,19 @@
       {claudeActive}
       on:create={handleCreate}
       {textToolActive}
+      {drawingTool}
+      {drawingColor}
+      {majorMode}
       on:createNote={handleCreateNote}
       on:toggleTextTool={() => {
         textToolActive = !textToolActive;
         if (!textToolActive) textToolGhost = null;
       }}
+      on:toggleDrawingTool={({ detail }) => {
+        drawingTool = detail;
+        if (drawingTool) { textToolActive = false; textToolGhost = null; }
+      }}
+      on:colorChange={({ detail }) => { drawingColor = detail; }}
       on:toggleWorkspace={handleToggleWorkspace}
       on:openClaudeInstance={({ detail: sid }) => {
         if (!hasWriteAccess) return;
@@ -1347,9 +1861,36 @@
       on:resumeClaudeInTerminal={({ detail: sid }) => {
         handleCreateWithInput(`claude --resume ${sid}`);
       }}
-      on:openGraphView={handleOpenGraphView}
+      {ideAvailable}
+      {ideEditors}
       on:toggleAppOverlay={handleToggleAppOverlay}
-      on:modeChange={({ detail }) => (mode = detail)}
+      on:focusIde={({ detail: wid }) => {
+        const w = widgets.get(wid);
+        if (w) {
+          // Pan the canvas to center on this widget
+          const [ox, oy] = getConstantOffset();
+          center[0] = w.x + w.w / 2 - (window.innerWidth / 2 - ox) / zoom;
+          center[1] = w.y + w.h / 2 - (window.innerHeight / 2 - oy) / zoom;
+        }
+      }}
+      on:openIde={() => {
+        if (!hasWriteAccess) return;
+        const [ox, oy] = getConstantOffset();
+        const x = Math.round(center[0] + window.innerWidth / 2 / zoom - ox);
+        const y = Math.round(center[1] + window.innerHeight / 2 / zoom - oy);
+        srocket?.send({ openIdeEditor: [x, y, ""] });
+      }}
+      on:majorModeChange={({ detail }) => {
+        majorMode = detail;
+        // When switching to slides, enable slideshow mode; when leaving, disable it
+        slideshowMode = detail === "slides";
+        // When leaving edition mode, deactivate edition tools
+        if (detail !== "edition") {
+          textToolActive = false;
+          textToolGhost = null;
+          drawingTool = null;
+        }
+      }}
       on:chat={() => {
         showChat = !showChat;
         newMessages = false;
@@ -1379,7 +1920,28 @@
         />
       </div>
     {/if}
+
   </div>
+
+  <!-- Timeline panel (right side, visible in slideshow mode) -->
+  {#if slideshowMode}
+    <div class="absolute top-20 right-4 z-10 pointer-events-auto">
+      <Timeline
+        {slides}
+        currentIndex={currentSlideIndex}
+        playing={slideshowPlaying}
+        exporting={pdfExporting}
+        canWrite={hasWriteAccess ?? false}
+        on:navigate={({ detail }) => navigateToSlide(detail)}
+        on:create={handleCreateSlide}
+        on:reorder={({ detail }) => srocket?.send({ reorderSlides: detail })}
+        on:play={startSlideshowPlay}
+        on:exportPdf={handleExportPdf}
+        on:stop={stopSlideshowPlay}
+        on:delete={({ detail: slid }) => srocket?.send({ deleteSlide: slid })}
+      />
+    </div>
+  {/if}
 
   <!-- Bottom-right panel column: Chat -->
   {#if showChat}
@@ -1439,7 +2001,7 @@
 
   <div
     class="absolute inset-0 overflow-hidden touch-none"
-    class:cursor-crosshair={textToolActive}
+    class:cursor-crosshair={textToolActive && !drawingTool}
     bind:this={fabricEl}
     on:contextmenu|preventDefault={(e) => {
       contextMenuX = e.clientX;
@@ -1447,9 +2009,23 @@
       contextMenuCanvasPos = normalizePosition(e);
       contextMenuVisible = true;
     }}
+    on:mousedown={(e) => {
+      // Start rubber band selection on empty canvas (left click, no tool active)
+      if (e.button === 0 && e.target === fabricEl && !textToolActive && !drawingTool && majorMode === "edition") {
+        const [x, y] = normalizePosition(e);
+        selectionRect = { x1: x, y1: y, x2: x, y2: y };
+        isSelecting = true;
+        if (!e.shiftKey) selectedItems = [];
+      }
+      // Alt+click on canvas: deselect
+      if (e.button === 0 && e.target === fabricEl && !e.altKey) {
+        selectedItems = [];
+      }
+    }}
     on:click={(e) => {
       if (textToolActive && e.target === fabricEl) {
         const [x, y] = normalizePosition(e);
+        pendingAutoFocusPos = [x, y];
         srocket?.send({ createTextBlock: [x, y] });
         textToolActive = false;
         textToolGhost = null;
@@ -1461,15 +2037,17 @@
       }
     }}
   >
-    {#if graphMode}
-      <GraphOverlay
-        {center}
-        {zoom}
-        {widgets}
-        {sourceFiles}
-        {componentGraph}
-      />
-    {/if}
+    <!-- Drawing layer (SVG overlay for pencil/highlighter strokes) -->
+    <DrawingLayer
+      {drawings}
+      {center}
+      {zoom}
+      activeTool={drawingTool}
+      color={drawingColor}
+      canWrite={hasWriteAccess ?? false}
+      on:create={({ detail }) => srocket?.send({ createDrawing: detail })}
+    />
+
     {#each shells as [id, winsize] (id)}
       {@const ws = id === resizing ? resizingSize : id === moving ? movingSize : winsize}
       <div
@@ -1559,8 +2137,10 @@
 
     {#each [...notes] as [nid, note] (nid)}
       {@const pos = nid === movingNote ? movingNotePos ?? note : note}
+      {@const isSelected = selectedItems.some(s => s.type === "note" && s.id === nid)}
       <div
         class="absolute"
+        class:canvas-focus-ring={isSelected}
         style:left={OFFSET_LEFT_CSS}
         style:top={OFFSET_TOP_CSS}
         style:transform-origin={OFFSET_TRANSFORM_ORIGIN_CSS}
@@ -1577,6 +2157,9 @@
             movingNoteOrigin = [x - note.x, y - note.y];
             movingNotePos = { x: note.x, y: note.y };
           }}
+          on:startResize={({ detail: event }) => {
+            startNoteResize(event, nid, note);
+          }}
           on:update={({ detail: updatedNote }) => {
             srocket?.send({ updateNote: [nid, updatedNote] });
           }}
@@ -1589,8 +2172,10 @@
 
     {#each [...textBlocks] as [tid, block] (tid)}
       {@const pos = tid === movingTextBlock ? movingTextBlockPos ?? block : block}
+      {@const isSelected = selectedItems.some(s => s.type === "textBlock" && s.id === tid)}
       <div
         class="absolute"
+        class:canvas-focus-ring={isSelected}
         style:left={OFFSET_LEFT_CSS}
         style:top={OFFSET_TOP_CSS}
         style:transform-origin={OFFSET_TRANSFORM_ORIGIN_CSS}
@@ -1600,6 +2185,7 @@
         <TextBlock
           {block}
           canWrite={hasWriteAccess ?? false}
+          autoFocus={tid === pendingAutoFocusTid}
           on:startMove={({ detail: event }) => {
             if (!hasWriteAccess) return;
             const [x, y] = normalizePosition(event);
@@ -1619,8 +2205,10 @@
 
     {#each [...widgets] as [wid, widget] (wid)}
       {@const pos = wid === movingWidget ? movingWidgetPos ?? widget : widget}
+      {@const isSelected = selectedItems.some(s => s.type === "widget" && s.id === wid)}
       <div
         class="absolute"
+        class:canvas-focus-ring={isSelected}
         style:left={OFFSET_LEFT_CSS}
         style:top={OFFSET_TOP_CSS}
         style:transform-origin={OFFSET_TRANSFORM_ORIGIN_CSS}
@@ -1660,7 +2248,6 @@
           <FileCard
             {widget}
             collapsed={widget.collapsed ?? false}
-            {graphMode}
             highlighted={highlightedWidgetId === wid}
             sessionId={id}
             file={sourceFiles.get(widget.kind.path) ?? null}
@@ -1723,32 +2310,24 @@
               }
               libraryPanels = libraryPanels;
             }}
-          />
-        {:else if widget.kind.type === "graphView"}
-          <GraphView
-            {widget}
-            {componentGraph}
-            {runtimeGraph}
-            on:startMove={({ detail: event }) => {
-              if (!hasWriteAccess) return;
-              const [x, y] = normalizePosition(event);
-              movingWidget = wid;
-              movingWidgetOrigin = [x - widget.x, y - widget.y];
-              movingWidgetPos = { x: widget.x, y: widget.y };
-            }}
-            on:delete={() => srocket?.send({ closeWidget: wid })}
-            on:navigateTo={({ detail: path }) => {
-              if (!focusExistingFileCard(path) && hasWriteAccess) {
-                const [ox, oy] = getConstantOffset();
-                const x = Math.round(center[0] + window.innerWidth / 2 / zoom - ox);
-                const y = Math.round(center[1] + window.innerHeight / 2 / zoom - oy);
-                srocket?.send({ openFileCard: [x, y, path] });
-              }
+            {ideAvailable}
+            {ideEditors}
+            on:openInVSCode={({ detail: { path, wid } }) => {
+              const targetWid = wid ?? ideEditors[0]?.[0];
+              if (targetWid == null) return;
+              const ideWidget = widgets.get(targetWid);
+              if (!ideWidget) return;
+              // Pan the canvas to center on the IDE widget
+              const [ox, oy] = getConstantOffset();
+              center[0] = ideWidget.x + ideWidget.w / 2 - (window.innerWidth / 2 - ox) / zoom;
+              center[1] = ideWidget.y + ideWidget.h / 2 - (window.innerHeight / 2 - oy) / zoom;
+              // Tell the IDE widget to open the file
+              ideEditorRefs[targetWid]?.openFile(path);
             }}
           />
         {:else if widget.kind.type === "claudeFeed"}
           {@const inst = claudeInstances.get(widget.kind.instanceId)}
-          <ClaudeActivityFeed
+          <ClaudeExecutionGraph
             {widget}
             collapsed={widget.collapsed ?? false}
             events={inst?.events ?? []}
@@ -1760,6 +2339,8 @@
             name={widget.name ?? null}
             {claudePid}
             {claudePidDead}
+            contextSnapshot={latestContextSnapshot}
+            {contextSnapshotVersion}
             on:startMove={({ detail: event }) => {
               if (!hasWriteAccess) return;
               const [x, y] = normalizePosition(event);
@@ -1786,6 +2367,8 @@
               }
             }}
             on:toggleAutoOpen={() => { autoOpenCards = !autoOpenCards; }}
+            on:ctrlClick={({ detail: e }) => { touchZoom.zoomAtPoint(e.clientX, e.clientY, e.shiftKey ? 1 / 1.4 : 1.4); }}
+            on:requestContextSnapshot={() => { srocket?.send({ requestContextSnapshot: true }); }}
           />
         {:else if widget.kind.type === "image"}
           <ImageWidget
@@ -1799,6 +2382,11 @@
               movingWidgetPos = { x: widget.x, y: widget.y };
             }}
             on:delete={() => srocket?.send({ closeWidget: wid })}
+            on:rename={({ detail: newName }) => {
+              if (!hasWriteAccess) return;
+              srocket?.send({ setWidgetName: [wid, newName] });
+              srocket?.send({ pushImageWidget: [wid, newName] });
+            }}
           />
         {:else if widget.kind.type === "appOverlay"}
           <AppOverlayWidget
@@ -1821,6 +2409,29 @@
             on:updateSettings={({ detail: { url, allowOpenFile, allowOpenClaude } }) => {
               srocket?.send({ updateAppOverlay: [wid, url, allowOpenFile, allowOpenClaude] });
             }}
+          />
+        {:else if widget.kind.type === "ideEditor"}
+          <IdeEditorWidget
+            bind:this={ideEditorRefs[wid]}
+            {widget}
+            canWrite={hasWriteAccess ?? false}
+            sessionName={id}
+            {ideStates}
+            {editLock}
+            users={new Map(users)}
+            myUid={userId}
+            on:startMove={({ detail: event }) => {
+              if (!hasWriteAccess) return;
+              const [x, y] = normalizePosition(event);
+              movingWidget = wid;
+              movingWidgetOrigin = [x - widget.x, y - widget.y];
+              movingWidgetPos = { x: widget.x, y: widget.y };
+            }}
+            on:resize={({ detail }) => {
+              srocket?.send({ resizeWidget: [wid, detail.w, detail.h] });
+            }}
+            on:maximize={() => { fullscreenIdeWid = wid; }}
+            on:delete={() => srocket?.send({ closeWidget: wid })}
           />
         {/if}
         {#if hasWriteAccess}
@@ -1936,6 +2547,37 @@
       </div>
     {/each}
 
+    <!-- Slide regions -->
+    {#if slideshowMode}
+      {#each [...slides] as [slid, sl] (slid)}
+        {@const pos = slid === movingSlide ? movingSlidePos ?? sl : sl}
+        <div
+          class="absolute"
+          style:left={OFFSET_LEFT_CSS}
+          style:top={OFFSET_TOP_CSS}
+          style:transform-origin={OFFSET_TRANSFORM_ORIGIN_CSS}
+          use:slide={{ x: pos.x, y: pos.y, center, zoom, immediate: slid === movingSlide }}
+        >
+          <SlideRegion
+            slide={sl}
+            canWrite={hasWriteAccess ?? false}
+            playing={slideshowPlaying}
+            on:startMove={({ detail: event }) => {
+              if (!hasWriteAccess) return;
+              const [x, y] = normalizePosition(event);
+              movingSlide = slid;
+              movingSlideOrigin = [x - sl.x, y - sl.y];
+              movingSlidePos = { x: sl.x, y: sl.y };
+            }}
+            on:startResize={({ detail: e }) => {
+              resizingSlide = { slid, startW: sl.w, startH: sl.h, startX: e.clientX, startY: e.clientY };
+            }}
+            on:delete={() => srocket?.send({ deleteSlide: slid })}
+          />
+        </div>
+      {/each}
+    {/if}
+
     {#if textToolActive && textToolGhost}
       <div
         class="fixed pointer-events-none z-50 text-zinc-400 text-sm bg-zinc-800/80 px-2 py-1 rounded border border-zinc-600"
@@ -1944,6 +2586,21 @@
       >
         Add text
       </div>
+    {/if}
+
+    <!-- Rubber band selection rectangle -->
+    {#if isSelecting && selectionRect}
+      {@const nr = normalizeRect(selectionRect)}
+      {@const ox = 0.5 * (typeof window !== 'undefined' ? window.innerWidth : 800) - 378}
+      {@const oy = 0.5 * (typeof window !== 'undefined' ? window.innerHeight : 600) - 240}
+      <div
+        class="absolute pointer-events-none border-2 border-indigo-400 bg-indigo-400/10 rounded"
+        style:left="{(nr.x1 - center[0] + ox) * zoom}px"
+        style:top="{(nr.y1 - center[1] + oy) * zoom}px"
+        style:width="{(nr.x2 - nr.x1) * zoom}px"
+        style:height="{(nr.y2 - nr.y1) * zoom}px"
+        style:z-index="50"
+      />
     {/if}
   </div>
 
@@ -1968,6 +2625,7 @@
         touchZoom.moveTo([cx, cy], INITIAL_ZOOM);
       } else if (detail === "new-text") {
         if (!hasWriteAccess) { makeToast("error", "Write access required"); return; }
+        pendingAutoFocusPos = [cx, cy];
         srocket?.send({ createTextBlock: [cx, cy] });
       } else if (detail === "new-note") {
         if (!hasWriteAccess) { makeToast("error", "Write access required"); return; }
@@ -2001,5 +2659,35 @@
       }}
       on:close={() => (filePickerOpen = false)}
     />
+  {/if}
+
+  <!-- Fullscreen IDE overlay (local-only, outside canvas transform) -->
+  {#if fullscreenIdeWid !== null}
+    <!-- svelte-ignore a11y-no-static-element-interactions -->
+    <div
+      class="fixed inset-0 z-[100] flex flex-col bg-zinc-900"
+      on:keydown={(e) => {
+        if (e.key === "Escape") { fullscreenIdeWid = null; e.preventDefault(); }
+      }}
+    >
+      <div class="flex items-center border-b border-zinc-700 bg-zinc-800/90 px-3 py-1 select-none">
+        <CircleButtons>
+          <CircleButton kind="red" on:mousedown={() => {
+            if (fullscreenIdeWid !== null) srocket?.send({ closeWidget: fullscreenIdeWid });
+            fullscreenIdeWid = null;
+          }} />
+          <CircleButton kind="yellow" on:mousedown={() => { fullscreenIdeWid = null; }} />
+          <CircleButton kind="green" on:mousedown={() => { fullscreenIdeWid = null; }} />
+        </CircleButtons>
+        <span class="flex-1 text-center text-sm text-zinc-300">VS Code — Fullscreen</span>
+        <div class="w-16" />
+      </div>
+      <iframe
+        src="/ide/s/{id}/"
+        title="VS Code IDE (fullscreen)"
+        class="flex-1 w-full border-none bg-zinc-900"
+        sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads allow-keyboard-lock"
+      />
+    </div>
   {/if}
 </main>

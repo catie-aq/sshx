@@ -153,23 +153,53 @@
       theme,
     });
 
-    // Keyboard shortcuts for natural text editing.
+    // Keyboard shortcuts for natural text editing and clipboard.
     term.attachCustomKeyEventHandler((event) => {
-      if (
-        (isMac && event.metaKey && !event.ctrlKey && !event.altKey) ||
-        (!isMac && !event.metaKey && event.ctrlKey && !event.altKey)
-      ) {
+      const mod = isMac ? event.metaKey : event.ctrlKey;
+      const modOnly = mod && !(isMac ? event.ctrlKey : event.metaKey) && !event.altKey;
+
+      if (modOnly) {
+        // Cmd/Ctrl+ArrowLeft → Home (Ctrl-A)
         if (event.key === "ArrowLeft") {
           dispatch("data", new Uint8Array([0x01]));
           return false;
-        } else if (event.key === "ArrowRight") {
+        }
+        // Cmd/Ctrl+ArrowRight → End (Ctrl-E)
+        if (event.key === "ArrowRight") {
           dispatch("data", new Uint8Array([0x05]));
           return false;
-        } else if (event.key === "Backspace") {
+        }
+        // Cmd/Ctrl+Backspace → Kill line (Ctrl-U)
+        if (event.key === "Backspace") {
           dispatch("data", new Uint8Array([0x15]));
           return false;
         }
+        // Cmd/Ctrl+C with selection → copy to clipboard, don't send SIGINT
+        if (event.key === "c" && term!.hasSelection()) {
+          return false; // let browser handle copy
+        }
+        // Cmd/Ctrl+V → let browser handle paste (xterm receives via paste event)
+        if (event.key === "v") {
+          return false;
+        }
+        // Cmd/Ctrl+A → select all terminal content
+        if (event.key === "a") {
+          event.preventDefault();
+          term!.selectAll();
+          return false;
+        }
+        // Cmd/Ctrl+K → let through for command palette
+        if (event.key === "k") {
+          return false;
+        }
       }
+
+      // Block all other Cmd-key combos from propagating to canvas (Mac)
+      // but let xterm handle Ctrl combos normally (Ctrl+C=SIGINT, Ctrl+D=EOF, etc.)
+      if (isMac && event.metaKey) {
+        return false; // let browser handle unknown Cmd+key
+      }
+
       return true;
     });
 
@@ -300,7 +330,7 @@
 <style lang="postcss">
   .term-container {
     @apply inline-block rounded-lg border border-zinc-700 opacity-90;
-    transition: transform 200ms, opacity 200ms;
+    transition: transform 200ms, opacity 200ms, box-shadow 200ms, border-color 200ms;
   }
 
   .term-container:not(.focused) :global(.xterm) {
@@ -308,6 +338,7 @@
   }
 
   .term-container.focused {
-    @apply opacity-100;
+    @apply opacity-100 border-indigo-500/70;
+    box-shadow: 0 0 0 1px rgba(99, 102, 241, 0.3), 0 0 12px rgba(99, 102, 241, 0.15);
   }
 </style>

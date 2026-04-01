@@ -4,9 +4,11 @@
   import { Editor } from "@tiptap/core";
   import StarterKit from "@tiptap/starter-kit";
   import Link from "@tiptap/extension-link";
+  import { FONTS, getFontFamily, DEFAULT_FONT } from "$lib/fonts";
 
   export let block: WsTextBlock;
   export let canWrite: boolean;
+  export let autoFocus: boolean = false;
 
   const dispatch = createEventDispatcher<{
     update: WsTextBlock;
@@ -41,7 +43,6 @@
   let wrapperEl: HTMLDivElement;
   let editor: Editor | null = null;
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
-  let autoFocus = false;
 
   // Toolbar active state
   let isBold = false;
@@ -52,10 +53,6 @@
   let showLinkDialog = false;
   let linkUrl = "";
   let linkInputEl: HTMLInputElement;
-
-  export function focusAfterCreate() {
-    autoFocus = true;
-  }
 
   onMount(() => {
     editor = new Editor({
@@ -227,7 +224,15 @@
   $: localContent = block.content || localContent;
 
   $: fontSize = FONT_SIZES[block.fontSize] ?? FONT_SIZES.md;
+  $: fontFamily = getFontFamily(block.font || DEFAULT_FONT);
   $: isEmpty = !localContent && !editing;
+
+  let fontDropdownOpen = false;
+
+  function setFont(fontId: string) {
+    fontDropdownOpen = false;
+    dispatch("update", { ...block, font: fontId });
+  }
 </script>
 
 <!-- svelte-ignore a11y-no-static-element-interactions -->
@@ -255,6 +260,28 @@
         <option value="lg">LG</option>
         <option value="xl">XL</option>
       </select>
+
+      <!-- Font family -->
+      <div class="relative" on:mousedown|stopPropagation>
+        <button
+          class="toolbar-btn font-picker-btn"
+          style:font-family={fontFamily}
+          title="Font"
+          on:click={() => (fontDropdownOpen = !fontDropdownOpen)}
+        >Aa</button>
+        {#if fontDropdownOpen}
+          <div class="font-dropdown">
+            {#each FONTS as f}
+              <button
+                class="font-dropdown-item"
+                class:active={(block.font || DEFAULT_FONT) === f.id}
+                style:font-family={f.family}
+                on:click={() => setFont(f.id)}
+              >{f.label}</button>
+            {/each}
+          </div>
+        {/if}
+      </div>
 
       <div class="toolbar-sep" />
 
@@ -393,6 +420,7 @@
     class:editing
     class:empty={isEmpty}
     style:font-size={fontSize}
+    style:font-family={fontFamily}
     style:color={block.color}
     style:text-align={block.align}
     on:mousedown={handleMousedown}
@@ -439,6 +467,27 @@
 
   .color-dot {
     @apply w-3.5 h-3.5 rounded-full border border-zinc-500 hover:scale-125 transition-transform cursor-pointer;
+  }
+
+  .font-picker-btn {
+    @apply text-xs px-1.5;
+    min-width: 24px;
+  }
+
+  .font-dropdown {
+    @apply absolute bg-zinc-800 border border-zinc-700 rounded-lg shadow-xl overflow-hidden;
+    top: calc(100% + 4px);
+    left: 0;
+    z-index: 20;
+    min-width: 130px;
+  }
+
+  .font-dropdown-item {
+    @apply w-full px-2 py-1 text-left text-sm text-zinc-300 hover:bg-zinc-700 transition-colors;
+  }
+
+  .font-dropdown-item.active {
+    @apply bg-zinc-600 text-white;
   }
 
   .link-dialog {

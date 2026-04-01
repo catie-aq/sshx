@@ -13,6 +13,8 @@
   export let file: WsSourceFile | null;
   export let canWrite: boolean;
   export let sessionId: string = "";
+  export let ideAvailable: boolean = false;
+  export let ideEditors: [number, string][] = [];
 
   const dispatch = createEventDispatcher<{
     startMove: MouseEvent;
@@ -25,16 +27,15 @@
     collapse: boolean;
     loadImports: void;
     loadDependents: void;
+    openInVSCode: { path: string; wid?: number };
   }>();
 
   export let collapsed: boolean = false;
-  export let graphMode: boolean = false;
   export let highlighted: boolean = false;
 
   /** Which export name is currently expanded to show its importers. */
   let selectedExport: string | null = null;
 
-  let flipped = false;
   let describing = false;
   let importedByExpanded = false;
 
@@ -168,6 +169,21 @@
     other: "bg-zinc-700 text-zinc-200",
   };
 
+  // Color for line count display
+  $: sizeColor = !file ? "text-zinc-500"
+    : file.lineCount < 100 ? "text-emerald-400"
+    : file.lineCount < 500 ? "text-indigo-400"
+    : file.lineCount < 1500 ? "text-yellow-400"
+    : "text-red-400";
+
+  $: barColor = !file ? "bg-zinc-600"
+    : file.lineCount < 100 ? "bg-emerald-500"
+    : file.lineCount < 500 ? "bg-indigo-500"
+    : file.lineCount < 1500 ? "bg-yellow-500"
+    : "bg-red-500";
+
+  $: filename = file?.path?.split("/").pop() ?? (widget.kind.type === "fileCard" ? widget.kind.path.split("/").pop() : "file") ?? "file";
+
   function startDescriptionEdit() {
     if (!file) return;
     editDescriptionText = file.description;
@@ -198,7 +214,9 @@
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const { url } = await res.json();
-      dispatch("updateMetadata", { path: file.path, update: { imagePath: url } });
+      const origName = fileBlob.name || "image.png";
+      dispatch("updateMetadata", { path: file.path, update: { imagePath: url, imageName: origName } });
+      imageName = origName;
     } catch (e) {
       console.error("Image upload failed:", e);
     }
@@ -228,12 +246,23 @@
     if (!file || !imageName.trim()) return;
     dispatch("updateMetadata", { path: file.path, update: { imageName: imageName.trim() } });
   }
+
+  let showCode = true;
+
+  function handleOpenInVSCode() {
+    if (!file || !ideAvailable) return;
+    if (ideEditors.length === 1) {
+      dispatch("openInVSCode", { path: file.path, wid: ideEditors[0][0] });
+    } else if (ideEditors.length > 1) {
+      dispatch("openInVSCode", { path: file.path });
+    }
+  }
 </script>
 
 <div
   class="panel-window flex flex-col select-none"
   class:highlighted
-  style:width={collapsed ? "280px" : `${effectiveW}px`}
+  style:width={collapsed ? "300px" : `${effectiveW}px`}
   style:height={collapsed ? "auto" : `${effectiveH}px`}
 >
   <!-- Header bar -->
@@ -254,73 +283,25 @@
     <div
       class="py-2 text-sm text-zinc-300 text-center font-medium overflow-hidden whitespace-nowrap text-ellipsis w-0 flex-grow-[4] font-mono"
     >
-      {file?.path ?? (widget.kind.type === "fileCard" ? widget.kind.path : "file")}
+      File · {filename}
     </div>
-    <div class="flex-1 flex items-center justify-end pr-2"><span class="text-zinc-500 text-[10px]">{collapsed ? '▴' : '▾'}</span></div>
+    <div class="flex-1 flex items-center justify-end gap-2 pr-2">
+      {#if !collapsed}
+        <!-- svelte-ignore a11y-no-static-element-interactions -->
+        <button
+          class="text-zinc-500 hover:text-zinc-300 text-[11px] px-1 py-0.5 rounded hover:bg-zinc-700 transition-colors leading-none font-mono"
+          on:click|stopPropagation={() => (showCode = !showCode)}
+          on:mousedown|stopPropagation
+          title="{showCode ? 'Hide code' : 'Show code'}"
+        >{showCode ? '‹/›' : '</>'}</button>
+      {/if}
+      <span class="text-zinc-500 text-[10px]">{collapsed ? '▴' : '▾'}</span>
+    </div>
   </div>
 
   {#if collapsed}
     <div class="px-3 py-2 bg-zinc-900 rounded-b-lg">
-      {#if graphMode && file}
-        <!-- Graph mode: import/export port list -->
-        <div class="flex flex-col text-xs">
-          {#each file.localImports as imp (imp)}
-            <div class="flex items-center gap-1.5 py-0.5 hover:bg-zinc-800 rounded px-0.5 group">
-              <!-- svelte-ignore a11y-no-static-element-interactions -->
-              <span
-                class="w-2.5 h-2.5 rounded-full bg-zinc-500 group-hover:bg-indigo-400 flex-shrink-0 cursor-pointer transition-colors"
-                title="Open {imp}"
-                on:click|stopPropagation={() => dispatch("openFile", imp)}
-                on:mousedown|stopPropagation
-              />
-              <span class="text-zinc-400 truncate">{imp.split("/").pop()}</span>
-            </div>
-          {/each}
-          {#each file.libraries.slice(0, 3) as lib (lib)}
-            <!-- svelte-ignore a11y-no-static-element-interactions -->
-            <div
-              class="flex items-center gap-1.5 py-0.5 px-0.5 hover:bg-zinc-800 rounded cursor-pointer group"
-              on:click|stopPropagation={() => dispatch("openLibrary", lib)}
-              on:mousedown|stopPropagation
-              title="Open library card for {lib}"
-            >
-              <span class="w-2.5 h-2.5 rounded-full bg-zinc-700 group-hover:bg-amber-700 flex-shrink-0 transition-colors" />
-              <span class="text-zinc-600 group-hover:text-amber-500 truncate italic text-[10px] transition-colors">{lib}</span>
-            </div>
-          {/each}
-          {#each file.importedBy as dep (dep)}
-            <div class="flex items-center justify-end gap-1.5 py-0.5 hover:bg-zinc-800 rounded px-0.5 group">
-              <span class="text-zinc-400 truncate text-right">{dep.split("/").pop()}</span>
-              <!-- svelte-ignore a11y-no-static-element-interactions -->
-              <span
-                class="w-2.5 h-2.5 rounded-full bg-zinc-500 group-hover:bg-cyan-400 flex-shrink-0 cursor-pointer transition-colors"
-                title="Open {dep}"
-                on:click|stopPropagation={() => dispatch("openFile", dep)}
-                on:mousedown|stopPropagation
-              />
-            </div>
-          {/each}
-        </div>
-        {#if file.localImports.length > 0 || file.importedBy.length > 0}
-          <!-- svelte-ignore a11y-no-static-element-interactions -->
-          <div class="flex gap-1 pt-1.5 border-t border-zinc-800 mt-1" on:mousedown|stopPropagation>
-            {#if file.localImports.length > 0}
-              <button
-                class="text-[10px] px-1.5 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-400"
-                on:click|stopPropagation={() => dispatch("loadImports")}
-                title="Open all imported files"
-              >↗ imports</button>
-            {/if}
-            {#if file.importedBy.length > 0}
-              <button
-                class="text-[10px] px-1.5 py-0.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-400"
-                on:click|stopPropagation={() => dispatch("loadDependents")}
-                title="Open dependent files"
-              >↗ dependents</button>
-            {/if}
-          </div>
-        {/if}
-      {:else if file?.description}
+      {#if file?.description}
         <p class="text-sm text-zinc-300 leading-snug description-clamp">
           {file.description.replace(/[#*`_[\]]/g, '').slice(0, 200)}
         </p>
@@ -331,19 +312,26 @@
       {/if}
     </div>
   {:else}
-  <!-- Card body -->
-  <div class="flex-1 overflow-hidden bg-zinc-900 rounded-b-lg flex flex-col">
-    {#if !flipped}
-      <!-- Front face: metadata -->
+  <!-- Card body: horizontal split -->
+  <div class="flex-1 overflow-hidden bg-zinc-900 rounded-b-lg flex flex-row min-h-0">
+
+    <!-- LEFT PANEL: metadata -->
+    <div class="flex flex-col overflow-y-auto" style="min-width:300px; width:300px; border-right: 1px solid theme('colors.zinc.800');">
       {#if file}
-        <div class="p-3 flex flex-col gap-2 overflow-y-auto text-xs flex-1">
+        <div class="p-3 flex flex-col gap-3 text-xs flex-1">
+
+          <!-- Large filename title -->
+          <h2 class="text-xl font-mono font-semibold text-zinc-100 leading-tight truncate" title={file.path}>
+            {filename}
+          </h2>
+
           <!-- Illustration image -->
           {#if file.imagePath}
             <div class="relative group rounded overflow-hidden bg-zinc-800">
               <img
                 src={file.imagePath}
                 alt="Illustration"
-                class="w-full object-contain max-h-40"
+                class="w-full object-contain max-h-48"
               />
               {#if canWrite}
                 <button
@@ -372,7 +360,7 @@
             <!-- Image drop zone -->
             <!-- svelte-ignore a11y-no-static-element-interactions -->
             <div
-              class="rounded border-2 border-dashed transition-colors cursor-pointer flex items-center justify-center gap-1.5 py-2 text-[11px]"
+              class="rounded border-2 border-dashed transition-colors cursor-pointer flex items-center justify-center gap-1.5 py-3 text-xs"
               class:border-indigo-600={dragOver}
               class:bg-indigo-900={dragOver}
               class:text-indigo-300={dragOver}
@@ -383,7 +371,7 @@
               on:drop={handleDrop}
               on:mousedown|stopPropagation
             >
-              <UploadCloudIcon size="12" />
+              <UploadCloudIcon size="14" />
               <span>Drop image or</span>
               <label class="text-indigo-400 hover:text-indigo-300 cursor-pointer underline underline-offset-1">
                 browse
@@ -399,22 +387,20 @@
 
           <!-- Kind badge + date -->
           <div class="flex items-center gap-2">
-            <span class="px-1.5 py-0.5 rounded text-xs {kindColors[file.kind] ?? kindColors.other}">
+            <span class="px-2 py-0.5 rounded text-xs font-medium {kindColors[file.kind] ?? kindColors.other}">
               {file.kind}
             </span>
-            <span class="text-zinc-600 text-[10px] ml-auto">{file.lastModified.slice(0, 10)}</span>
+            <span class="text-zinc-500 text-xs ml-auto">{file.lastModified.slice(0, 10)}</span>
           </div>
 
-          <!-- Size blocks -->
-          <span class="flex items-center gap-0.5">
-            {#each Array(Math.min(12, Math.ceil(file.lineCount / 50))).fill(null) as _}
-              <span class="inline-block w-1.5 h-3 rounded-sm bg-zinc-600"></span>
-            {/each}
-            {#if file.lineCount > 600}
-              <span class="text-zinc-500 text-[9px]">…</span>
-            {/if}
-            <span class="ml-1 text-zinc-500 text-[10px]">{file.lineCount} lines</span>
-          </span>
+          <!-- Large colored size indicator -->
+          <div class="flex items-baseline gap-2">
+            <span class="text-3xl font-bold {sizeColor}">{file.lineCount}</span>
+            <span class="text-sm text-zinc-500">lines</span>
+            <div class="flex-1 h-2 rounded-full bg-zinc-800 overflow-hidden self-center">
+              <div class="h-full rounded-full {barColor}" style:width="{Math.min(100, file.lineCount / 10)}%" />
+            </div>
+          </div>
 
           <!-- AI description (editable) -->
           {#if editingDescription}
@@ -455,7 +441,7 @@
             <!-- Description view (rendered markdown) -->
             {#if file.description}
               <div class="group flex items-start gap-1">
-                <div class="carta-view flex-1">
+                <div class="carta-view flex-1 text-sm">
                   {#key file.description}
                     <CartaViewer {carta} value={file.description} theme="card" />
                   {/key}
@@ -473,28 +459,29 @@
               </div>
             {/if}
 
-            <!-- Claude action buttons (always visible when canWrite) -->
+            <!-- Action buttons row -->
             {#if canWrite}
               <!-- svelte-ignore a11y-no-static-element-interactions -->
-              <div class="flex flex-wrap gap-1" on:mousedown|stopPropagation>
+              <div class="flex flex-wrap gap-1.5" on:mousedown|stopPropagation>
+                <!-- Edit button (only shown if no description) -->
+                {#if !file.description}
+                  <button
+                    class="flex items-center gap-1 text-sm text-zinc-400 hover:text-zinc-200 border border-zinc-700 hover:border-zinc-500 rounded px-2.5 py-1"
+                    on:click={startDescriptionEdit}
+                    title="Write description manually"
+                  >
+                    <EditIcon size="12" /> Edit
+                  </button>
+                {/if}
                 <button
-                  class="text-xs text-indigo-400 hover:text-indigo-300 border border-indigo-800 hover:border-indigo-600 rounded px-2 py-0.5"
+                  class="flex items-center gap-1 text-sm text-indigo-400 hover:text-indigo-300 border border-indigo-800 hover:border-indigo-600 rounded px-2.5 py-1"
                   on:click={() => { if (file) { describing = true; dispatch("describe", file.path); } }}
                   title={file.description ? "Re-generate description with Claude" : "Generate description with Claude"}
                 >
                   ✦ {file.description ? "Re-describe" : "Describe with Claude"}
                 </button>
-                {#if !file.description}
-                  <button
-                    class="text-xs text-zinc-500 hover:text-zinc-300 border border-zinc-700 hover:border-zinc-500 rounded px-1.5 py-0.5"
-                    on:click={startDescriptionEdit}
-                    title="Write description manually"
-                  >
-                    <EditIcon size="10" />
-                  </button>
-                {/if}
                 <button
-                  class="text-xs text-zinc-400 hover:text-zinc-200 border border-zinc-700 hover:border-zinc-500 rounded px-2 py-0.5"
+                  class="text-sm text-zinc-400 hover:text-zinc-200 border border-zinc-700 hover:border-zinc-500 rounded px-2.5 py-1"
                   on:click={() => (askingClaude = !askingClaude)}
                   title="Ask Claude a question about this file"
                 >
@@ -538,7 +525,7 @@
             {/if}
           {/if}
 
-          <!-- Libraries (external packages) — clickable to open LibraryCard -->
+          <!-- Libraries (external packages) -->
           {#if file.libraries.length > 0}
             <div class="flex flex-wrap items-baseline gap-x-1 gap-y-0.5">
               <span class="text-zinc-500 flex-shrink-0">imports:</span>
@@ -606,7 +593,7 @@
             </div>
           {/if}
 
-          <!-- Exports — click an export to reveal which files import it -->
+          <!-- Exports -->
           {#if file.exports.length > 0}
             <div class="flex flex-col gap-0.5">
               <span class="text-zinc-500">exports:</span>
@@ -651,17 +638,12 @@
           <span class="text-xs text-zinc-600 mt-1">Run <code class="font-mono">sshx analyze</code> to enable.</span>
         </div>
       {/if}
+    </div>
 
-      <div class="flex justify-end px-3 pb-2 flex-shrink-0">
-        <button
-          class="text-xs text-zinc-500 hover:text-zinc-300"
-          on:click={() => (flipped = true)}
-        >
-          code →
-        </button>
-      </div>
-    {:else}
-      <!-- Back face: Monaco code editor -->
+    <!-- RIGHT PANEL: Monaco code editor -->
+    {#if showCode}
+    <div class="flex flex-col flex-1 min-w-0 min-h-0">
+      <!-- Editor area -->
       <div class="flex-1 overflow-hidden min-h-0">
         {#if file?.content}
           <div class="w-full h-full" use:mountEditor />
@@ -707,16 +689,7 @@
         {/if}
 
         <!-- Toolbar row -->
-        <div class="flex items-center px-2 py-1 gap-1.5 bg-zinc-900 rounded-b-lg">
-          <button
-            class="text-[11px] text-zinc-500 hover:text-zinc-300"
-            on:click={() => { flipped = false; editorAskingClaude = false; }}
-          >
-            ← info
-          </button>
-
-          <div class="flex-1" />
-
+        <div class="flex items-center px-2 py-1 gap-1.5 bg-zinc-900 rounded-br-lg">
           <!-- Font size controls -->
           <div class="flex items-center gap-0.5">
             <button
@@ -731,7 +704,9 @@
             >A+</button>
           </div>
 
-          <!-- Ask Claude button with context indicator -->
+          <div class="flex-1" />
+
+          <!-- Ask Claude button -->
           <button
             class="flex items-center gap-1 text-[10px] rounded px-1.5 py-0.5 border transition-colors"
             class:text-indigo-400={!editorAskingClaude}
@@ -749,9 +724,27 @@
                 : `· ${file?.path?.split("/").pop() ?? "file"}`}
             </span>
           </button>
+
+          <!-- Open in VSCode button -->
+          <button
+            class="flex items-center gap-1 text-[10px] rounded px-1.5 py-0.5 border transition-colors"
+            class:text-blue-400={ideAvailable && !!file}
+            class:border-blue-900={ideAvailable && !!file}
+            class:hover:border-blue-700={ideAvailable && !!file}
+            class:text-zinc-600={!ideAvailable || !file}
+            class:border-zinc-800={!ideAvailable || !file}
+            class:cursor-not-allowed={!ideAvailable || !file}
+            disabled={!ideAvailable || !file}
+            on:click={handleOpenInVSCode}
+            title={ideAvailable ? "Open in VS Code" : "No IDE available — start sshx with --ide"}
+          >
+            Open in VSCode
+          </button>
         </div>
       </div>
+    </div>
     {/if}
+
   </div>
   {/if}
 </div>
@@ -811,98 +804,39 @@
     background: #18181b;
     color: #d4d4d8; /* zinc-300 */
     caret-color: #a1a1aa;
+    font-size: 0.75rem;
+    line-height: 1.5;
     padding: 6px 8px;
-    min-height: 72px;
-    max-height: 120px;
+    min-height: 80px;
     resize: none;
-    font-size: 0.75rem;
-    line-height: 1.5;
-    border-bottom: 1px solid #3f3f46;
-  }
-  :global(.carta-theme__card .carta-input ::selection) {
-    background: #3730a380;
+    outline: none;
   }
 
-  /* Syntax highlight layer (sits over textarea) */
-  :global(.carta-theme__card .carta-highlight) {
-    padding: 6px 8px;
-    font-size: 0.75rem;
-    line-height: 1.5;
-    color: transparent; /* highlight layer, not text */
-  }
-
-  /* Preview renderer */
+  /* Preview pane */
   :global(.carta-theme__card .carta-renderer) {
-    background: #09090b; /* zinc-950 */
+    background: #18181b;
     color: #a1a1aa; /* zinc-400 */
+    font-size: 0.75rem;
     padding: 6px 8px;
-    font-size: 0.72rem;
-    line-height: 1.6;
-    max-height: 120px;
     overflow-y: auto;
-    border-radius: 0 0 6px 6px;
   }
 
-  /* Markdown elements inside renderer */
-  :global(.carta-theme__card .carta-renderer p) { margin-bottom: 0.3em; }
-  :global(.carta-theme__card .carta-renderer h1),
-  :global(.carta-theme__card .carta-renderer h2),
-  :global(.carta-theme__card .carta-renderer h3) {
-    color: #e4e4e7;
-    font-weight: 600;
-    margin-bottom: 0.2em;
+  /* Markdown element resets inside the card theme */
+  :global(.carta-theme__card .carta-renderer p) {
+    margin: 0 0 4px;
   }
-  :global(.carta-theme__card .carta-renderer strong) { color: #e4e4e7; font-weight: 700; }
-  :global(.carta-theme__card .carta-renderer em) { font-style: italic; }
   :global(.carta-theme__card .carta-renderer code) {
-    font-family: "Fira Code VF", monospace;
-    font-size: 0.85em;
-    background: #27272a;
+    background: #27272a; /* zinc-800 */
     border-radius: 3px;
-    padding: 0.1em 0.3em;
-    color: #c4b5fd;
+    padding: 0 3px;
+    font-size: 0.7rem;
   }
-  :global(.carta-theme__card .carta-renderer ul) { padding-left: 1.2em; list-style: disc; }
-  :global(.carta-theme__card .carta-renderer ol) { padding-left: 1.2em; list-style: decimal; }
-  :global(.carta-theme__card .carta-renderer li) { margin-bottom: 0.1em; }
-
-  /* ── Monaco thin scrollbars ─────────────────────────────────────── */
-  :global(.monaco-scrollable-element > .scrollbar) {
-    border-radius: 3px;
+  :global(.carta-theme__card .carta-renderer h1,
+          .carta-theme__card .carta-renderer h2,
+          .carta-theme__card .carta-renderer h3) {
+    font-size: 0.8rem;
+    font-weight: 600;
+    margin: 4px 0 2px;
+    color: #e4e4e7; /* zinc-200 */
   }
-  :global(.monaco-scrollable-element > .scrollbar > .slider) {
-    border-radius: 3px !important;
-    background: rgba(100, 100, 120, 0.45) !important;
-  }
-  :global(.monaco-scrollable-element > .scrollbar > .slider:hover) {
-    background: rgba(140, 140, 165, 0.6) !important;
-  }
-  :global(.monaco-scrollable-element > .scrollbar.vertical) {
-    width: 6px !important;
-  }
-  :global(.monaco-scrollable-element > .scrollbar.horizontal) {
-    height: 6px !important;
-  }
-
-  /* Read-only viewer */
-  .carta-view :global(.carta-viewer) {
-    color: #a1a1aa;
-    font-size: 0.72rem;
-    line-height: 1.6;
-    font-style: italic;
-  }
-  .carta-view :global(.carta-viewer p) { margin-bottom: 0.3em; }
-  .carta-view :global(.carta-viewer p:last-child) { margin-bottom: 0; }
-  .carta-view :global(.carta-viewer strong) { color: #e4e4e7; font-weight: 700; }
-  .carta-view :global(.carta-viewer em) { font-style: italic; }
-  .carta-view :global(.carta-viewer code) {
-    font-family: "Fira Code VF", monospace;
-    font-size: 0.85em;
-    background: #27272a;
-    border-radius: 3px;
-    padding: 0.1em 0.3em;
-    color: #c4b5fd;
-  }
-  .carta-view :global(.carta-viewer ul) { padding-left: 1.2em; list-style: disc; }
-  .carta-view :global(.carta-viewer ol) { padding-left: 1.2em; list-style: decimal; }
 </style>

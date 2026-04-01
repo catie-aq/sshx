@@ -1,0 +1,15 @@
+{
+  "name": "sshx-collab",
+  "displayName": "sshx Collaboration",
+  "description": "Syncs VS Code editor state (open files, cursors, selections) with sshx for real-time collaboration.",
+  "version": "0.1.0",
+  "publisher": "sshx",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["*"],
+  "main": "./src/extension.js",
+  "contributes": {},
+  "scripts": {}
+}

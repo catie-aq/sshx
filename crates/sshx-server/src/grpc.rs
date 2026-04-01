@@ -12,15 +12,16 @@ use sshx_core::proto::{
     BrowserLeaveResponse, BrowserUpdate, ClientUpdate, CloseRequest, CloseResponse, OpenRequest,
     OpenResponse, ServerUpdate,
 };
-use sshx_core::{rand_alphanumeric, Sid, Vid};
+use sshx_core::{rand_alphanumeric, Sid, Vid, Wid};
 use tokio::sync::mpsc;
 use tokio::time::{self, MissedTickBehavior};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{error, info, warn};
 
+use crate::session::snapshot::JsonSessionSnapshot;
 use crate::session::{Metadata, Session};
-use crate::web::protocol::{WsClaudeEvent, WsComponentGraph, WsSourceFile, WsVideoStream};
+use crate::web::protocol::{WsClaudeEvent, WsIdeState, WsSourceFile, WsVideoStream};
 use crate::ServerState;
 
 /// Interval for synchronizing sequence numbers with the client.
@@ -28,6 +29,9 @@ pub const SYNC_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Interval for measuring client latency.
 pub const PING_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Interval for sending full session snapshots to the CLI for persistence.
+pub const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Server that handles gRPC requests from the sshx command-line client.
 #[derive(Clone)]
@@ -63,7 +67,24 @@ impl SshxService for GrpcServer {
                     name: request.name,
                     write_password_hash: request.write_password_hash,
                 };
-                self.0.insert(&name, Arc::new(Session::new(metadata)));
+                let session = Session::new(metadata);
+
+                // Restore canvas state from a JSON snapshot if provided.
+                if let Some(snapshot_bytes) = request.restore_snapshot {
+                    if !snapshot_bytes.is_empty() {
+                        match serde_json::from_slice::<JsonSessionSnapshot>(&snapshot_bytes) {
+                            Ok(snap) => {
+                                info!(%name, "restoring session from JSON snapshot");
+                                session.restore_from_json(&snap);
+                            }
+                            Err(e) => {
+                                warn!(%name, "failed to parse restore snapshot: {e}");
+                            }
+                        }
+                    }
+                }
+
+                self.0.insert(&name, Arc::new(session));
             }
         };
         let token = self.0.mac().chain_update(&name).finalize();
@@ -81,13 +102,17 @@ impl SshxService for GrpcServer {
             Some(result) => result?,
             None => return Err(Status::invalid_argument("missing first message")),
         };
-        let session_name = match first_update.client_message {
+        let (session_name, ide_available) = match first_update.client_message {
             Some(ClientMessage::Hello(hello)) => {
-                let (name, token) = hello
-                    .split_once(',')
-                    .ok_or_else(|| Status::invalid_argument("missing name and token"))?;
+                let parts: Vec<&str> = hello.splitn(3, ',').collect();
+                if parts.len() < 2 {
+                    return Err(Status::invalid_argument("missing name and token"));
+                }
+                let (name, token) = (parts[0], parts[1]);
                 validate_token(self.0.mac(), name, token)?;
-                name.to_string()
+                // Optional third field: "ide" if the CLI has IDE support.
+                let ide_flag = parts.get(2).map(|s| *s == "ide").unwrap_or(false);
+                (name.to_string(), ide_flag)
             }
             _ => return Err(Status::invalid_argument("invalid first message")),
         };
@@ -103,6 +128,11 @@ impl SshxService for GrpcServer {
             }
         };
 
+        // Set IDE availability flag from the hello message.
+        if ide_available {
+            session.set_ide_available(true);
+        }
+
         // We now spawn an asynchronous task that sends updates to the client. Note that
         // when this task finishes, the sender end is dropped, so the receiver is
         // automatically closed.
@@ -110,6 +140,11 @@ impl SshxService for GrpcServer {
         tokio::spawn(async move {
             if let Err(err) = handle_streaming(&tx, &session, stream).await {
                 warn!(?err, "connection exiting early due to an error");
+            }
+            // Reset IDE availability and clear IDE states when the CLI channel closes.
+            if ide_available {
+                session.set_ide_available(false);
+                session.clear_ide_states();
             }
         });
 
@@ -153,6 +188,9 @@ async fn handle_streaming(
     let mut ping_interval = time::interval(PING_INTERVAL);
     ping_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
+    // Use sleep instead of interval to avoid an immediate first tick.
+    let mut snapshot_sleep = std::pin::pin!(time::sleep(SNAPSHOT_INTERVAL));
+
     loop {
         tokio::select! {
             // Send periodic sync messages to the client.
@@ -165,6 +203,33 @@ async fn handle_streaming(
             // Send periodic pings to the client.
             _ = ping_interval.tick() => {
                 send_msg(tx, ServerMessage::Ping(get_time_ms())).await;
+            }
+            // Send periodic session snapshots for CLI persistence.
+            _ = &mut snapshot_sleep => {
+                let snap = session.json_snapshot();
+                match serde_json::to_vec(&snap) {
+                    Ok(bytes) => {
+                        send_msg(tx, ServerMessage::SessionSnapshot(bytes.into())).await;
+                    }
+                    Err(e) => {
+                        warn!("failed to serialize session snapshot: {e}");
+                    }
+                }
+                snapshot_sleep.as_mut().reset(time::Instant::now() + SNAPSHOT_INTERVAL);
+            }
+            // Also send an immediate snapshot when metadata changes (drawings, notes, etc.).
+            _ = session.sync_now_wait() => {
+                let snap = session.json_snapshot();
+                match serde_json::to_vec(&snap) {
+                    Ok(bytes) => {
+                        send_msg(tx, ServerMessage::SessionSnapshot(bytes.into())).await;
+                    }
+                    Err(e) => {
+                        warn!("failed to serialize session snapshot: {e}");
+                    }
+                }
+                // Reset the periodic timer so we don't double-snapshot.
+                snapshot_sleep.as_mut().reset(time::Instant::now() + SNAPSHOT_INTERVAL);
             }
             // Send buffered server updates to the client.
             Ok(msg) = session.update_rx().recv() => {
@@ -185,6 +250,11 @@ async fn handle_streaming(
             }
             // Exit on a session shutdown signal.
             _ = session.terminated() => {
+                // Send final snapshot before disconnecting.
+                let snap = session.json_snapshot();
+                if let Ok(bytes) = serde_json::to_vec(&snap) {
+                    send_msg(tx, ServerMessage::SessionSnapshot(bytes.into())).await;
+                }
                 let msg = String::from("disconnecting because session is closed");
                 send_msg(tx, ServerMessage::Error(msg)).await;
                 return Ok(());
@@ -244,16 +314,6 @@ async fn handle_update(tx: &ServerTx, session: &Session, update: ClientUpdate) -
                 Err(e) => warn!("failed to decode claude event: {e}"),
             }
         }
-        Some(ClientMessage::ComponentGraph(bytes)) => {
-            match zstd::decode_all(&*bytes)
-                .map_err(|e| format!("zstd decode: {e}"))
-                .and_then(|raw| serde_json::from_slice::<WsComponentGraph>(&raw)
-                    .map_err(|e| format!("json parse: {e}")))
-            {
-                Ok(graph) => session.update_component_graph(graph),
-                Err(e) => warn!("failed to decode component graph: {e}"),
-            }
-        }
         Some(ClientMessage::WidgetNames(bytes)) => {
             match serde_json::from_slice::<std::collections::HashMap<String, String>>(&bytes) {
                 Ok(names) => session.apply_widget_names(&names),
@@ -263,6 +323,42 @@ async fn handle_update(tx: &ServerTx, session: &Session, update: ClientUpdate) -
         Some(ClientMessage::Pong(ts)) => {
             let latency = get_time_ms().saturating_sub(ts);
             session.send_latency_measurement(latency);
+        }
+        Some(ClientMessage::HttpTunnelResponse(resp)) => {
+            session.deliver_tunnel_response(resp);
+        }
+        Some(ClientMessage::WsTunnelFrame(frame)) => {
+            session.deliver_ws_tunnel_frame(frame);
+        }
+        Some(ClientMessage::IdeState(update)) => {
+            // The CLI sends its local IDE state, scoped by ide_id (= Wid).
+            let wid = Wid(update.ide_id);
+            match serde_json::from_slice::<WsIdeState>(&update.json) {
+                Ok(state) => session.update_ide_state(wid, state),
+                Err(e) => warn!("failed to decode IDE state from CLI: {e}"),
+            }
+        }
+        Some(ClientMessage::EditLockRequest(req)) => {
+            // The CLI extension requests/releases an edit lock.
+            if req.release {
+                session.release_edit_lock(sshx_core::Uid(0));
+            } else {
+                match session.request_edit_lock(sshx_core::Uid(0), req.file) {
+                    Ok(lock) => {
+                        // Send the lock status back to the CLI.
+                        if let Ok(json) = serde_json::to_vec(&lock) {
+                            send_msg(tx, ServerMessage::EditLockStatus(json.into())).await;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("edit lock request denied: {e}");
+                    }
+                }
+            }
+        }
+        Some(ClientMessage::ContextSnapshot(bytes)) => {
+            let ansi = String::from_utf8_lossy(&bytes).into_owned();
+            session.deliver_context_snapshot(ansi);
         }
         Some(ClientMessage::Error(err)) => {
             // TODO: Propagate these errors to listeners on the web interface?

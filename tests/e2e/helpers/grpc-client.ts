@@ -50,23 +50,24 @@ function getBrowserServiceClient(endpoint: string): ServiceClient {
 /**
  * Create a session via gRPC Open().
  * Returns { name, token, key } where key is the encryption key.
+ *
+ * @param encryptedZeros — if provided, use these bytes as the encrypted_zeros
+ *   auth proof. For browser-facing tests, compute via helpers/encrypt.ts to
+ *   match what the browser will derive from the key.
  */
 export async function createSession(
-  endpoint: string
+  endpoint: string,
+  encryptedZeros?: Buffer,
 ): Promise<{ name: string; token: string; key: string; url: string }> {
   const client = getSshxServiceClient(endpoint);
   const key = "testkey1234567";
-  // Generate encrypted zeros the same way the Rust client does: encrypt a
-  // block of zeros with the argon2-derived key. For test simplicity, we just
-  // send 16 zero bytes as the encrypted_zeros — the server stores whatever we
-  // send and uses it for constant-time comparison.
-  const encryptedZeros = Buffer.alloc(16, 0);
+  const zeros = encryptedZeros ?? Buffer.alloc(16, 0);
 
   return new Promise((resolve, reject) => {
     client.open(
       {
         origin: `http://${endpoint}`,
-        encryptedZeros,
+        encryptedZeros: zeros,
         name: "e2e-test",
         writePasswordHash: null,
       },
@@ -154,4 +155,37 @@ export function browserStream(
       resolve();
     }, 500);
   });
+}
+
+/**
+ * Simulate an IDE-capable CLI client by opening a persistent gRPC Channel
+ * stream with ",ide" appended to the Hello message. This causes the server to
+ * set ide_available=true for the session.
+ *
+ * Returns a cleanup function that ends the stream (setting ide_available=false).
+ * Keep the returned handle alive for the duration of the test.
+ */
+export function simulateIdeCli(
+  endpoint: string,
+  name: string,
+  token: string
+): () => void {
+  const client = getSshxServiceClient(endpoint);
+  const call = client.channel();
+
+  call.on("error", (err: Error) => {
+    // CANCELLED is expected when we end the stream
+    if ((err as any).code === grpc.status.CANCELLED) return;
+    if ((err as any).code === grpc.status.UNAVAILABLE) return;
+    console.warn("simulateIdeCli stream error:", err.message);
+  });
+
+  // Send the Hello message with the "ide" flag.
+  // For proto oneof fields, the field name is set directly at the top level
+  // (same pattern as BrowserUpdate: { frame: {...} } not { browserMessage: { frame: ... } }).
+  call.write({ hello: `${name},${token},ide` });
+
+  return () => {
+    call.end();
+  };
 }

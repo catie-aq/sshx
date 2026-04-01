@@ -42,6 +42,7 @@ message OpenRequest {
   bytes encrypted_zeros = 2;              // Encrypted zero block, for client verification.
   string name = 3;                        // Name of the session (user@hostname).
   optional bytes write_password_hash = 4; // Hashed write password, if read-only mode is enabled.
+  optional bytes restore_snapshot = 5;    // zstd-compressed JSON session snapshot for restore.
 }
 
 // Details of a newly-created sshx session.
@@ -63,6 +64,19 @@ message NewShell {
   int32 y = 3;   // Y position of the shell.
 }
 
+// IDE editor state for sync between clients.
+message IdeStateUpdate {
+  bytes json = 1;     // JSON-encoded WsIdeState.
+  uint32 ide_id = 2;  // Widget/IDE instance ID (0 = legacy).
+}
+
+// Request to acquire or release an edit lock from the CLI extension.
+message EditLockRequest {
+  string file = 1;    // File path to lock.
+  bool release = 2;   // If true, release the lock instead of acquiring.
+  uint32 ide_id = 3;  // Which IDE instance holds/requests the lock.
+}
+
 // Bidirectional streaming update from the client.
 message ClientUpdate {
   oneof client_message {
@@ -72,10 +86,14 @@ message ClientUpdate {
     uint32 closed_shell = 4;    // Acknowledge that a shell was closed.
     bytes source_metadata = 10;  // zstd-compressed JSON Vec<WsSourceFile>.
     bytes claude_event = 11;     // JSON-encoded WsClaudeEvent.
-    bytes component_graph = 12;  // zstd-compressed JSON WsComponentGraph.
     fixed64 pong = 14;           // Response for latency measurement.
     string error = 15;
     bytes widget_names = 16;     // JSON-encoded map<instanceId, name> on startup.
+    HttpTunnelResponse http_tunnel_response = 20; // Tunneled HTTP response from the CLI.
+    WsTunnelFrame ws_tunnel_frame = 21;           // Tunneled WebSocket frame from the CLI.
+    IdeStateUpdate ide_state = 22;                // Local IDE state from extension via sync endpoint.
+    EditLockRequest edit_lock_request = 23;       // Request/release an edit lock from the extension.
+    bytes context_snapshot = 24;                  // Raw ANSI output from `claude --resume <id> /context`.
   }
 }
 
@@ -111,6 +129,35 @@ message BrowserInputEvent {
   string json = 2; // JSON-encoded mouse or keyboard event.
 }
 
+// An HTTP request tunneled through gRPC (server → CLI).
+message HttpTunnelRequest {
+  uint32 tunnel_id = 1;       // Unique ID for this request/response pair.
+  string method = 2;          // HTTP method: GET, POST, PUT, etc.
+  string path = 3;            // Full path including query string.
+  map<string, string> headers = 4;
+  bytes body = 5;
+  bool websocket_upgrade = 6; // True if this is a WebSocket upgrade request.
+  uint32 ide_id = 7;          // IDE instance ID (maps to a specific IdeManager on the CLI).
+}
+
+// An HTTP response chunk tunneled through gRPC (CLI → server).
+message HttpTunnelResponse {
+  uint32 tunnel_id = 1;
+  uint32 status_code = 2;     // HTTP status code (200, 404, etc.).
+  map<string, string> headers = 3;
+  bytes body_chunk = 4;       // A chunk of the response body.
+  bool done = 5;              // True if this is the last chunk.
+  bool websocket_accepted = 6; // True if the WebSocket upgrade was accepted.
+}
+
+// A WebSocket frame tunneled through gRPC (bidirectional).
+message WsTunnelFrame {
+  uint32 tunnel_id = 1;
+  bytes data = 2;             // Raw WebSocket frame payload.
+  bool is_text = 3;           // True for text frames, false for binary.
+  bool close = 4;             // True to signal close.
+}
+
 // Bidirectional streaming update from the server.
 message ServerUpdate {
   oneof server_message {
@@ -126,6 +173,12 @@ message ServerUpdate {
     BrowserInputEvent browser_input = 16;              // Forward input to offscreen browser.
     SetWidgetNameRequest set_widget_name = 17;         // Persist a widget name.
     ImageFile image_file = 18;                         // Push image bytes to CLI for local storage.
+    bytes session_snapshot = 19;                       // Full session state snapshot (JSON) for persistence.
+    HttpTunnelRequest http_tunnel_request = 20;        // Tunnel an HTTP request to the CLI.
+    WsTunnelFrame ws_tunnel_frame = 21;                // Tunnel a WebSocket frame to the CLI.
+    IdeStateUpdate ide_state = 22;                     // Remote IDE state update for sync to extension.
+    bytes edit_lock_status = 23;                       // JSON-encoded WsEditLock for the CLI extension.
+    bytes context_snapshot_request = 24;              // Empty payload — triggers CLI to capture /context output.
   }
 }
 

@@ -94,6 +94,28 @@ impl Display for Tid {
     }
 }
 
+/// Unique identifier for a drawing stroke within a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Did(pub u32);
+
+impl Display for Did {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "did#{}", self.0)
+    }
+}
+
+/// Unique identifier for a slide within a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Slid(pub u32);
+
+impl Display for Slid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "slid#{}", self.0)
+    }
+}
+
 /// A counter for generating unique identifiers.
 #[derive(Debug)]
 pub struct IdCounter {
@@ -103,6 +125,8 @@ pub struct IdCounter {
     next_wid: AtomicU32,
     next_vid: AtomicU32,
     next_tid: AtomicU32,
+    next_did: AtomicU32,
+    next_slid: AtomicU32,
 }
 
 impl Default for IdCounter {
@@ -114,6 +138,8 @@ impl Default for IdCounter {
             next_wid: AtomicU32::new(1),
             next_vid: AtomicU32::new(1),
             next_tid: AtomicU32::new(1),
+            next_did: AtomicU32::new(1),
+            next_slid: AtomicU32::new(1),
         }
     }
 }
@@ -149,6 +175,16 @@ impl IdCounter {
         Tid(self.next_tid.fetch_add(1, Ordering::Relaxed))
     }
 
+    /// Returns the next unique drawing ID.
+    pub fn next_did(&self) -> Did {
+        Did(self.next_did.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Returns the next unique slide ID.
+    pub fn next_slid(&self) -> Slid {
+        Slid(self.next_slid.fetch_add(1, Ordering::Relaxed))
+    }
+
     /// Return the current internal values of the counter.
     pub fn get_current_values(&self) -> (Sid, Uid) {
         (
@@ -162,4 +198,52 @@ impl IdCounter {
         self.next_sid.store(sid.0, Ordering::Relaxed);
         self.next_uid.store(uid.0, Ordering::Relaxed);
     }
+
+    /// Return all counter values as a tuple for full snapshot.
+    pub fn get_all_values(&self) -> AllCounterValues {
+        AllCounterValues {
+            next_sid: self.next_sid.load(Ordering::Relaxed),
+            next_uid: self.next_uid.load(Ordering::Relaxed),
+            next_nid: self.next_nid.load(Ordering::Relaxed),
+            next_wid: self.next_wid.load(Ordering::Relaxed),
+            next_vid: self.next_vid.load(Ordering::Relaxed),
+            next_tid: self.next_tid.load(Ordering::Relaxed),
+            next_did: self.next_did.load(Ordering::Relaxed),
+            next_slid: self.next_slid.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Restore all counter values from a snapshot.
+    pub fn set_all_values(&self, v: &AllCounterValues) {
+        self.next_sid.store(v.next_sid, Ordering::Relaxed);
+        self.next_uid.store(v.next_uid, Ordering::Relaxed);
+        self.next_nid.store(v.next_nid, Ordering::Relaxed);
+        self.next_wid.store(v.next_wid, Ordering::Relaxed);
+        self.next_vid.store(v.next_vid, Ordering::Relaxed);
+        self.next_tid.store(v.next_tid, Ordering::Relaxed);
+        self.next_did.store(v.next_did, Ordering::Relaxed);
+        self.next_slid.store(v.next_slid, Ordering::Relaxed);
+    }
+}
+
+/// All counter values for serialization/deserialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AllCounterValues {
+    /// Next shell ID.
+    pub next_sid: u32,
+    /// Next user ID.
+    pub next_uid: u32,
+    /// Next note ID.
+    pub next_nid: u32,
+    /// Next widget ID.
+    pub next_wid: u32,
+    /// Next video stream ID.
+    pub next_vid: u32,
+    /// Next text block ID.
+    pub next_tid: u32,
+    /// Next drawing ID.
+    pub next_did: u32,
+    /// Next slide ID.
+    pub next_slid: u32,
 }

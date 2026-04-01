@@ -202,6 +202,16 @@ export class TouchZoom {
     this.#moved(false);
   }
 
+  /** Zoom in or out centered on a client-space point. factor > 1 = zoom in. */
+  zoomAtPoint(clientX: number, clientY: number, factor: number) {
+    const point = this.#getPoint({ clientX, clientY } as PointerEvent);
+    let newZoom = Vec.clamp(this.zoom * factor, MIN_ZOOM, MAX_ZOOM);
+    const movement = Vec.mul(point, 1 / this.zoom - 1 / newZoom);
+    this.center = Vec.add(this.center, movement);
+    this.zoom = newZoom;
+    this.#moved();
+  }
+
   #moved(manual = true) {
     for (const callback of this.#callbacks) {
       callback(manual);

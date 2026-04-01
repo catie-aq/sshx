@@ -44,6 +44,12 @@ export default defineConfig({
         changeOrigin: true,
         secure: false,
       },
+      "/ide": {
+        target: `http://127.0.0.1:${serverPort}`,
+        changeOrigin: true,
+        ws: true,
+        secure: false,
+      },
     },
   },
 });

@@ -10,10 +10,10 @@ use futures_util::{SinkExt, StreamExt};
 use http::StatusCode;
 use sshx::encrypt::Encrypt;
 use sshx_core::proto::sshx_service_client::SshxServiceClient;
-use sshx_core::{Sid, Uid, Vid};
+use sshx_core::{Sid, Uid, Vid, Wid};
 use sshx_server::{
     state::ServerState,
-    web::protocol::{WsClient, WsIceCandidate, WsIceServer, WsServer, WsUser, WsVideoStream, WsWinsize},
+    web::protocol::{WsClient, WsIceCandidate, WsIceServer, WsServer, WsUser, WsVideoStream, WsWidget, WsWinsize},
     Server,
 };
 use tokio::net::{TcpListener, TcpStream};
@@ -95,6 +95,10 @@ pub struct ClientSocket {
     pub messages: Vec<(Uid, String, String)>,
     pub errors: Vec<String>,
 
+    // IDE fields
+    pub ide_available: bool,
+    pub widgets: HashMap<Wid, WsWidget>,
+
     // Video / screen share fields
     pub video_streams: HashMap<Vid, WsVideoStream>,
     pub browser_frames: Vec<(Vid, u64, Bytes, bool)>,
@@ -103,6 +107,9 @@ pub struct ClientSocket {
     pub rtc_ice_candidates: Vec<(Vid, Uid, Uid, WsIceCandidate)>,
     pub ice_servers: Vec<WsIceServer>,
     pub browser_control: HashMap<Vid, Option<Uid>>,
+
+    // Context snapshot
+    pub context_snapshots: Vec<String>,
 }
 
 impl ClientSocket {
@@ -121,6 +128,8 @@ impl ClientSocket {
             data: HashMap::new(),
             messages: Vec::new(),
             errors: Vec::new(),
+            ide_available: false,
+            widgets: HashMap::new(),
             video_streams: HashMap::new(),
             browser_frames: Vec::new(),
             rtc_offers: Vec::new(),
@@ -128,6 +137,7 @@ impl ClientSocket {
             rtc_ice_candidates: Vec::new(),
             ice_servers: Vec::new(),
             browser_control: HashMap::new(),
+            context_snapshots: Vec::new(),
         };
         this.authenticate().await;
         Ok(this)
@@ -207,6 +217,16 @@ impl ClientSocket {
                     WsServer::ShellLatency(_) => {}
                     WsServer::Pong(_) => {}
                     WsServer::Error(err) => self.errors.push(err),
+                    WsServer::IdeAvailable(v) => self.ide_available = v,
+                    WsServer::Widgets(list) => {
+                        self.widgets = list.into_iter().collect();
+                    }
+                    WsServer::WidgetDiff(id, Some(w)) => {
+                        self.widgets.insert(id, w);
+                    }
+                    WsServer::WidgetDiff(id, None) => {
+                        self.widgets.remove(&id);
+                    }
                     WsServer::VideoStreams(list) => {
                         self.video_streams = list.into_iter().collect();
                     }
@@ -234,6 +254,9 @@ impl ClientSocket {
                     }
                     WsServer::BrowserControlStatus(vid, uid) => {
                         self.browser_control.insert(vid, uid);
+                    }
+                    WsServer::ContextSnapshot(text) => {
+                        self.context_snapshots.push(text);
                     }
                     _ => {} // ignore other message types in tests
                 }

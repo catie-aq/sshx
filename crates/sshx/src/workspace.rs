@@ -29,7 +29,7 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, info, warn};
 
-use crate::analyze::{AnalysisDb, AnalysisEntry, ComponentGraph, ANALYSIS_FILENAME};
+use crate::analyze::{AnalysisDb, AnalysisEntry, ANALYSIS_FILENAME};
 
 // ---------------------------------------------------------------------------
 // Wire types  (must match WsSourceFile / WsClaudeEvent on the server)
@@ -92,6 +92,10 @@ pub struct ClaudeEvent {
     pub input_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u32>,
     /// UNIX timestamp (seconds) of the transcript file's last modification.
     /// Only present on synthetic `"transcript"` events.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -178,6 +182,52 @@ async fn run_update_file_metadata(
     db.save(&out_path)?;
     info!(path = %path, "file metadata updated in {}", out_path.display());
     Ok(())
+}
+
+/// Spawn a task that captures the Claude context window via `claude --resume <id> /context`
+/// and sends the raw ANSI output back to the server as `ClientMessage::ContextSnapshot`.
+pub fn spawn_context_snapshot(tx: mpsc::Sender<ClientMessage>) {
+    tokio::spawn(async move {
+        run_context_snapshot(tx).await;
+    });
+}
+
+async fn run_context_snapshot(tx: mpsc::Sender<ClientMessage>) {
+    // `claude --continue --print '/context'` resumes the most-recent session in
+    // the current directory in non-interactive (pipe-friendly) mode and runs the
+    // built-in /context slash command, which prints a markdown context-window
+    // summary without making any API calls.  It exits quickly (< 5 s).
+    let result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(30),
+        tokio::process::Command::new("claude")
+            .args(["--continue", "--print", "/context"])
+            .stdin(std::process::Stdio::null())
+            .output(),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(out)) => {
+            let mut combined = out.stdout;
+            combined.extend_from_slice(&out.stderr);
+            if combined.is_empty() {
+                let msg = b"[sshx] No context output. Is a Claude session active?";
+                tx.send(ClientMessage::ContextSnapshot(bytes::Bytes::from_static(msg))).await.ok();
+            } else {
+                tx.send(ClientMessage::ContextSnapshot(bytes::Bytes::from(combined))).await.ok();
+            }
+        }
+        Ok(Err(e)) => {
+            warn!("context snapshot command failed: {e}");
+            let msg = format!("[sshx] context snapshot failed: {e}");
+            tx.send(ClientMessage::ContextSnapshot(bytes::Bytes::from(msg.into_bytes()))).await.ok();
+        }
+        Err(_) => {
+            warn!("context snapshot timed out after 30s");
+            let msg = b"[sshx] context snapshot timed out after 30s.";
+            tx.send(ClientMessage::ContextSnapshot(bytes::Bytes::from_static(msg))).await.ok();
+        }
+    }
 }
 
 /// Spawn a task that saves image bytes received from the server into `~/.sshx/images/`.
@@ -286,19 +336,6 @@ async fn send_db(db: &AnalysisDb, tx: &mpsc::Sender<ClientMessage>) -> Result<()
     let json = serde_json::to_vec(&serde_json::json!({ "root": root, "rootPath": root_path, "files": files }))?;
     let compressed = zstd::encode_all(&*json, 3)?;
     tx.send(ClientMessage::SourceMetadata(compressed.into()))
-        .await
-        .ok();
-
-    // Also send the component graph derived from the same database.
-    send_graph(&db.to_graph(), tx).await?;
-    Ok(())
-}
-
-/// Serialize and send a [`ComponentGraph`] to the server.
-async fn send_graph(graph: &ComponentGraph, tx: &mpsc::Sender<ClientMessage>) -> Result<()> {
-    let json = serde_json::to_vec(graph)?;
-    let compressed = zstd::encode_all(&*json, 3)?;
-    tx.send(ClientMessage::ComponentGraph(compressed.into()))
         .await
         .ok();
     Ok(())
@@ -521,14 +558,21 @@ fn parse_journal_entry(entry: &JournalEntry) -> Option<ClaudeEvent> {
     let timestamp = entry.timestamp.clone().unwrap_or_default();
     let session_id = entry.session_id.clone().unwrap_or_default();
 
-    let input_tokens = msg
-        .get("usage")
+    let usage = msg.get("usage");
+    let input_tokens = usage
         .and_then(|u| u.get("input_tokens"))
         .and_then(|v| v.as_u64())
         .map(|v| v as u32);
-    let output_tokens = msg
-        .get("usage")
+    let output_tokens = usage
         .and_then(|u| u.get("output_tokens"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+    let cache_read_tokens = usage
+        .and_then(|u| u.get("cache_read_input_tokens"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+    let cache_creation_tokens = usage
+        .and_then(|u| u.get("cache_creation_input_tokens"))
         .and_then(|v| v.as_u64())
         .map(|v| v as u32);
 
@@ -545,6 +589,8 @@ fn parse_journal_entry(entry: &JournalEntry) -> Option<ClaudeEvent> {
                         session_id,
                         input_tokens,
                         output_tokens,
+                        cache_read_tokens,
+                        cache_creation_tokens,
                         file_mtime: None,
                     });
                 }
@@ -555,10 +601,42 @@ fn parse_journal_entry(entry: &JournalEntry) -> Option<ClaudeEvent> {
                 match block_type {
                     "tool_use" => {
                         let tool = block.get("name")?.as_str()?.to_string();
-                        let input = block
-                            .get("input")
-                            .map(|v| v.to_string().chars().take(500).collect::<String>())
-                            .unwrap_or_default();
+                        let input_val = block.get("input");
+                        let input = if tool == "Edit" {
+                            // Build valid JSON with each field individually truncated
+                            // so the result is always parseable.
+                            let inp = input_val.and_then(|v| v.as_object());
+                            if let Some(obj) = inp {
+                                let fp = obj.get("file_path")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let old_s: String = obj.get("old_string")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .chars().take(4000).collect();
+                                let new_s: String = obj.get("new_string")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .chars().take(4000).collect();
+                                let replace_all = obj.get("replace_all")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                serde_json::json!({
+                                    "file_path": fp,
+                                    "old_string": old_s,
+                                    "new_string": new_s,
+                                    "replace_all": replace_all,
+                                }).to_string()
+                            } else {
+                                input_val
+                                    .map(|v| v.to_string().chars().take(500).collect::<String>())
+                                    .unwrap_or_default()
+                            }
+                        } else {
+                            input_val
+                                .map(|v| v.to_string().chars().take(500).collect::<String>())
+                                .unwrap_or_default()
+                        };
                         return Some(ClaudeEvent {
                             kind: "tool_use".into(),
                             tool: Some(tool),
@@ -567,6 +645,8 @@ fn parse_journal_entry(entry: &JournalEntry) -> Option<ClaudeEvent> {
                             session_id,
                             input_tokens,
                             output_tokens,
+                            cache_read_tokens,
+                            cache_creation_tokens,
                             file_mtime: None,
                         });
                     }
@@ -580,6 +660,8 @@ fn parse_journal_entry(entry: &JournalEntry) -> Option<ClaudeEvent> {
                             session_id,
                             input_tokens,
                             output_tokens,
+                            cache_read_tokens,
+                            cache_creation_tokens,
                             file_mtime: None,
                         });
                     }
@@ -604,6 +686,8 @@ fn parse_journal_entry(entry: &JournalEntry) -> Option<ClaudeEvent> {
                             session_id,
                             input_tokens: None,
                             output_tokens: None,
+                            cache_read_tokens: None,
+                            cache_creation_tokens: None,
                             file_mtime: None,
                         });
                     }
@@ -621,6 +705,8 @@ fn parse_journal_entry(entry: &JournalEntry) -> Option<ClaudeEvent> {
                         session_id,
                         input_tokens: None,
                         output_tokens: None,
+                        cache_read_tokens: None,
+                        cache_creation_tokens: None,
                         file_mtime: None,
                     });
                 }
@@ -632,6 +718,8 @@ fn parse_journal_entry(entry: &JournalEntry) -> Option<ClaudeEvent> {
                     session_id,
                     input_tokens: None,
                     output_tokens: None,
+                    cache_read_tokens: None,
+                    cache_creation_tokens: None,
                     file_mtime: None,
                 })
             }
@@ -662,7 +750,7 @@ pub async fn tail_transcript(
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map(|d| d.as_secs());
-    info!("watching Claude transcript: {path_str}");
+    debug!("watching Claude transcript: {path_str}");
     if let Ok(json) = serde_json::to_vec(&ClaudeEvent {
         kind: "transcript".into(),
         tool: None,
@@ -671,6 +759,8 @@ pub async fn tail_transcript(
         session_id: file_session_id,
         input_tokens: None,
         output_tokens: None,
+        cache_read_tokens: None,
+        cache_creation_tokens: None,
         file_mtime,
     }) {
         tx.send(ClientMessage::ClaudeEvent(json.into())).await.ok();
@@ -789,7 +879,7 @@ pub(crate) async fn watch_transcripts_in_dir(
     };
 
     // Initial scan: pick up any pre-existing .jsonl files.
-    let entries: Vec<PathBuf> = std::fs::read_dir(project_dir)
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(project_dir)
         .ok()
         .into_iter()
         .flatten()
@@ -797,6 +887,21 @@ pub(crate) async fn watch_transcripts_in_dir(
         .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
         .map(|e| e.path())
         .collect();
+    entries.sort();
+    let total = entries.len();
+    const SHOW: usize = 3;
+    for (i, path) in entries.iter().enumerate() {
+        if i < SHOW {
+            info!(
+                "watching Claude transcript: {} ({}/{})",
+                path.display(),
+                i + 1,
+                total
+            );
+        } else if i == SHOW {
+            info!("... {} more transcript files loaded", total - SHOW);
+        }
+    }
     for path in entries {
         spawn_tail(path);
     }
@@ -900,6 +1005,8 @@ async fn send_pid_event(tx: &mpsc::Sender<ClientMessage>, pid_str: &str, status:
         session_id: String::new(),
         input_tokens: None,
         output_tokens: None,
+        cache_read_tokens: None,
+        cache_creation_tokens: None,
         file_mtime: None,
     }) {
         tx.send(ClientMessage::ClaudeEvent(json.into())).await.ok();
