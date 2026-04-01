@@ -1,11 +1,17 @@
 use anyhow::{Context, Result};
+use futures_util::StreamExt as FuturesStreamExt;
 use sshx::{controller::Controller, encrypt::Encrypt, runner::Runner};
 use sshx_core::{
-    proto::{server_update::ServerMessage, NewShell, TerminalInput},
+    proto::{
+        client_update::ClientMessage as GrpcClientMessage,
+        server_update::ServerMessage,
+        ClientUpdate, NewShell, OpenRequest, TerminalInput,
+    },
     Sid, Uid,
 };
 use sshx_server::web::protocol::{WsClient, WsWinsize};
 use tokio::time::{self, Duration};
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::common::*;
 
@@ -346,6 +352,80 @@ async fn test_context_snapshot_delivered() -> Result<()> {
 
     assert_eq!(s.context_snapshots.len(), 1);
     assert_eq!(s.context_snapshots[0], "test ANSI output \x1b[32mgreen\x1b[0m");
+
+    Ok(())
+}
+
+/// Full gRPC round-trip: WS RequestContextSnapshot → update_tx → gRPC stream →
+/// mock CLI receives ContextSnapshotRequest → replies ContextSnapshot → WS broadcast.
+#[tokio::test]
+async fn test_context_snapshot_grpc_roundtrip() -> Result<()> {
+    let server = TestServer::new().await;
+    let mut grpc = server.grpc_client().await;
+
+    // 1. Create session via gRPC Open.
+    let open_resp = grpc
+        .open(OpenRequest {
+            origin: server.endpoint(),
+            encrypted_zeros: Encrypt::new("").zeros().into(),
+            name: String::new(),
+            write_password_hash: None,
+            restore_snapshot: None,
+        })
+        .await?
+        .into_inner();
+    let name = open_resp.name;
+    let token = open_resp.token;
+
+    // 2. Connect a WebSocket browser client.
+    let mut ws = ClientSocket::connect(&server.ws_endpoint(&name), "", None).await?;
+    ws.flush().await;
+
+    // 3. Set up a mock CLI gRPC channel via an unbounded channel.
+    let (cli_tx, cli_rx) = tokio::sync::mpsc::unbounded_channel::<ClientUpdate>();
+    // Send Hello — required as the very first message by grpc.rs.
+    cli_tx.send(ClientUpdate {
+        client_message: Some(GrpcClientMessage::Hello(format!("{name},{token}"))),
+    })?;
+    let stream = UnboundedReceiverStream::new(cli_rx);
+    let mut server_stream = grpc.channel(stream).await?.into_inner();
+
+    // 4. Spawn mock-CLI task: watch for ContextSnapshotRequest, reply with ContextSnapshot.
+    let cli_tx2 = cli_tx.clone();
+    tokio::spawn(async move {
+        while let Some(Ok(update)) = server_stream.next().await {
+            if let Some(sshx_core::proto::server_update::ServerMessage::ContextSnapshotRequest(_)) =
+                update.server_message
+            {
+                cli_tx2
+                    .send(ClientUpdate {
+                        client_message: Some(GrpcClientMessage::ContextSnapshot(
+                            b"## Test Context\nTokens: 42k\n".to_vec().into(),
+                        )),
+                    })
+                    .ok();
+                break;
+            }
+        }
+    });
+
+    // Allow the gRPC channel to establish before triggering the request.
+    time::sleep(Duration::from_millis(50)).await;
+
+    // 5. Browser sends RequestContextSnapshot over WebSocket.
+    ws.send(WsClient::RequestContextSnapshot).await;
+
+    // 6. Allow time for the full round-trip (WS → session → gRPC → mock CLI → gRPC → session → WS).
+    time::sleep(Duration::from_millis(500)).await;
+    ws.flush().await;
+
+    // 7. Assert the snapshot arrived at the browser WebSocket client.
+    assert_eq!(
+        ws.context_snapshots.len(),
+        1,
+        "WsServer::ContextSnapshot should have been received"
+    );
+    assert_eq!(ws.context_snapshots[0], "## Test Context\nTokens: 42k\n");
 
     Ok(())
 }

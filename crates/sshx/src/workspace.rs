@@ -197,10 +197,29 @@ async fn run_context_snapshot(tx: mpsc::Sender<ClientMessage>) {
     // the current directory in non-interactive (pipe-friendly) mode and runs the
     // built-in /context slash command, which prints a markdown context-window
     // summary without making any API calls.  It exits quickly (< 5 s).
+
+    // Prepend common npm-global and local binary directories so `claude` is
+    // found even when sshx is launched from a subprocess that inherits a
+    // stripped PATH (e.g. via mprocs or systemd).
+    let extra_paths = [
+        dirs::home_dir().map(|h| h.join(".npm-global").join("bin")),
+        dirs::home_dir().map(|h| h.join(".local").join("bin")),
+    ];
+    let mut path_parts: Vec<String> = extra_paths
+        .into_iter()
+        .flatten()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    if let Ok(existing) = std::env::var("PATH") {
+        path_parts.push(existing);
+    }
+    let path_env = path_parts.join(":");
+
     let result = tokio::time::timeout(
         tokio::time::Duration::from_secs(30),
         tokio::process::Command::new("claude")
             .args(["--continue", "--print", "/context"])
+            .env("PATH", &path_env)
             .stdin(std::process::Stdio::null())
             .output(),
     )
@@ -208,6 +227,16 @@ async fn run_context_snapshot(tx: mpsc::Sender<ClientMessage>) {
 
     match result {
         Ok(Ok(out)) => {
+            info!(
+                exit_code = out.status.code(),
+                stdout_bytes = out.stdout.len(),
+                stderr_bytes = out.stderr.len(),
+                "context snapshot command completed"
+            );
+            if !out.stderr.is_empty() {
+                let stderr_str = String::from_utf8_lossy(&out.stderr);
+                info!(stderr = %stderr_str, "context snapshot stderr");
+            }
             let mut combined = out.stdout;
             combined.extend_from_slice(&out.stderr);
             if combined.is_empty() {

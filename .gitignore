@@ -7,3 +7,5 @@
 /build
 
 /distribution/*/dist/
+
+.local/openvscode-server*

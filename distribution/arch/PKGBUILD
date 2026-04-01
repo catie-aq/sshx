@@ -1,0 +1,42 @@
+# Maintainer: Caleb Maclennan <caleb@alerque.com>
+# Contributor: Hoream <hoream@qq.com>
+# Contributor: Asuka Minato
+
+pkgname=sshx
+pkgver=0.4.1
+pkgrel=2
+pkgdesc='A secure web-based, collaborative terminal'
+url="https://github.com/ekzhang/$pkgname"
+license=(MIT)
+arch=(x86_64 aarch64)
+depends=(glibc # libc.so libm.so
+         libgcc libgcc_s.so)
+makedepends=(cargo
+             protobuf)
+options=(!lto) # https://github.com/briansmith/ring/issues/1444
+_archive="$pkgname-$pkgver"
+source=("$url/archive/v$pkgver/$_archive.tar.gz")
+# source=("$_archive.tar.gz::https://static.crates.io/crates/$pkgname/$_archive.crate"
+        # "$pkgname-LICENSE::$url/raw/$pkgver/LICENSE")
+sha256sums=('ab6de41546b849726faa3b964466c1f8bb558bd27ee2452a9758405ff013108f')
+
+prepare() {
+    cd "$_archive"
+    cargo fetch --locked --target host-tuple
+}
+
+build() {
+    cd "$_archive"
+    cargo build --frozen --release
+}
+
+check() {
+    cd "$_archive"
+    cargo test --frozen --release
+}
+
+package() {
+    cd "$_archive"
+    install -Dm0755 -t "$pkgdir/usr/bin/" "target/release/$pkgname"{,-server}
+    install -Dm0644 -t "$pkgdir/usr/share/licenses/$pkgname/" LICENSE
+}
