@@ -97,6 +97,12 @@
 
   onMount(() => {
     function handleGlobalKey(e: KeyboardEvent) {
+      // Escape: exit fullscreen IDE
+      if (e.key === "Escape" && fullscreenIdeWid !== null) {
+        fullscreenIdeWid = null;
+        e.preventDefault();
+        return;
+      }
       if ((e.metaKey || e.ctrlKey) && e.key === "k") {
         e.preventDefault();
         commandPaletteOpen = true;
@@ -1348,6 +1354,8 @@
   let ideAvailable = false;
   /** Wid of the IDE widget currently shown fullscreen (local-only, not synced). */
   let fullscreenIdeWid: number | null = null;
+  /** The ideId of the fullscreen IDE widget, used to build the correct iframe URL. */
+  let fullscreenIdeId: number = 0;
   /** Map from wid to IdeEditorWidget component instance, for programmatic file opens. */
   let ideEditorRefs: Record<number, { openFile: (path: string) => void }> = {};
 
@@ -2430,7 +2438,7 @@
             on:resize={({ detail }) => {
               srocket?.send({ resizeWidget: [wid, detail.w, detail.h] });
             }}
-            on:maximize={() => { fullscreenIdeWid = wid; }}
+            on:maximize={({ detail: ideId }) => { fullscreenIdeWid = wid; fullscreenIdeId = ideId; }}
             on:delete={() => srocket?.send({ closeWidget: wid })}
           />
         {/if}
@@ -2663,30 +2671,29 @@
 
   <!-- Fullscreen IDE overlay (local-only, outside canvas transform) -->
   {#if fullscreenIdeWid !== null}
-    <!-- svelte-ignore a11y-no-static-element-interactions -->
-    <div
-      class="fixed inset-0 z-[100] flex flex-col bg-zinc-900"
-      on:keydown={(e) => {
-        if (e.key === "Escape") { fullscreenIdeWid = null; e.preventDefault(); }
-      }}
-    >
-      <div class="flex items-center border-b border-zinc-700 bg-zinc-800/90 px-3 py-1 select-none">
+    <div class="fixed inset-0 z-[100] flex flex-col bg-zinc-900">
+      <div class="flex-shrink-0 flex items-center gap-2 border-b-2 border-indigo-700 bg-black px-3 py-2 select-none">
         <CircleButtons>
-          <CircleButton kind="red" on:mousedown={() => {
+          <CircleButton kind="red" on:click={() => {
             if (fullscreenIdeWid !== null) srocket?.send({ closeWidget: fullscreenIdeWid });
             fullscreenIdeWid = null;
           }} />
-          <CircleButton kind="yellow" on:mousedown={() => { fullscreenIdeWid = null; }} />
-          <CircleButton kind="green" on:mousedown={() => { fullscreenIdeWid = null; }} />
+          <CircleButton kind="yellow" on:click={() => { fullscreenIdeWid = null; }} />
+          <CircleButton kind="green" on:click={() => { fullscreenIdeWid = null; }} />
         </CircleButtons>
         <span class="flex-1 text-center text-sm text-zinc-300">VS Code — Fullscreen</span>
-        <div class="w-16" />
+        <button
+          class="text-xs text-zinc-400 hover:text-zinc-100 px-2 py-0.5 border border-zinc-600 rounded hover:border-zinc-400 transition-colors"
+          on:click={() => { fullscreenIdeWid = null; }}
+        >
+          Exit
+        </button>
       </div>
       <iframe
-        src="/ide/s/{id}/"
+        src="/ide/s/{id}/{fullscreenIdeId}/"
         title="VS Code IDE (fullscreen)"
-        class="flex-1 w-full border-none bg-zinc-900"
-        sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads allow-keyboard-lock"
+        class="flex-1 w-full border-none"
+        sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads"
       />
     </div>
   {/if}

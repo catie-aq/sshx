@@ -21,7 +21,7 @@
     startMove: MouseEvent;
     delete: void;
     resize: { w: number; h: number };
-    maximize: void;
+    maximize: number;
   }>();
 
   let el: HTMLDivElement;
@@ -116,7 +116,7 @@
       minimized = false;
       dispatch("resize", { w: preMinW || 800, h: preMinH || 500 });
     }
-    dispatch("maximize");
+    dispatch("maximize", ideId);
   }
 
   function minimize() {
