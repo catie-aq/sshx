@@ -321,8 +321,8 @@ export type WsClient = {
   releaseBrowserControl?: Vid;
   /** Create an image widget at canvas position (x, y) with URL, alt text, and optional filename for auto-push. */
   createImageWidget?: [number, number, string, string, string | null];
-  /** Push an ImageWidget's image to the CLI with a given filename. */
-  pushImageWidget?: [Wid, string];
+  /** Push an ImageWidget's image to the CLI with a given filename. [wid, newName, oldName] */
+  pushImageWidget?: [Wid, string, string];
   /** Request all connected overlay clients to flash a component by name. */
   highlightComponent?: string;
   /** Open the app overlay widget at canvas position (x, y). */

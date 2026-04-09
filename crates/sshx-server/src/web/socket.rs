@@ -448,6 +448,7 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>, ice_server
                                         .send(ServerMessage::ImageFile(ImageFile {
                                             name: name.clone(),
                                             data: data.into(),
+                                            old_name: String::new(),
                                         }))
                                         .await
                                         .ok();
@@ -731,6 +732,10 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>, ice_server
                 }
             }
             WsClient::UpdateIdeState(wid, state) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
                 session.update_ide_state(wid, state);
             }
             WsClient::RequestEditLock(file) => {
@@ -770,6 +775,7 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>, ice_server
                                 .send(ServerMessage::ImageFile(ImageFile {
                                     name,
                                     data: data.into(),
+                                    old_name: String::new(),
                                 }))
                                 .await
                                 .ok();
@@ -781,26 +787,26 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>, ice_server
             WsClient::RequestContextSnapshot => {
                 session.request_context_snapshot();
             }
-            WsClient::PushImageWidget(wid, new_name) => {
+            WsClient::PushImageWidget(wid, new_name, old_name) => {
                 if let Err(e) = session.check_write_permission(user_id) {
                     send(socket, WsServer::Error(e.to_string())).await?;
                     continue;
                 }
                 if new_name.is_empty() { continue; }
-                // Look up the widget's image URL and current name.
-                let info = session.list_widgets().into_iter()
+                // Look up the widget's current image URL.
+                let url = session.list_widgets().into_iter()
                     .find(|(id, _)| *id == wid)
                     .and_then(|(_, w)| match w.kind {
-                        WsWidgetKind::Image { url, .. } => Some((url, w.name)),
+                        WsWidgetKind::Image { url, .. } => Some(url),
                         _ => None,
                     });
-                if let Some((url, _old_name)) = info {
+                if let Some(url) = url {
                     // Rename the file on disk if the name changed.
                     let local = url.trim_start_matches('/');
                     let new_url = rename_upload_file(local, &new_name).await.unwrap_or_else(|| url.clone());
                     // Update the widget kind with the new URL and name.
                     session.update_image_widget(wid, new_url, new_name.clone()).ok();
-                    // Push image bytes to CLI (use .send().await to avoid silent drops).
+                    // Push image bytes to CLI with old_name for cleanup.
                     let new_local = session.list_widgets().into_iter()
                         .find(|(id, _)| *id == wid)
                         .and_then(|(_, w)| match w.kind {
@@ -815,6 +821,7 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>, ice_server
                                 .send(ServerMessage::ImageFile(ImageFile {
                                     name: new_name,
                                     data: data.into(),
+                                    old_name,
                                 }))
                                 .await
                                 .ok();

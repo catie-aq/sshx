@@ -43,6 +43,12 @@ struct Args {
     #[clap(long)]
     name: Option<String>,
 
+    /// Custom session slug — sets the URL path to /s/<slug>.
+    /// Must be 2–40 alphanumeric characters, hyphens, or underscores.
+    /// Example: --slug plati  →  https://sshx.io/s/plati
+    #[clap(long)]
+    slug: Option<String>,
+
     /// Enable read-only access mode — generates separate URLs for viewers
     /// and editors.
     #[clap(long)]
@@ -307,6 +313,7 @@ async fn run_session(args: Args) -> Result<()> {
             Some(std::path::PathBuf::from(sshx::controller::SESSION_DIR)),
             openvscode_bin,
             workspace_root.clone(),
+            args.slug,
         )
         .await?;
 

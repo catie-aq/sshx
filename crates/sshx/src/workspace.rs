@@ -260,15 +260,16 @@ async fn run_context_snapshot(tx: mpsc::Sender<ClientMessage>) {
 }
 
 /// Spawn a task that saves image bytes received from the server into `~/.sshx/images/`.
-pub fn spawn_save_image_file(name: String, data: Vec<u8>) {
+/// If `old_name` is set and differs from `name`, the old file is removed after saving.
+pub fn spawn_save_image_file(name: String, data: Vec<u8>, old_name: String) {
     tokio::spawn(async move {
-        if let Err(e) = run_save_image_file(name, data).await {
+        if let Err(e) = run_save_image_file(name, data, old_name).await {
             warn!("save-image-file task exited: {e:#}");
         }
     });
 }
 
-async fn run_save_image_file(name: String, data: Vec<u8>) -> Result<()> {
+async fn run_save_image_file(name: String, data: Vec<u8>, old_name: String) -> Result<()> {
     let dir = dirs::home_dir()
         .context("no home directory")?
         .join(".sshx")
@@ -276,6 +277,14 @@ async fn run_save_image_file(name: String, data: Vec<u8>) -> Result<()> {
     tokio::fs::create_dir_all(&dir).await?;
     tokio::fs::write(dir.join(&name), &data).await?;
     info!("image saved → ~/.sshx/images/{name}");
+    // Clean up the old file if this was a rename.
+    if !old_name.is_empty() && old_name != name {
+        let old_path = dir.join(&old_name);
+        if old_path.exists() {
+            tokio::fs::remove_file(&old_path).await.ok();
+            info!("removed old image → ~/.sshx/images/{old_name}");
+        }
+    }
     Ok(())
 }
 

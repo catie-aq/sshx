@@ -22,6 +22,7 @@
 <button
   class="w-3 h-3 p-[1px] rounded-full {details[kind].cls}"
   on:mousedown|stopPropagation
+  on:pointerdown|stopPropagation
   on:click
 >
   <svelte:component

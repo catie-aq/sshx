@@ -43,6 +43,7 @@ message OpenRequest {
   string name = 3;                        // Name of the session (user@hostname).
   optional bytes write_password_hash = 4; // Hashed write password, if read-only mode is enabled.
   optional bytes restore_snapshot = 5;    // zstd-compressed JSON session snapshot for restore.
+  optional string custom_name = 6;        // Custom session slug (e.g. "plati" → /s/plati).
 }
 
 // Details of a newly-created sshx session.
@@ -119,8 +120,9 @@ message SetWidgetNameRequest {
 
 // Push an image file to the CLI client for local storage.
 message ImageFile {
-  string name = 1; // User-defined filename (e.g., "screenshot.png").
-  bytes data = 2;  // Raw image bytes.
+  string name = 1;     // User-defined filename (e.g., "screenshot.png").
+  bytes data = 2;      // Raw image bytes.
+  string old_name = 3; // Previous filename — CLI deletes this after saving the new file.
 }
 
 // An input event (mouse/keyboard) to be injected into an offscreen browser display.

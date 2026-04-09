@@ -32,8 +32,8 @@
     const ox = 0.5 * window.innerWidth - 378;
     const oy = 0.5 * window.innerHeight - 240;
     return [
-      center[0] + clientX / zoom - ox,
-      center[1] + clientY / zoom - oy,
+      (clientX - ox) / zoom + center[0],
+      (clientY - oy) / zoom + center[1],
     ];
   }
 
@@ -53,6 +53,11 @@
     e.preventDefault();
     const [x, y] = screenToCanvas(e.clientX, e.clientY);
     currentPoints = [...currentPoints, x, y];
+  }
+
+  function handlePointerCancel(_e: PointerEvent) {
+    isDrawing = false;
+    currentPoints = [];
   }
 
   function handlePointerUp(e: PointerEvent) {
@@ -100,6 +105,7 @@
   on:pointerdown={handlePointerDown}
   on:pointermove={handlePointerMove}
   on:pointerup={handlePointerUp}
+  on:pointercancel={handlePointerCancel}
 >
   <g transform="translate({viewX}, {viewY}) scale({zoom})">
     <!-- Existing drawings -->

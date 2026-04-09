@@ -142,7 +142,7 @@ export class TouchZoom {
         },
         drag: {
           filterTaps: false,
-          pointer: { keys: false, buttons: 4 },
+          pointer: { keys: false, buttons: 4, touch: true },
         },
       },
     );
@@ -282,15 +282,30 @@ export class TouchZoom {
     if (event instanceof WheelEvent) return;
 
     if (!this.#originPoint) return;
-    const delta = Vec.sub(this.#originPoint, origin);
-    const trueDelta = Vec.sub(delta, this.#delta);
-    this.#delta = delta;
 
+    // 1. Pan: track how the finger midpoint moves (screen → canvas coords)
+    const panDelta = Vec.sub(this.#originPoint, origin);
+    const panIncrement = Vec.sub(panDelta, this.#delta);
+    this.#delta = panDelta;
+
+    this.center = Vec.add(this.center, Vec.div(panIncrement, this.zoom));
+
+    // 2. Zoom: centered on the current pinch midpoint (same math as wheel zoom)
     const zoomLevel = movement[0] / this.#lastMovement;
     this.#lastMovement = movement[0];
 
-    this.center = Vec.add(this.center, Vec.div(trueDelta, this.zoom * 2));
-    this.zoom = Vec.clamp(this.zoom * zoomLevel, MIN_ZOOM, MAX_ZOOM);
+    const newZoom = Vec.clamp(this.zoom * zoomLevel, MIN_ZOOM, MAX_ZOOM);
+    if (newZoom !== this.zoom) {
+      // Keep the pinch midpoint stationary by adjusting center
+      const point = [
+        origin[0] - this.#bounds.minX,
+        origin[1] - this.#bounds.minY,
+      ];
+      const zoomShift = Vec.mul(point, 1 / this.zoom - 1 / newZoom);
+      this.center = Vec.add(this.center, zoomShift);
+      this.zoom = newZoom;
+    }
+
     this.#moved();
   };
 
@@ -309,6 +324,7 @@ export class TouchZoom {
     "drag",
     MouseEvent | PointerEvent | TouchEvent | KeyboardEvent
   > = ({ delta, elapsedTime }) => {
+    if (this.isPinching) return; // Don't pan during pinch-zoom
     if (delta[0] === 0 && delta[1] === 0 && elapsedTime < 200) return;
     this.center = Vec.sub(this.center, Vec.div(delta, this.zoom));
     this.#moved();

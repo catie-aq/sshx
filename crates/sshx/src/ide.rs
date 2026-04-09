@@ -87,7 +87,15 @@ pub fn spawn_sync_server(
     output_tx: mpsc::Sender<ClientMessage>,
 ) -> Result<IdeSyncHandle> {
     let (remote_tx, _) = broadcast::channel(64);
-    let port = find_free_port().context("failed to find a free port for IDE sync")?;
+
+    // Bind immediately so we hold the port — avoids TOCTOU between
+    // find_free_port() and the later async bind.
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .context("failed to bind IDE sync server port")?;
+    std_listener
+        .set_nonblocking(true)
+        .context("failed to set nonblocking on IDE sync listener")?;
+    let port = std_listener.local_addr()?.port();
 
     let state = Arc::new(SyncState {
         output_tx,
@@ -101,12 +109,11 @@ pub fn spawn_sync_server(
         .route("/unlock", post(post_unlock))
         .with_state(state);
 
-    let listener_addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
     tokio::spawn(async move {
-        let listener = match tokio::net::TcpListener::bind(listener_addr).await {
+        let listener = match tokio::net::TcpListener::from_std(std_listener) {
             Ok(l) => l,
             Err(e) => {
-                error!("IDE sync server failed to bind: {e}");
+                error!("IDE sync server failed to create tokio listener: {e}");
                 return;
             }
         };
@@ -282,21 +289,38 @@ impl IdeManager {
     }
 
     /// Returns the path to the bundled extensions directory.
+    ///
+    /// Search order:
+    ///   1. `<sshx-binary-dir>/extensions/`  — production package layout
+    ///   2. `<workspace>/extensions/`         — workspace contains the repo
+    ///   3. `<cwd>/extensions/`               — running from the repo root in dev
     fn extensions_dir(&self) -> PathBuf {
-        // Look for extensions/ next to the sshx binary, or in the workspace.
         let exe_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
             .unwrap_or_else(|| PathBuf::from("."));
+
         let bundled = exe_dir.join("extensions");
         if bundled.exists() {
             return bundled;
         }
-        // Fallback: check workspace root.
+
         let ws_ext = self.workspace_dir.join("extensions");
         if ws_ext.exists() {
             return ws_ext;
         }
+
+        // Development fallback: look in the current working directory.
+        // When running `cargo run -p sshx` from the repo root, this finds
+        // `./extensions/sshx-collab/` without requiring the binary to be
+        // co-located with the extension sources.
+        if let Ok(cwd) = std::env::current_dir() {
+            let cwd_ext = cwd.join("extensions");
+            if cwd_ext.exists() {
+                return cwd_ext;
+            }
+        }
+
         bundled
     }
 

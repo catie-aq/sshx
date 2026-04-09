@@ -56,11 +56,28 @@ impl SshxService for GrpcServer {
         if origin.is_empty() {
             return Err(Status::invalid_argument("origin is empty"));
         }
-        let name = rand_alphanumeric(10);
+        let name = if let Some(ref slug) = request.custom_name {
+            // Validate: 2–40 chars, alphanumeric / hyphens / underscores only.
+            if slug.len() < 2 || slug.len() > 40 {
+                return Err(Status::invalid_argument(
+                    "custom name must be 2–40 characters",
+                ));
+            }
+            if !slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                return Err(Status::invalid_argument(
+                    "custom name may only contain letters, digits, hyphens, and underscores",
+                ));
+            }
+            slug.clone()
+        } else {
+            rand_alphanumeric(10)
+        };
         info!(%name, "creating new session");
 
         match self.0.lookup(&name) {
-            Some(_) => return Err(Status::already_exists("generated duplicate ID")),
+            Some(_) => return Err(Status::already_exists(
+                "session name already in use, try a different --slug",
+            )),
             None => {
                 let metadata = Metadata {
                     encrypted_zeros: request.encrypted_zeros,

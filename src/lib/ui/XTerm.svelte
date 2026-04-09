@@ -53,11 +53,13 @@
     close: void;
     shrink: void;
     expand: void;
+    maximize: void;
     bringToFront: void;
-    startMove: MouseEvent;
+    startMove: PointerEvent;
     focus: void;
     blur: void;
     nameChange: string;
+    titleChange: string;
   }>();
 
   const typeahead = new TypeAheadAddon();
@@ -65,6 +67,8 @@
   export let rows: number, cols: number;
   export let write: (data: string) => void; // bound function prop
   export let shellName: string = "";
+  export let mobileSelected: boolean = false;
+  export let mobileFullscreen: boolean = false;
 
   let localName = shellName;
   $: localName = shellName;
@@ -86,7 +90,7 @@
   let currentTitle = "Remote Terminal";
 
   $: if (term) {
-    term.options.fontSize = collapsed ? 7 : 14;
+    term.options.fontSize = collapsed ? 7 : mobileFullscreen ? 11 : 14;
   }
 
   function handleWheelSkipXTerm(event: WheelEvent) {
@@ -212,6 +216,7 @@
     term.resize(cols, rows);
     term.onTitleChange((title) => {
       currentTitle = title;
+      dispatch("titleChange", title);
     });
 
     // Hack: We artificially disable scrolling when the terminal is not focused.
@@ -257,33 +262,29 @@
 <div
   class="term-container"
   class:focused
+  class:mobile-selected={mobileSelected}
   style:background={theme.background}
-  on:mousedown={() => dispatch("bringToFront")}
-  on:pointerdown={(event) => event.stopPropagation()}
+  on:pointerdown={(event) => { dispatch("bringToFront"); event.stopPropagation(); }}
 >
   <div
-    class="flex select-none cursor-grab active:cursor-grabbing"
-    on:mousedown={(event) => dispatch("startMove", event)}
-    on:dblclick={() => (collapsed = !collapsed)}
+    class="flex select-none cursor-grab active:cursor-grabbing touch-none"
+    on:pointerdown={(event) => { if (event.isPrimary) dispatch("startMove", event); }}
+    on:contextmenu|preventDefault
   >
     <div class="flex-1 flex items-center px-3">
       <CircleButtons>
-        <!--
-          TODO: This should be on:click, but that is not working due to the
-          containing element's on:pointerdown `stopPropagation()` call.
-        -->
         <CircleButton
           kind="red"
-          on:mousedown={(event) => event.button === 0 && dispatch("close")}
+          on:click={() => dispatch("close")}
         />
         {#if !collapsed}
           <CircleButton
             kind="yellow"
-            on:mousedown={(event) => event.button === 0 && dispatch("shrink")}
+            on:click={() => dispatch("shrink")}
           />
           <CircleButton
             kind="green"
-            on:mousedown={(event) => event.button === 0 && dispatch("expand")}
+            on:click={() => dispatch("maximize")}
           />
         {/if}
       </CircleButtons>
@@ -311,20 +312,38 @@
       on:pointerdown|stopPropagation
     />
   </div>
-  <div
-    class="inline-block transition-opacity duration-500"
-    class:px-4={!collapsed} class:py-2={!collapsed}
-    class:px-1={collapsed}  class:py-0={collapsed}
-    bind:this={termEl}
-    style:opacity={loaded ? 1.0 : 0.0}
-    on:wheel={(event) => {
-      if (focused) {
-        // Don't pan the page when scrolling while the terminal is selected.
-        // Conversely, we manually disable terminal scrolling unless it is currently selected.
-        event.stopPropagation();
-      }
-    }}
-  />
+  <div class="relative">
+    <div
+      class="inline-block transition-opacity duration-500"
+      class:px-4={!collapsed} class:py-2={!collapsed}
+      class:px-1={collapsed}  class:py-0={collapsed}
+      bind:this={termEl}
+      style:opacity={loaded ? 1.0 : 0.0}
+      on:wheel={(event) => {
+        if (focused) {
+          // Don't pan the page when scrolling while the terminal is selected.
+          // Conversely, we manually disable terminal scrolling unless it is currently selected.
+          event.stopPropagation();
+        }
+      }}
+    />
+    {#if focused && !collapsed}
+      <button
+        class="absolute bottom-1.5 right-1.5 z-10 w-6 h-6 rounded-full bg-zinc-700/80 text-zinc-400 flex items-center justify-center hover:bg-zinc-600 active:bg-zinc-500 transition-colors shadow-lg backdrop-blur-sm"
+        on:mousedown|preventDefault|stopPropagation
+        on:pointerdown|stopPropagation
+        on:click|stopPropagation={() => {
+          if (term) term.scrollToBottom();
+        }}
+        title="Scroll to bottom"
+      >
+        <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+          <path d="M4 6l4 4 4-4" />
+          <path d="M4 10l4 4 4-4" />
+        </svg>
+      </button>
+    {/if}
+  </div>
 </div>
 
 <style lang="postcss">
@@ -340,5 +359,10 @@
   .term-container.focused {
     @apply opacity-100 border-indigo-500/70;
     box-shadow: 0 0 0 1px rgba(99, 102, 241, 0.3), 0 0 12px rgba(99, 102, 241, 0.15);
+  }
+
+  .term-container.mobile-selected {
+    @apply opacity-100 border-amber-400/70;
+    box-shadow: 0 0 0 2px rgba(251, 191, 36, 0.3), 0 0 16px rgba(251, 191, 36, 0.15);
   }
 </style>

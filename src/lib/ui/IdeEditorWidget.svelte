@@ -132,6 +132,25 @@
     minimized = false;
     dispatch("resize", { w: preMinW || 800, h: preMinH || 500 });
   }
+
+  /** Forward mousemove from inside the iframe to the parent window.
+   *  Same-origin access lets us listen directly on contentWindow. */
+  function setupIframeCursorBridge() {
+    if (!iframeEl?.contentWindow) return;
+    try {
+      iframeEl.contentWindow.addEventListener("mousemove", (e: MouseEvent) => {
+        const rect = iframeEl.getBoundingClientRect();
+        const synth = new MouseEvent("mousemove", {
+          clientX: rect.left + e.clientX,
+          clientY: rect.top + e.clientY,
+          bubbles: true,
+        });
+        window.dispatchEvent(synth);
+      });
+    } catch {
+      // Cross-origin fallback — should not happen with allow-same-origin
+    }
+  }
 </script>
 
 <svelte:window on:mouseup={handleMouseup} />
@@ -236,6 +255,7 @@
         title="VS Code IDE"
         class="w-full h-full border-none bg-zinc-900"
         sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads"
+        on:load={setupIframeCursorBridge}
       />
     </div>
   {/if}

@@ -8,6 +8,7 @@
     FileTextIcon,
     FolderIcon,
     GlobeIcon,
+    MaximizeIcon,
     MessageSquareIcon,
     MonitorIcon,
     PlayCircleIcon,
@@ -27,6 +28,7 @@
   export let workspaceOpen: boolean = false;
   export let claudeInstances: Map<string, { events: unknown[]; transcriptPath: string | null; sessionName: string | null; widgetName: string | null; fileMtime: number | null; closed: boolean }> = new Map();
   export let claudeActive: boolean = false;
+  export let autoOpenClaude: boolean = false;
 
   export let isSharing: boolean = false;
   export let appOverlayOpen: boolean = false;
@@ -44,6 +46,11 @@
   /** Active IDE editor widgets: [wid, label]. */
   export let ideEditors: [number, string][] = [];
 
+  /** Whether we are on a touch/mobile device. */
+  export let mobile: boolean = false;
+  /** Whether there is at least one terminal available for fullscreen. */
+  export let hasTerminals: boolean = false;
+
   const dispatch = createEventDispatcher<{
     create: void;
     chat: void;
@@ -56,6 +63,7 @@
     toggleWorkspace: void;
     openClaudeInstance: string;
     resumeClaudeInTerminal: string;
+    toggleAutoOpenClaude: void;
     search: void;
     startScreenShare: void;
     stopScreenShare: void;
@@ -64,6 +72,7 @@
     openIde: void;
     focusIde: number;
     majorModeChange: "none" | "edition" | "slides";
+    fullscreenTerminal: void;
   }>();
 
   const DRAWING_COLORS = [
@@ -89,19 +98,20 @@
 
 <svelte:window on:click={handleWindowClick} />
 
-<div class="toolbar-container">
+<div class="toolbar-container" class:mobile>
   <!-- Primary bar -->
-  <div class="panel inline-block px-3 py-2">
-    <div class="flex items-center select-none">
-      <a href="/" class="flex-shrink-0"
-        ><img src={logo} alt="sshx logo" class="h-10" /></a
-      >
-      <p class="ml-1.5 mr-2 font-medium">sshx</p>
-
-      <div class="v-divider" />
+  <div class="panel primary-bar" class:mobile-bar={mobile}>
+    <div class="flex items-center select-none" class:mobile-scroll={mobile}>
+      {#if !mobile}
+        <a href="/" class="flex-shrink-0"
+          ><img src={logo} alt="sshx logo" class="h-10" /></a
+        >
+        <p class="ml-1.5 mr-2 font-medium">sshx</p>
+        <div class="v-divider" />
+      {/if}
 
       <!-- Group 1: Windowed elements -->
-      <div class="flex space-x-1">
+      <div class="flex space-x-1 flex-shrink-0">
         <!-- Terminal: new terminal -->
         <button
           class="icon-button"
@@ -168,10 +178,22 @@
         </div>
       </div>
 
+      <!-- Mobile: fullscreen terminal button -->
+      {#if mobile && hasTerminals}
+        <button
+          class="icon-button fullscreen-btn"
+          on:click={() => dispatch("fullscreenTerminal")}
+          disabled={!connected}
+          title="Fullscreen terminal"
+        >
+          <MaximizeIcon strokeWidth={1.5} class="p-0.5" />
+        </button>
+      {/if}
+
       <div class="v-divider" />
 
       <!-- Group 2: Information elements -->
-      <div class="flex space-x-1">
+      <div class="flex space-x-1 flex-shrink-0">
         <!-- Search -->
         <button class="icon-button" on:click={() => dispatch("search")} title="Search (Ctrl+K)">
           <SearchIcon strokeWidth={1.5} class="p-0.5" />
@@ -194,6 +216,7 @@
           {#if claudeDropdownOpen}
             <ClaudeInstanceList
               instances={claudeInstances}
+              {autoOpenClaude}
               on:openInstance={({ detail: sid }) => {
                 dispatch("openClaudeInstance", sid);
                 claudeDropdownOpen = false;
@@ -202,6 +225,7 @@
                 dispatch("resumeClaudeInTerminal", sid);
                 claudeDropdownOpen = false;
               }}
+              on:toggleAutoOpen={() => dispatch("toggleAutoOpenClaude")}
               on:close={() => (claudeDropdownOpen = false)}
             />
           {/if}
@@ -234,7 +258,7 @@
       <div class="v-divider" />
 
       <!-- Group 3: Social elements -->
-      <div class="flex space-x-1">
+      <div class="flex space-x-1 flex-shrink-0">
         <!-- Chat -->
         <button class="icon-button" on:click={() => dispatch("chat")} title="Chat">
           <MessageSquareIcon strokeWidth={1.5} class="p-0.5" />
@@ -281,7 +305,7 @@
       <div class="v-divider" />
 
       <!-- Group 4: Settings / Network -->
-      <div class="flex space-x-1">
+      <div class="flex space-x-1 flex-shrink-0">
         <button class="icon-button" on:click={() => dispatch("settings")} title="Settings">
           <SettingsIcon strokeWidth={1.5} class="p-0.5" />
         </button>
@@ -294,8 +318,8 @@
 
   <!-- Second bar: Edition tools (visible when edition mode is active) -->
   {#if majorMode === "edition"}
-    <div class="panel inline-block px-3 py-1.5 mt-1">
-      <div class="flex items-center space-x-1 select-none">
+    <div class="panel inline-block px-3 py-1.5 mt-1" class:mobile-bar={mobile}>
+      <div class="flex items-center space-x-1 select-none" class:mobile-scroll={mobile}>
         <!-- Text tool (T) -->
         <button
           class="sub-button"
@@ -371,8 +395,29 @@
     @apply flex flex-col items-center;
   }
 
+  .toolbar-container.mobile {
+    @apply items-stretch;
+  }
+
+  .primary-bar {
+    @apply inline-block px-3 py-2;
+  }
+
+  .mobile-bar {
+    @apply block px-2 py-1.5 rounded-none border-x-0 border-t-0;
+  }
+
+  .mobile-scroll {
+    @apply overflow-x-auto flex-nowrap;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .mobile-scroll::-webkit-scrollbar {
+    display: none;
+  }
+
   .v-divider {
-    @apply h-5 mx-2 border-l-4 border-zinc-800;
+    @apply h-5 mx-2 border-l-4 border-zinc-800 flex-shrink-0;
   }
 
   .v-divider-sm {
@@ -380,8 +425,12 @@
   }
 
   .icon-button {
-    @apply relative rounded-md p-1 hover:bg-zinc-700 active:bg-indigo-700 transition-colors;
+    @apply relative rounded-md p-1 hover:bg-zinc-700 active:bg-indigo-700 transition-colors flex-shrink-0;
     @apply disabled:opacity-50 disabled:bg-transparent;
+  }
+
+  .fullscreen-btn {
+    @apply bg-indigo-700/60 hover:bg-indigo-600 ml-1;
   }
 
   .mode-active {

@@ -85,6 +85,7 @@ impl Controller {
         session_dir: Option<PathBuf>,
         openvscode_bin: Option<PathBuf>,
         workspace_dir: Option<PathBuf>,
+        custom_name: Option<String>,
     ) -> Result<Self> {
         debug!(%origin, "connecting to server");
         let encryption_key = rand_alphanumeric(14); // 83.3 bits of entropy
@@ -140,6 +141,7 @@ impl Controller {
             name: name.into(),
             write_password_hash,
             restore_snapshot: restore_snapshot.map(Into::into),
+            custom_name,
         };
         let mut resp = client.open(req).await?.into_inner();
         resp.url = resp.url + "#" + &encryption_key;
@@ -338,7 +340,7 @@ impl Controller {
                     spawn_update_widget_name(req.instance_id, req.name);
                 }
                 ServerMessage::ImageFile(img) => {
-                    spawn_save_image_file(img.name, img.data.to_vec());
+                    spawn_save_image_file(img.name, img.data.to_vec(), img.old_name);
                 }
                 ServerMessage::SessionSnapshot(bytes) => {
                     self.save_session_snapshot(&bytes).await;

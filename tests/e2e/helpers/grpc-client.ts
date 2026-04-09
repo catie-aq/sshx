@@ -189,3 +189,87 @@ export function simulateIdeCli(
     call.end();
   };
 }
+
+/**
+ * Simulate a CLI client that creates a shell, so the browser sees a terminal.
+ *
+ * Opens a Channel() stream, sends Hello + CreatedShell, and optionally sends
+ * terminal data. Returns a cleanup function.
+ */
+export function simulateCliWithShell(
+  endpoint: string,
+  name: string,
+  token: string,
+  opts?: { shellId?: number; x?: number; y?: number; data?: string }
+): () => void {
+  const client = getSshxServiceClient(endpoint);
+  const call = client.channel();
+
+  call.on("error", (err: Error) => {
+    if ((err as any).code === grpc.status.CANCELLED) return;
+    if ((err as any).code === grpc.status.UNAVAILABLE) return;
+    console.warn("simulateCliWithShell stream error:", err.message);
+  });
+
+  // Send Hello
+  call.write({ hello: `${name},${token}` });
+
+  // Create a shell
+  const shellId = opts?.shellId ?? 1;
+  call.write({
+    createdShell: {
+      id: shellId,
+      x: opts?.x ?? 0,
+      y: opts?.y ?? 0,
+    },
+  });
+
+  // Optionally send some terminal data so the terminal has content
+  if (opts?.data) {
+    call.write({
+      data: {
+        id: shellId,
+        data: Buffer.from(opts.data),
+        seq: 0,
+      },
+    });
+  }
+
+  return () => {
+    call.end();
+  };
+}
+
+/**
+ * Like simulateCliWithShell but creates multiple shells at once.
+ */
+export function simulateCliWithShells(
+  endpoint: string,
+  name: string,
+  token: string,
+  shellConfigs: { shellId: number; x?: number; y?: number; data?: string }[]
+): () => void {
+  const client = getSshxServiceClient(endpoint);
+  const call = client.channel();
+
+  call.on("error", (err: Error) => {
+    if ((err as any).code === grpc.status.CANCELLED) return;
+    if ((err as any).code === grpc.status.UNAVAILABLE) return;
+    console.warn("simulateCliWithShells stream error:", err.message);
+  });
+
+  call.write({ hello: `${name},${token}` });
+
+  for (const cfg of shellConfigs) {
+    call.write({
+      createdShell: { id: cfg.shellId, x: cfg.x ?? 0, y: cfg.y ?? 0 },
+    });
+    if (cfg.data) {
+      call.write({
+        data: { id: cfg.shellId, data: Buffer.from(cfg.data), seq: 0 },
+      });
+    }
+  }
+
+  return () => { call.end(); };
+}

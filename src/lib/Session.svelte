@@ -7,7 +7,7 @@
     afterUpdate,
     createEventDispatcher,
   } from "svelte";
-  import { fade } from "svelte/transition";
+  import { fade, fly } from "svelte/transition";
   import { debounce, throttle } from "lodash-es";
 
   import { Encrypt } from "./encrypt";
@@ -69,12 +69,231 @@
   // Terminal width and height limits.
   const TERM_MIN_ROWS = 8;
   const TERM_MIN_COLS = 32;
+  // Mobile fullscreen caps — prevent xterm.js from rendering too many rows/cols,
+  // which causes severe lag on mobile devices with tall viewports.
+  const MOBILE_MAX_ROWS = 60;
+  const MOBILE_MAX_COLS = 200;
 
   function getConstantOffset() {
     return [
       0.5 * window.innerWidth - CONSTANT_OFFSET_LEFT,
       0.5 * window.innerHeight - CONSTANT_OFFSET_TOP,
     ];
+  }
+
+  /** Svelte action: reparents the xterm container for a given shell ID into `node`,
+   *  and restores it to its original parent when destroyed or when the shell changes.
+   *  No pinch-zoom or pan — the terminal is resized to fit the container. */
+  function reparentTerm(node: HTMLElement, shellId: number) {
+    let currentId = shellId;
+    let termEl: HTMLElement | null = null;
+    let origParent: HTMLElement | null = null;
+    let origNextSibling: ChildNode | null = null;
+
+    /** Measure xterm cell size and compute how many rows/cols fit the container.
+     *
+     *  Cell size is measured from a real rendered character in the xterm DOM
+     *  (a `.xterm-char-measure-element` probe or a row span) so the result is
+     *  correct regardless of font-size changes or previous resize state. */
+    function computeFit() {
+      if (!termEl) return;
+      const xtermViewport = termEl.querySelector(".xterm-viewport") as HTMLElement | null;
+
+      // --- Measure cell dimensions from the actual rendered font ---
+      // xterm.js places a hidden probe element for measuring character size.
+      let cellW = 0, cellH = 0;
+      const probe = termEl.querySelector(".xterm-char-measure-element") as HTMLElement | null;
+      if (probe) {
+        // The probe contains a single character; its bounding rect gives exact cell size.
+        const rect = probe.getBoundingClientRect();
+        cellW = rect.width;
+        cellH = rect.height;
+      }
+      // Fallback: derive from xterm-screen and current effective dimensions.
+      if (cellW <= 0 || cellH <= 0) {
+        const xtermScreen = termEl.querySelector(".xterm-screen") as HTMLElement | null;
+        if (!xtermScreen) return;
+        const shell = shells.find(([id]) => id === currentId);
+        if (!shell) return;
+        const effectiveRows = fullscreenTermSize?.rows ?? shell[1].rows;
+        const effectiveCols = fullscreenTermSize?.cols ?? shell[1].cols;
+        if (effectiveRows <= 0 || effectiveCols <= 0) return;
+        cellW = xtermScreen.scrollWidth / effectiveCols;
+        cellH = xtermScreen.scrollHeight / effectiveRows;
+      }
+      if (cellW <= 0 || cellH <= 0) return;
+
+      // --- Measure available space ---
+      const scrollbarW = xtermViewport ? (xtermViewport.offsetWidth - xtermViewport.clientWidth) : 0;
+      const availW = Math.max(node.clientWidth - scrollbarW, 0);
+      const availH = Math.max(termEl.clientHeight, 0);
+      if (availW <= 0 || availH <= 0) return;
+
+      const fitCols = Math.min(Math.max(Math.floor(availW / cellW), TERM_MIN_COLS), MOBILE_MAX_COLS);
+      const fitRows = Math.min(Math.max(Math.floor(availH / cellH), TERM_MIN_ROWS), MOBILE_MAX_ROWS);
+      if (fullscreenTermSize?.rows === fitRows && fullscreenTermSize?.cols === fitCols) return;
+      fullscreenTermSize = { rows: fitRows, cols: fitCols };
+    }
+
+    let resizeObserver: ResizeObserver | null = null;
+    let reparentedEl: HTMLElement | null = null;
+
+    // Flick-scroll: translate single-finger vertical swipes into xterm scroll
+    let touchStartY = 0;
+    let touchLastY = 0;
+    let touchVelocity = 0;
+    let flickAnimId = 0;
+
+    function onTouchStart(e: TouchEvent) {
+      if (e.touches.length !== 1) return;
+      cancelAnimationFrame(flickAnimId);
+      touchStartY = e.touches[0].clientY;
+      touchLastY = touchStartY;
+      touchVelocity = 0;
+    }
+
+    function onTouchMove(e: TouchEvent) {
+      if (e.touches.length !== 1 || !termEl) return;
+      const y = e.touches[0].clientY;
+      const dy = touchLastY - y; // positive = scroll down
+      touchVelocity = dy;
+      touchLastY = y;
+      // Dispatch wheel event to xterm for live scrolling
+      const viewport = termEl.querySelector(".xterm-viewport") as HTMLElement | null;
+      if (viewport && Math.abs(dy) > 1) {
+        viewport.scrollTop += dy;
+      }
+    }
+
+    function onTouchEnd(_e: TouchEvent) {
+      // Flick: if velocity is significant, animate momentum scroll
+      if (!termEl || Math.abs(touchVelocity) < 2) return;
+      let v = touchVelocity * 2.5; // boost initial velocity for snappier flick
+      const viewport = termEl.querySelector(".xterm-viewport") as HTMLElement | null;
+      if (!viewport) return;
+      function step() {
+        v *= 0.95; // lighter friction = longer coast
+        if (Math.abs(v) < 0.5) return;
+        viewport!.scrollTop += v;
+        flickAnimId = requestAnimationFrame(step);
+      }
+      flickAnimId = requestAnimationFrame(step);
+    }
+
+    let hiddenDecorations: HTMLElement[] = [];
+
+    function attach(id: number) {
+      termEl = termElements[id] ?? null;
+      if (!termEl) return;
+      // The termEl is the xterm div inside .term-container; we reparent the
+      // whole .term-container so the title bar etc. come along.
+      const container = termEl.closest(".term-container") as HTMLElement | null;
+      reparentedEl = container ?? termEl;
+      origParent = reparentedEl.parentElement;
+      origNextSibling = reparentedEl.nextSibling;
+      node.appendChild(reparentedEl);
+      // Hide decorations (circle buttons title bar + name input row) — the
+      // fullscreen overlay has its own header with the terminal title.
+      hiddenDecorations = [];
+      if (reparentedEl !== termEl) {
+        for (const child of Array.from(reparentedEl.children)) {
+          if (child instanceof HTMLElement && child !== termEl && !child.contains(termEl)) {
+            child.style.display = "none";
+            hiddenDecorations.push(child);
+          }
+        }
+      }
+      // Force the terminal container to fill the fullscreen host
+      reparentedEl.style.width = "100%";
+      reparentedEl.style.height = "100%";
+      reparentedEl.style.display = "flex";
+      reparentedEl.style.flexDirection = "column";
+      reparentedEl.style.borderRadius = "0";
+      reparentedEl.style.border = "none";
+      reparentedEl.style.opacity = "1";
+      // Make the xterm div grow to fill remaining space with no wasted padding
+      termEl.style.flex = "1";
+      termEl.style.minHeight = "0";
+      termEl.style.padding = "2px 0";
+      termEl.style.boxSizing = "border-box";
+      // Enable flick-scroll touch handling
+      node.addEventListener("touchstart", onTouchStart, { passive: true });
+      node.addEventListener("touchmove", onTouchMove, { passive: true });
+      node.addEventListener("touchend", onTouchEnd, { passive: true });
+      // Compute fit after layout settles. We schedule multiple passes because
+      // the XTerm font size may change reactively (14→11 on mobile) after the
+      // reparent, so the first measurement can use stale cell dimensions.
+      requestAnimationFrame(() => computeFit());
+      setTimeout(() => computeFit(), 100);
+      setTimeout(() => computeFit(), 300);
+      // Re-compute on container resize (keyboard, orientation) AND on the
+      // xterm-screen element (catches font-size changes that resize cells).
+      resizeObserver = new ResizeObserver(() => computeFit());
+      resizeObserver.observe(node);
+      const xtermScreenEl = termEl.querySelector(".xterm-screen") as HTMLElement | null;
+      if (xtermScreenEl) resizeObserver.observe(xtermScreenEl);
+    }
+
+    /** Restore the current terminal to its canvas position and reset styles. */
+    function restoreTermToCanvas() {
+      resizeObserver?.disconnect();
+      resizeObserver = null;
+      if (!termEl || !reparentedEl) return;
+      // Restore hidden decorations (circle buttons + name input)
+      for (const el of hiddenDecorations) {
+        el.style.display = "";
+      }
+      hiddenDecorations = [];
+      // Restore styles on the container
+      reparentedEl.style.width = "";
+      reparentedEl.style.height = "";
+      reparentedEl.style.display = "";
+      reparentedEl.style.flexDirection = "";
+      reparentedEl.style.borderRadius = "";
+      reparentedEl.style.border = "";
+      reparentedEl.style.opacity = "";
+      // Restore styles on the xterm div
+      termEl.style.flex = "";
+      termEl.style.minHeight = "";
+      termEl.style.padding = "";
+      termEl.style.boxSizing = "";
+      // Move back to canvas. Use try/catch because origNextSibling may have
+      // been removed by Svelte's {#each} re-render during the switch.
+      if (origParent) {
+        try {
+          if (origNextSibling && origNextSibling.parentNode === origParent) {
+            origParent.insertBefore(reparentedEl, origNextSibling);
+          } else {
+            origParent.appendChild(reparentedEl);
+          }
+        } catch {
+          origParent.appendChild(reparentedEl);
+        }
+      }
+      termEl = null;
+      reparentedEl = null;
+      origParent = null;
+      origNextSibling = null;
+    }
+
+    attach(currentId);
+
+    return {
+      update(newId: number) {
+        if (newId === currentId) return;
+        restoreTermToCanvas();
+        currentId = newId;
+        attach(newId);
+      },
+      destroy() {
+        cancelAnimationFrame(flickAnimId);
+        node.removeEventListener("touchstart", onTouchStart);
+        node.removeEventListener("touchmove", onTouchMove);
+        node.removeEventListener("touchend", onTouchEnd);
+        fullscreenTermSize = null;
+        restoreTermToCanvas();
+      },
+    };
   }
 
   let fabricEl: HTMLElement;
@@ -94,9 +313,45 @@
   let filePickerScreenPos: [number, number] = [0, 0];
   let filePickerCanvasPos: [number, number] = [0, 0];
   let shellNames = new Map<number, string>(); // local-only terminal labels
+  let terminalTitles = new Map<number, string>(); // shell-reported titles (e.g. user@host:~/dir)
+
+  // Track mobile virtual keyboard height and actual viewport size via visualViewport API
+  let keyboardOffset = 0;
+  /** Actual visible viewport height in px (accounts for keyboard, browser chrome). */
+  let viewportHeight = typeof window !== "undefined" ? window.innerHeight : 0;
+
+  onMount(() => {
+    const vv = window.visualViewport;
+    if (vv) {
+      function updateViewport() {
+        keyboardOffset = window.innerHeight - (vv!.height + vv!.offsetTop);
+        if (keyboardOffset < 0) keyboardOffset = 0;
+        viewportHeight = vv!.height;
+      }
+      updateViewport();
+      vv.addEventListener("resize", updateViewport);
+      vv.addEventListener("scroll", updateViewport);
+      return () => {
+        vv.removeEventListener("resize", updateViewport);
+        vv.removeEventListener("scroll", updateViewport);
+      };
+    }
+  });
 
   onMount(() => {
     function handleGlobalKey(e: KeyboardEvent) {
+      // Escape: close drawer first, then exit fullscreen
+      if (e.key === "Escape" && fullscreenTermMenuOpen) {
+        fullscreenTermMenuOpen = false;
+        e.preventDefault();
+        return;
+      }
+      if (e.key === "Escape" && fullscreenTermId !== null) {
+        fullscreenTermId = null;
+        fullscreenTermMenuOpen = false;
+        e.preventDefault();
+        return;
+      }
       // Escape: exit fullscreen IDE
       if (e.key === "Escape" && fullscreenIdeWid !== null) {
         fullscreenIdeWid = null;
@@ -242,7 +497,6 @@
     touchZoom.onMove(() => {
       center = touchZoom.center;
       zoom = touchZoom.zoom;
-
       // Blur if the user is currently focused on a terminal.
       //
       // This makes it so that panning does not stop when the cursor happens to
@@ -291,6 +545,54 @@
   let movingOrigin = [0, 0]; // Coordinates of mouse at origin when drag started.
   let movingSize: WsWinsize; // New [x, y] position of the dragged terminal.
   let movingIsDone = false; // Moving finished but hasn't been acknowledged.
+
+  /** Whether the primary input is touch (coarse pointer). */
+  const isTouchDevice = typeof window !== "undefined" && window.matchMedia("(pointer: coarse)").matches;
+  /** Last tap timestamp per terminal ID, for double-tap detection. */
+  const lastMobileTapTime = new Map<number, number>();
+
+  /** Start a long-press gesture on a terminal title bar (mobile).
+   *  After 400ms without significant movement, vibrates and enters drag mode. */
+  function startMobileLongPress(id: number, event: PointerEvent, ws: WsWinsize) {
+    const startX = event.clientX;
+    const startY = event.clientY;
+    let cancelled = false;
+
+    const timer = setTimeout(() => {
+      if (cancelled) return;
+      navigator.vibrate?.(30);
+      const [cx, cy] = normalizePosition(event as unknown as MouseEvent);
+      moving = id;
+      movingOrigin = [cx - ws.x, cy - ws.y];
+      movingSize = ws;
+      movingIsDone = false;
+      cleanupEarly();
+    }, 400);
+
+    function onEarlyMove(e: PointerEvent) {
+      if (!e.isPrimary) return;
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+      if (dx * dx + dy * dy > 100) {
+        cancelled = true;
+        clearTimeout(timer);
+        cleanupEarly();
+      }
+    }
+    function onEarlyUp() {
+      cancelled = true;
+      clearTimeout(timer);
+      cleanupEarly();
+    }
+    function cleanupEarly() {
+      window.removeEventListener("pointermove", onEarlyMove);
+      window.removeEventListener("pointerup", onEarlyUp);
+      window.removeEventListener("pointercancel", onEarlyUp);
+    }
+    window.addEventListener("pointermove", onEarlyMove);
+    window.addEventListener("pointerup", onEarlyUp);
+    window.addEventListener("pointercancel", onEarlyUp);
+  }
 
   let resizing = -1; // Terminal ID that is being resized.
   let resizingOrigin = [0, 0]; // Coordinates of top-left origin when resize started.
@@ -642,7 +944,8 @@
     }),
   ] satisfies SearchItem[];
 
-  // Auto-open: when true, a FileCard is created for each file Claude reads.
+  // Auto-open: when true, Claude activity panels and FileCards are opened automatically.
+  let autoOpenClaude = false;
   let autoOpenCards = false;
   let autoOpenOffset = 0; // cascade so cards don't stack exactly on top of each other
 
@@ -872,7 +1175,7 @@
             claudeInstances = claudeInstances;
             // Auto-open the Claude activity panel for this session if we haven't
             // done so already in this browser session (prevents re-opening on reconnect).
-            if (hasWriteAccess && !autoOpenedClaudeSessions.has(sid)) {
+            if (autoOpenClaude && hasWriteAccess && !autoOpenedClaudeSessions.has(sid)) {
               autoOpenedClaudeSessions.add(sid);
               const alreadyOpen = [...widgets.values()].some(
                 (w) => w.kind.type === "claudeFeed" && (w.kind as any).instanceId === sid,
@@ -1352,6 +1655,95 @@
 
   let iceServers: RTCIceServer[] = [{ urls: "stun:stun.l.google.com:19302" }];
   let ideAvailable = false;
+  /** Shell ID of the terminal currently shown fullscreen (local-only, not synced). */
+  let fullscreenTermId: number | null = null;
+  /** Computed rows/cols that fit the fullscreen container. Set by reparentTerm action. */
+  let fullscreenTermSize: { rows: number; cols: number } | null = null;
+  /** Text input value for the fullscreen terminal mobile input bar. */
+  let fullscreenTermInput = "";
+  /** Whether the terminal switcher menu is open in fullscreen mode. */
+  let fullscreenTermMenuOpen = false;
+  /** Saved winsize before fullscreen, keyed by shell ID, for restore on exit. */
+  let preFullscreenShellId: number | null = null;
+  let preFullscreenWinsize: WsWinsize | null = null;
+  /** Suppresses the reactive resize sender during terminal switches. */
+  let fullscreenSwitching = false;
+
+  // When fullscreen size is computed, send the resize to the server so the
+  // CLI PTY adjusts and everyone sees the new dimensions.
+  $: if (fullscreenTermId !== null && fullscreenTermSize && srocket && !fullscreenSwitching) {
+    const shell = shells.find(([id]) => id === fullscreenTermId);
+    if (shell) {
+      const ws: WsWinsize = { ...shell[1], ...fullscreenTermSize };
+      srocket.send({ move: [fullscreenTermId, ws] });
+    }
+  }
+
+  // React to fullscreen enter/exit.
+  function onFullscreenChange(newId: number | null) {
+    if (!srocket) return;
+
+    if (newId !== null && preFullscreenShellId === null) {
+      // Entering fullscreen: save original size, hide cursor, set focus
+      const shell = shells.find(([id]) => id === newId);
+      if (shell) {
+        preFullscreenShellId = newId;
+        preFullscreenWinsize = { ...shell[1] };
+      }
+      srocket.send({ setCursor: null });
+      srocket.send({ setFocus: newId });
+    } else if (newId === null && preFullscreenShellId !== null) {
+      // Exiting fullscreen: restore original terminal size
+      if (preFullscreenWinsize) {
+        srocket.send({ move: [preFullscreenShellId, preFullscreenWinsize] });
+      }
+      preFullscreenShellId = null;
+      preFullscreenWinsize = null;
+    } else if (newId !== null && preFullscreenShellId !== null && newId !== preFullscreenShellId) {
+      // Switching terminals in fullscreen: restore old, save new
+      fullscreenSwitching = true;
+      if (preFullscreenWinsize) {
+        srocket.send({ move: [preFullscreenShellId, preFullscreenWinsize] });
+      }
+      const shell = shells.find(([id]) => id === newId);
+      if (shell) {
+        preFullscreenShellId = newId;
+        preFullscreenWinsize = { ...shell[1] };
+      }
+      srocket.send({ setFocus: newId });
+      // Re-enable resize sender after the switch settles
+      requestAnimationFrame(() => { fullscreenSwitching = false; });
+    }
+  }
+  $: onFullscreenChange(fullscreenTermId);
+
+  /** Send text from the fullscreen input bar to the active terminal. */
+  function sendFullscreenInput() {
+    if (fullscreenTermId === null || fullscreenTermInput.length === 0) return;
+    if (!hasWriteAccess) return;
+    const utf8 = new TextEncoder();
+    const data = utf8.encode(fullscreenTermInput + "\r");
+    handleInput(fullscreenTermId, data);
+    fullscreenTermInput = "";
+  }
+
+  /** Send just an Enter keystroke to the fullscreen terminal. */
+  function sendFullscreenEnter() {
+    if (fullscreenTermId === null) return;
+    if (!hasWriteAccess) return;
+    const utf8 = new TextEncoder();
+    handleInput(fullscreenTermId, utf8.encode("\r"));
+  }
+
+  /** Scroll the fullscreen terminal to the very bottom. */
+  function scrollFullscreenToBottom() {
+    if (fullscreenTermId === null) return;
+    const el = termElements[fullscreenTermId];
+    if (!el) return;
+    const viewport = el.querySelector(".xterm-viewport") as HTMLElement | null;
+    if (viewport) viewport.scrollTop = viewport.scrollHeight;
+  }
+
   /** Wid of the IDE widget currently shown fullscreen (local-only, not synced). */
   let fullscreenIdeWid: number | null = null;
   /** The ideId of the fullscreen IDE widget, used to build the correct iframe URL. */
@@ -1536,6 +1928,12 @@
       srocket?.send(message);
     }, 80);
 
+    function handlePointer(event: PointerEvent) {
+      // Only track primary pointer for drag operations
+      if (!event.isPrimary) return;
+      handleMouse(event);
+    }
+
     function handleMouse(event: MouseEvent) {
       // Use else-if so only ONE drag operation runs per frame.
       // This prevents multiple widgets from moving simultaneously
@@ -1638,6 +2036,11 @@
 
       lastCanvasMousePos = normalizePosition(event);
       sendCursor({ setCursor: lastCanvasMousePos });
+    }
+
+    function handlePointerEnd(event: PointerEvent) {
+      if (!event.isPrimary) return;
+      handleMouseEnd(event);
     }
 
     function handleMouseEnd(event: MouseEvent) {
@@ -1759,10 +2162,16 @@
 
     window.addEventListener("mousemove", handleMouse);
     window.addEventListener("mouseup", handleMouseEnd);
+    window.addEventListener("pointermove", handlePointer);
+    window.addEventListener("pointerup", handlePointerEnd);
+    window.addEventListener("pointercancel", handlePointerEnd);
     document.body.addEventListener("mouseleave", handleMouseEnd);
     return () => {
       window.removeEventListener("mousemove", handleMouse);
       window.removeEventListener("mouseup", handleMouseEnd);
+      window.removeEventListener("pointermove", handlePointer);
+      window.removeEventListener("pointerup", handlePointerEnd);
+      window.removeEventListener("pointercancel", handlePointerEnd);
       document.body.removeEventListener("mouseleave", handleMouseEnd);
     };
   });
@@ -1799,7 +2208,8 @@
               srocket?.send({ updateFileMetadata: [hoveredFilePath, { imagePath: url }] });
             } else {
               const [cx, cy] = lastCanvasMousePos ?? [0, 0];
-              const defaultName = blob.name || `paste-${Date.now()}.png`;
+              const ext = (blob.name?.split(".").pop() || "png").toLowerCase();
+              const defaultName = `image-${Date.now()}.${ext}`;
               srocket?.send({ createImageWidget: [cx, cy, url, defaultName, defaultName] });
             }
           } catch (err) {
@@ -1831,9 +2241,15 @@
   on:wheel={(event) => event.preventDefault()}
 >
   <div
-    class="absolute top-8 inset-x-0 flex justify-center pointer-events-none z-10"
+    class="absolute inset-x-0 pointer-events-none z-10"
+    class:top-0={isTouchDevice}
+    class:top-8={!isTouchDevice}
+    class:flex={!isTouchDevice}
+    class:justify-center={!isTouchDevice}
   >
     <Toolbar
+      mobile={isTouchDevice}
+      hasTerminals={shells.length > 0}
       {connected}
       {newMessages}
       {hasWriteAccess}
@@ -1843,6 +2259,7 @@
       hiddenStreamCount={0}
       claudeInstances={claudeInstances}
       {claudeActive}
+      {autoOpenClaude}
       on:create={handleCreate}
       {textToolActive}
       {drawingTool}
@@ -1869,6 +2286,7 @@
       on:resumeClaudeInTerminal={({ detail: sid }) => {
         handleCreateWithInput(`claude --resume ${sid}`);
       }}
+      on:toggleAutoOpenClaude={() => { autoOpenClaude = !autoOpenClaude; }}
       {ideAvailable}
       {ideEditors}
       on:toggleAppOverlay={handleToggleAppOverlay}
@@ -1913,6 +2331,11 @@
       on:startScreenShare={handleStartScreenShare}
       on:stopScreenShare={handleStopScreenShare}
       on:showStreams={() => {}}
+      on:fullscreenTerminal={() => {
+        // Fullscreen the focused terminal, or the first one available
+        const target = focused.length > 0 ? focused[focused.length - 1] : (shells.length > 0 ? shells[0][0] : null);
+        if (target !== null) fullscreenTermId = target;
+      }}
     />
 
     {#if showNetworkInfo}
@@ -1954,8 +2377,8 @@
   <!-- Bottom-right panel column: Chat -->
   {#if showChat}
     <div
-      class="absolute bottom-4 right-4 z-10 w-80 flex flex-col gap-2 pointer-events-none"
-      style="max-height: calc(100vh - 80px);"
+      class="absolute right-4 z-10 w-80 flex flex-col gap-2 pointer-events-none"
+      style="bottom: {16 + keyboardOffset}px; max-height: calc(100vh - 80px - {keyboardOffset}px);"
     >
       <div class="flex-1 min-h-0 flex flex-col pointer-events-auto">
         <Chat
@@ -2057,7 +2480,8 @@
     />
 
     {#each shells as [id, winsize] (id)}
-      {@const ws = id === resizing ? resizingSize : id === moving ? movingSize : winsize}
+      {@const baseWs = id === resizing ? resizingSize : id === moving ? movingSize : winsize}
+      {@const ws = (id === fullscreenTermId && fullscreenTermSize) ? { ...baseWs, ...fullscreenTermSize } : baseWs}
       <div
         class="absolute"
         style:left={OFFSET_LEFT_CSS}
@@ -2072,10 +2496,15 @@
           rows={ws.rows}
           cols={ws.cols}
           shellName={shellNames.get(id) ?? ""}
+          mobileFullscreen={isTouchDevice && id === fullscreenTermId}
           bind:write={writers[id]}
           bind:termEl={termElements[id]}
           on:nameChange={({ detail: name }) => {
             srocket?.send({ setShellName: [id, name] });
+          }}
+          on:titleChange={({ detail: title }) => {
+            terminalTitles.set(id, title);
+            terminalTitles = terminalTitles;
           }}
           on:data={({ detail: data }) =>
             hasWriteAccess && handleInput(id, data)}
@@ -2090,9 +2519,11 @@
           }}
           on:expand={() => {
             if (!hasWriteAccess) return;
-            const rows = ws.rows + 4;
-            const cols = ws.cols + 10;
-            srocket?.send({ move: [id, { ...ws, rows, cols }] });
+            const rows = Math.min(ws.rows + 4, MOBILE_MAX_ROWS);
+            const cols = Math.min(ws.cols + 10, MOBILE_MAX_COLS);
+            if (rows !== ws.rows || cols !== ws.cols) {
+              srocket?.send({ move: [id, { ...ws, rows, cols }] });
+            }
           }}
           on:bringToFront={() => {
             if (!hasWriteAccess) return;
@@ -2101,11 +2532,27 @@
           }}
           on:startMove={({ detail: event }) => {
             if (!hasWriteAccess) return;
-            const [x, y] = normalizePosition(event);
-            moving = id;
-            movingOrigin = [x - ws.x, y - ws.y];
-            movingSize = ws;
-            movingIsDone = false;
+            if (isTouchDevice) {
+              const now = Date.now();
+              const lastTap = lastMobileTapTime.get(id) ?? 0;
+              lastMobileTapTime.set(id, now);
+              if (now - lastTap < 350) {
+                lastMobileTapTime.delete(id);
+                fullscreenTermId = id;
+              } else {
+                startMobileLongPress(id, event, ws);
+              }
+            } else {
+              const [x, y] = normalizePosition(event);
+              moving = id;
+              movingOrigin = [x - ws.x, y - ws.y];
+              movingSize = ws;
+              movingIsDone = false;
+            }
+          }}
+          on:maximize={() => {
+            if (!hasWriteAccess) return;
+            fullscreenTermId = id;
           }}
           on:focus={() => {
             if (!hasWriteAccess) return;
@@ -2116,11 +2563,16 @@
           }}
         />
 
-        <!-- User avatars -->
-        <div class="absolute bottom-2.5 right-2.5 pointer-events-none">
+        <!-- User avatars + fullscreen indicators -->
+        <div class="absolute bottom-2.5 right-2.5 pointer-events-none flex flex-col items-end gap-1">
+          {#each users.filter(([uid, u]) => uid !== userId && u.focus === id && u.cursor === null) as [, viewer]}
+            <div class="text-[9px] bg-zinc-800/80 text-zinc-400 px-1.5 py-0.5 rounded-full whitespace-nowrap backdrop-blur-sm border border-zinc-700/50">
+              {viewer.name} is viewing full-screen
+            </div>
+          {/each}
           <Avatars
             users={users.filter(
-              ([uid, user]) => uid !== userId && user.focus === id,
+              ([uid, user]) => uid !== userId && user.focus === id && user.cursor !== null,
             )}
           />
         </div>
@@ -2128,7 +2580,8 @@
         <!-- Interactable element for resizing -->
         <div
           class="absolute w-5 h-5 -bottom-1 -right-1 cursor-nwse-resize select-none"
-          on:mousedown={(event) => {
+          on:pointerdown={(event) => {
+            event.stopPropagation();
             const canvasEl = termElements[id].querySelector(".xterm-screen");
             if (canvasEl) {
               resizing = id;
@@ -2138,7 +2591,6 @@
               resizingSize = ws;
             }
           }}
-          on:pointerdown={(event) => event.stopPropagation()}
         />
       </div>
     {/each}
@@ -2392,8 +2844,9 @@
             on:delete={() => srocket?.send({ closeWidget: wid })}
             on:rename={({ detail: newName }) => {
               if (!hasWriteAccess) return;
+              const oldName = widget.name ?? "";
               srocket?.send({ setWidgetName: [wid, newName] });
-              srocket?.send({ pushImageWidget: [wid, newName] });
+              srocket?.send({ pushImageWidget: [wid, newName, oldName] });
             }}
           />
         {:else if widget.kind.type === "appOverlay"}
@@ -2667,6 +3120,156 @@
       }}
       on:close={() => (filePickerOpen = false)}
     />
+  {/if}
+
+  <!-- Fullscreen terminal overlay (local-only, outside canvas transform) -->
+  {#if fullscreenTermId !== null}
+    {@const fsShellName = shellNames.get(fullscreenTermId) || ""}
+    {@const fsTermTitle = terminalTitles.get(fullscreenTermId) || ""}
+    {@const fsDisplayTitle = fsShellName
+      ? (fsTermTitle ? `${fsShellName} — ${fsTermTitle}` : fsShellName)
+      : (fsTermTitle || "Terminal")}
+    <div class="fixed inset-x-0 z-[100] flex flex-col bg-zinc-900"
+      style="top: 0; height: {viewportHeight}px;"
+    >
+      <!-- Compact title bar — z-10 to stay above reparented xterm -->
+      <div class="flex-shrink-0 flex items-center gap-1 border-b border-zinc-700/60 bg-zinc-900 px-2 py-1.5 select-none relative z-10">
+        <!-- Burger menu button -->
+        <button
+          class="flex flex-col gap-[3px] p-2 -m-0.5 rounded hover:bg-zinc-700 active:bg-zinc-600 transition-colors"
+          on:click={() => { fullscreenTermMenuOpen = !fullscreenTermMenuOpen; }}
+        >
+          <span class="block w-4 h-[2px] bg-zinc-300"></span>
+          <span class="block w-4 h-[2px] bg-zinc-300"></span>
+          <span class="block w-4 h-[2px] bg-zinc-300"></span>
+        </button>
+        <span class="flex-1 text-[11px] text-zinc-400 truncate text-center font-mono leading-tight">
+          {fsDisplayTitle}
+        </span>
+        <button
+          class="text-xs text-zinc-300 hover:text-white px-3 py-1.5 -m-0.5 bg-zinc-700 hover:bg-zinc-600 active:bg-zinc-500 rounded transition-colors"
+          on:click={() => { fullscreenTermId = null; fullscreenTermMenuOpen = false; }}
+        >
+          Exit
+        </button>
+      </div>
+      <!-- Terminal reparented here — takes all remaining space -->
+      <div
+        class="flex-1 min-h-0 overflow-hidden relative"
+        on:touchstart={(e) => {
+          // Swipe-right from left edge to open drawer
+          if (e.touches.length === 1 && e.touches[0].clientX < 30 && !fullscreenTermMenuOpen) {
+            const startX = e.touches[0].clientX;
+            function onMove(ev) {
+              const dx = ev.touches[0].clientX - startX;
+              if (dx > 50) {
+                fullscreenTermMenuOpen = true;
+                cleanup();
+              }
+            }
+            function onEnd() { cleanup(); }
+            function cleanup() {
+              window.removeEventListener("touchmove", onMove);
+              window.removeEventListener("touchend", onEnd);
+              window.removeEventListener("touchcancel", onEnd);
+            }
+            window.addEventListener("touchmove", onMove, { passive: true });
+            window.addEventListener("touchend", onEnd, { passive: true });
+            window.addEventListener("touchcancel", onEnd, { passive: true });
+          }
+        }}
+      >
+        <div
+          class="absolute inset-0"
+          use:reparentTerm={fullscreenTermId}
+        />
+        <!-- Scroll to bottom floating button -->
+        <button
+          class="absolute bottom-1.5 right-1.5 z-10 w-6 h-6 rounded-full bg-zinc-700/80 text-zinc-400 flex items-center justify-center hover:bg-zinc-600 active:bg-zinc-500 transition-colors shadow-lg backdrop-blur-sm"
+          on:click={scrollFullscreenToBottom}
+          title="Scroll to bottom"
+        >
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+            <path d="M4 6l4 4 4-4" />
+            <path d="M4 10l4 4 4-4" />
+          </svg>
+        </button>
+
+        <!-- Slide-in terminal drawer (swipe right or burger to open) -->
+        {#if fullscreenTermMenuOpen}
+          <!-- Backdrop -->
+          <div
+            class="absolute inset-0 z-20 bg-black/40"
+            on:click={() => { fullscreenTermMenuOpen = false; }}
+            on:keydown={() => {}}
+            transition:fade|local={{ duration: 150 }}
+          />
+          <!-- Drawer panel -->
+          <div
+            class="absolute top-0 left-0 bottom-0 z-30 w-56 bg-zinc-800 border-r border-zinc-700 shadow-2xl flex flex-col"
+            transition:fly|local={{ x: -224, duration: 200 }}
+          >
+            <div class="px-3 py-2 text-xs text-zinc-500 font-medium border-b border-zinc-700/50">
+              Terminals
+            </div>
+            <div class="flex-1 overflow-y-auto py-1">
+              {#each shells as [sid, _ws] (sid)}
+                {@const itemName = shellNames.get(sid) || ""}
+                {@const itemTitle = terminalTitles.get(sid) || ""}
+                <button
+                  class="w-full text-left px-3 py-2 text-xs transition-colors
+                    {sid === fullscreenTermId
+                      ? 'bg-indigo-600/30 text-indigo-300 border-l-2 border-indigo-400'
+                      : 'text-zinc-300 hover:bg-zinc-700 border-l-2 border-transparent'}"
+                  on:click={() => { fullscreenTermId = sid; fullscreenTermMenuOpen = false; }}
+                >
+                  <span class="block truncate font-medium">{itemName || `Terminal #${sid}`}</span>
+                  {#if itemTitle}
+                    <span class="block text-[10px] text-zinc-500 truncate font-mono mt-0.5">{itemTitle}</span>
+                  {/if}
+                </button>
+              {/each}
+            </div>
+          </div>
+        {/if}
+      </div>
+      <!-- Mobile text input bar -->
+      <div class="flex-shrink-0 flex items-center gap-1 border-t border-zinc-700/60 bg-zinc-800 px-1.5 py-1">
+        <input
+          class="flex-1 bg-zinc-900 text-zinc-100 text-xs rounded px-2 py-1 border border-zinc-600 focus:border-indigo-500 focus:outline-none min-w-0"
+          type="text"
+          enterkeyhint="send"
+          autocomplete="off"
+          autocorrect="off"
+          autocapitalize="off"
+          spellcheck="false"
+          placeholder="Type command…"
+          bind:value={fullscreenTermInput}
+          on:keydown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              sendFullscreenInput();
+            }
+          }}
+        />
+        <button
+          class="px-1.5 py-1 rounded text-xs font-medium transition-colors bg-zinc-700 text-zinc-300 hover:bg-zinc-600 active:bg-zinc-500 flex-shrink-0"
+          on:click={sendFullscreenEnter}
+          title="Send Enter key"
+        >
+          ↵
+        </button>
+        <button
+          class="px-2 py-1 rounded text-xs font-medium transition-colors flex-shrink-0
+            {fullscreenTermInput.length > 0
+              ? 'bg-indigo-600 text-white hover:bg-indigo-500 active:bg-indigo-700'
+              : 'bg-zinc-700 text-zinc-400 cursor-default'}"
+          on:click={sendFullscreenInput}
+        >
+          Send
+        </button>
+      </div>
+    </div>
   {/if}
 
   <!-- Fullscreen IDE overlay (local-only, outside canvas transform) -->

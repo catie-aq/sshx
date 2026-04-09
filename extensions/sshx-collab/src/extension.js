@@ -24,9 +24,6 @@ let sseResponse = null;
 /** @type {Map<string, vscode.TextEditorDecorationType>} */
 const cursorDecorations = new Map();
 
-/** Guard to prevent applying remote state from triggering a sendState loop. */
-let applyingRemoteState = false;
-
 /** User colors for remote cursors. */
 const CURSOR_COLORS = [
   "rgba(59,130,246,0.5)", // blue
@@ -109,9 +106,6 @@ function collectState() {
  * Send the current state to the sync endpoint (debounced).
  */
 function sendState() {
-  // Don't echo back when we're applying remote state.
-  if (applyingRemoteState) return;
-
   if (debounceTimer) clearTimeout(debounceTimer);
   debounceTimer = setTimeout(() => {
     const state = collectState();
@@ -196,9 +190,11 @@ function handleRemoteEvent(kind, dataStr) {
     const wrapper = JSON.parse(dataStr);
     if (kind === "state" && wrapper.data) {
       const state = wrapper.data;
+      // Only show cursor decorations — do NOT auto-navigate to the remote
+      // file or auto-scroll to the remote position. Forcing navigation
+      // whenever the collaborator switches files makes independent editing
+      // impossible (both editors would continuously chase each other).
       applyRemoteCursors(state);
-      applyRemoteFileOpen(state);
-      applyRemoteScroll(state);
     } else if (kind === "lock" && wrapper.data) {
       applyRemoteLock(wrapper.data);
     }
@@ -257,99 +253,14 @@ function applyRemoteCursors(state) {
 }
 
 /**
- * Open the remote user's active file if we don't already have it open.
- * @param {object} state
- */
-function applyRemoteFileOpen(state) {
-  if (!state.activeFile) return;
-
-  const activeEditor = vscode.window.activeTextEditor;
-  const currentFile = activeEditor
-    ? vscode.workspace.asRelativePath(activeEditor.document.uri, false)
-    : null;
-
-  // Only navigate if the remote user is looking at a different file.
-  if (currentFile === state.activeFile) return;
-
-  // Check if the file is already open in a tab — don't steal focus if so.
-  const tabGroups = vscode.window.tabGroups;
-  for (const group of tabGroups.all) {
-    for (const tab of group.tabs) {
-      if (tab.input && tab.input.uri) {
-        const rel = vscode.workspace.asRelativePath(tab.input.uri, false);
-        if (rel === state.activeFile && tab.isActive) return;
-      }
-    }
-  }
-
-  // Find the file in the workspace and open it.
-  const workspaceFolders = vscode.workspace.workspaceFolders;
-  if (!workspaceFolders || workspaceFolders.length === 0) return;
-
-  const fileUri = vscode.Uri.joinPath(
-    workspaceFolders[0].uri,
-    state.activeFile
-  );
-
-  applyingRemoteState = true;
-  vscode.window
-    .showTextDocument(fileUri, {
-      preview: true,
-      preserveFocus: true,
-    })
-    .then(
-      () => {
-        applyingRemoteState = false;
-      },
-      () => {
-        applyingRemoteState = false;
-      }
-    );
-}
-
-/**
- * Scroll to the remote user's visible range in the current file.
- * @param {object} state
- */
-function applyRemoteScroll(state) {
-  if (
-    !state.visibleRanges ||
-    !Array.isArray(state.visibleRanges) ||
-    state.visibleRanges.length === 0
-  )
-    return;
-
-  const activeEditor = vscode.window.activeTextEditor;
-  if (!activeEditor) return;
-
-  const currentFile = vscode.workspace.asRelativePath(
-    activeEditor.document.uri,
-    false
-  );
-
-  // Only apply scroll if the remote user is viewing the same file.
-  for (const vr of state.visibleRanges) {
-    const [path, startLine, endLine] = vr;
-    if (path !== currentFile) continue;
-
-    const range = new vscode.Range(
-      new vscode.Position(startLine, 0),
-      new vscode.Position(endLine, 0)
-    );
-
-    applyingRemoteState = true;
-    activeEditor.revealRange(range, vscode.TextEditorRevealType.AtTop);
-    applyingRemoteState = false;
-    break; // Apply only the first matching range.
-  }
-}
-
-/**
  * Show edit lock status in the status bar.
  * @param {object} lock — { holder, file, expiresAt }
  */
 function applyRemoteLock(lock) {
   if (lock.holder !== null && lock.holder !== undefined) {
+    // Skip expired locks (server auto-expires after 5 s; don't show stale UI).
+    const now = Date.now();
+    if (lock.expiresAt && lock.expiresAt < now) return;
     vscode.window.setStatusBarMessage(
       `🔒 Edit lock: ${lock.file || "unknown"} (user ${lock.holder})`,
       5000

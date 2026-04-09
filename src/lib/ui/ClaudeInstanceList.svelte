@@ -2,10 +2,12 @@
   import { createEventDispatcher } from "svelte";
 
   export let instances: Map<string, { events: unknown[]; transcriptPath: string | null; sessionName: string | null; widgetName: string | null; fileMtime: number | null; closed: boolean }>;
+  export let autoOpenClaude: boolean = false;
 
   const dispatch = createEventDispatcher<{
     openInstance: string;
     resumeInTerminal: string;
+    toggleAutoOpen: void;
     close: void;
   }>();
 
@@ -36,8 +38,17 @@
   use:clickOutside
   on:keydown={(e) => e.key === "Escape" && dispatch("close")}
 >
-  <div class="px-3 py-2 text-xs font-medium text-zinc-400 border-b border-zinc-800 select-none">
-    ✦ Claude Sessions
+  <div class="px-3 py-2 flex items-center justify-between border-b border-zinc-800 select-none">
+    <span class="text-xs font-medium text-zinc-400">✦ Claude Sessions</span>
+    <button
+      class="text-[10px] px-2 py-0.5 rounded-full transition-colors"
+      class:bg-indigo-700={autoOpenClaude}
+      class:text-indigo-200={autoOpenClaude}
+      class:bg-zinc-700={!autoOpenClaude}
+      class:text-zinc-400={!autoOpenClaude}
+      on:click|stopPropagation={() => dispatch("toggleAutoOpen")}
+      title={autoOpenClaude ? "Auto-open panels: ON" : "Auto-open panels: OFF"}
+    >auto-open</button>
   </div>
   {#if [...instances.values()].every((i) => i.closed)}
     <div class="px-3 py-3 text-xs text-zinc-500 text-center">No Claude sessions detected.</div>

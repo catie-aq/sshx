@@ -4,6 +4,64 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sshx_core::{Did, Nid, Sid, Slid, Tid, Uid, Vid, Wid};
 
+/// Serde helpers that accept both CBOR integers and floats for f32 fields.
+/// cbor-x (JavaScript) encodes whole-number floats (e.g. 2.0, 1.0) as CBOR
+/// integers, but ciborium's default f32 deserializer rejects them.
+mod flexible_f32 {
+    use serde::de::{Deserializer, SeqAccess, Visitor};
+
+    /// Newtype wrapper with a Deserialize that accepts both integers and floats.
+    struct Num(f32);
+
+    impl<'de> serde::Deserialize<'de> for Num {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V;
+            impl<'de> Visitor<'de> for V {
+                type Value = Num;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("a number (float or integer)")
+                }
+                fn visit_f32<E: serde::de::Error>(self, v: f32) -> Result<Num, E> {
+                    Ok(Num(v))
+                }
+                fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Num, E> {
+                    Ok(Num(v as f32))
+                }
+                fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Num, E> {
+                    Ok(Num(v as f32))
+                }
+                fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Num, E> {
+                    Ok(Num(v as f32))
+                }
+            }
+            d.deserialize_any(V)
+        }
+    }
+
+    pub fn scalar<'de, D: Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
+        use serde::Deserialize as _;
+        Num::deserialize(d).map(|n| n.0)
+    }
+
+    pub fn vec<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<f32>, D::Error> {
+        struct SeqV;
+        impl<'de> Visitor<'de> for SeqV {
+            type Value = Vec<f32>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a sequence of numbers")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<f32>, A::Error> {
+                let mut out = Vec::new();
+                while let Some(Num(v)) = seq.next_element::<Num>()? {
+                    out.push(v);
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_seq(SeqV)
+    }
+}
+
 /// Real-time message conveying the position and size of a terminal.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -299,12 +357,15 @@ pub struct WsDrawing {
     /// Tool type: "pencil" or "highlighter".
     pub tool: String,
     /// Flat array of points: [x0, y0, x1, y1, ...] in canvas coordinates.
+    #[serde(deserialize_with = "flexible_f32::vec")]
     pub points: Vec<f32>,
     /// CSS color string (e.g. "#ff0000" or "rgba(255,0,255,0.5)").
     pub color: String,
     /// Stroke width in pixels.
+    #[serde(deserialize_with = "flexible_f32::scalar")]
     pub width: f32,
     /// Opacity (0.0 to 1.0). Highlighter typically uses ~0.4.
+    #[serde(deserialize_with = "flexible_f32::scalar")]
     pub opacity: f32,
 }
 
@@ -544,8 +605,8 @@ pub enum WsClient {
     ReleaseBrowserControl(Vid),
     /// Create an image widget at canvas position (x, y) with URL, alt text, and optional filename for auto-push.
     CreateImageWidget(i32, i32, String, String, Option<String>),
-    /// Push an ImageWidget's image to the CLI with the given filename.
-    PushImageWidget(Wid, String),
+    /// Push an ImageWidget's image to the CLI with the given filename. (wid, new_name, old_name)
+    PushImageWidget(Wid, String, String),
     /// Request all connected overlay clients to flash a component by name.
     HighlightComponent(String),
     /// Open the app overlay widget at canvas position (x, y).
