@@ -28,7 +28,7 @@ struct Args {
     // ---- Session options (used when no subcommand is given) ---------------
 
     /// Address of the remote sshx server.
-    #[clap(long, default_value = "https://sshx.io", env = "SSHX_SERVER")]
+    #[clap(long, default_value = env!("SSHX_DEFAULT_SERVER_URL"), env = "SSHX_SERVER")]
     server: String,
 
     /// Local shell command to run in the terminal.

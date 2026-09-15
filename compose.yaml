@@ -23,37 +23,44 @@ services:
     container_name: sshx-backend
     network_mode: host
     working_dir: /app
-    user: "${UID:-1000}:${GID:-1000}"
+    environment:
+      - LOCAL_UID=${UID:-1000}
+      - LOCAL_GID=${GID:-1000}
+      - FIX_DIRS=/usr/local/cargo/registry:/app/target
     volumes:
       - .:/app
-      - ./homa-server2.gaur-toad.ts.net.crt:/certs/server.crt:ro
-      - ./homa-server2.gaur-toad.ts.net.key:/certs/server.key:ro
+      - ./${SSHX_HOST}.crt:/certs/server.crt:ro
+      - ./${SSHX_HOST}.key:/certs/server.key:ro
       - cargo-cache:/usr/local/cargo/registry
       - cargo-target:/app/target
+
     command: >
       cargo run --bin sshx-server --
-      --override-origin https://homa-server2.gaur-toad.ts.net:5173
-      --secret dev-secret
-      --admin-token dev-admin-token
-      --redis-url redis://localhost:12601
+      --override-origin https://${SSHX_HOST}:${SSHX_WEB_PORT}
+      --secret ${SSHX_SECRET}
+      --admin-token ${SSHX_ADMIN_TOKEN:-dev-admin-token}
+      --redis-url redis://localhost:${SSHX_REDIS_PORT}
       --listen 0.0.0.0
-      --host homa-server2.gaur-toad.ts.net
+      --host ${SSHX_HOST}
     depends_on:
       - redis
     restart: unless-stopped
 
   web:
-    image: node:18
+    image: node:20
     container_name: sshx-web
     network_mode: host
     working_dir: /app
-    user: "${UID:-1000}:${GID:-1000}"
     volumes:
       - .:/app
-      - ./homa-server2.gaur-toad.ts.net.crt:/certs/server.crt:ro
-      - ./homa-server2.gaur-toad.ts.net.key:/certs/server.key:ro
       - node-modules:/app/node_modules
     environment:
+      - SSHX_HOST=${SSHX_HOST}
+      - SSHX_WEB_PORT=${SSHX_WEB_PORT}
+      - SSHX_WEB_HOST=${SSHX_WEB_HOST}
+      - SSHX_SERVER_PORT=${SSHX_SERVER_PORT}
+      - TLS_CERT=${TLS_CERT}
+      - TLS_KEY=${TLS_KEY}
       - HOME=/tmp
     command: sh -c "git config --global --add safe.directory /app && npm install && npm run dev"
     depends_on:

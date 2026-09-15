@@ -46,15 +46,15 @@ XWIN_ARCH=x86,x86_64,aarch64 cargo xwin build -p sshx --release --target aarch64
 temp=$(mktemp)
 targets=(
   x86_64-unknown-linux-musl
-  aarch64-unknown-linux-musl
-  arm-unknown-linux-musleabihf
-  armv7-unknown-linux-musleabihf
-  x86_64-apple-darwin
-  aarch64-apple-darwin
-  x86_64-unknown-freebsd
-  x86_64-pc-windows-msvc
-  i686-pc-windows-msvc
-  aarch64-pc-windows-msvc
+#  aarch64-unknown-linux-musl
+#  arm-unknown-linux-musleabihf
+#  armv7-unknown-linux-musleabihf
+# x86_64-apple-darwin
+ # aarch64-apple-darwin
+ # x86_64-unknown-freebsd
+#  x86_64-pc-windows-msvc
+#  i686-pc-windows-msvc
+#  aarch64-pc-windows-msvc
 )
 for target in "${targets[@]}"
 do

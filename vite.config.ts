@@ -8,6 +8,19 @@ const commitHash = execSync("git rev-parse --short HEAD").toString().trim();
 
 const webPort = parseInt(process.env.SSHX_WEB_PORT || "5173", 10);
 const serverPort = parseInt(process.env.SSHX_SERVER_PORT || "8051", 10);
+const webHost = process.env.SSHX_WEB_HOST || "vps.burro-piranha.ts.net";
+
+function loadTls() {
+  const keyPath = process.env.TLS_KEY || "";
+  const certPath = process.env.TLS_CERT || "";
+  try {
+    if (!keyPath || !certPath) return undefined;
+    return { key: readFileSync(keyPath), cert: readFileSync(certPath) };
+  } catch {
+    return undefined;
+  }
+}
+const tls = loadTls();
 
 export default defineConfig({
   define: {
@@ -21,14 +34,13 @@ export default defineConfig({
   },
 
   server: {
+    host: "0.0.0.0",
     port: webPort,
     strictPort: true,
-    https: {
-      key: readFileSync("homa-server2.burro-piranha.ts.net.key"),
-      cert: readFileSync("homa-server2.burro-piranha.ts.net.crt"),
-    },
+    allowedHosts: [webHost],
+    https: tls,
     hmr: {
-      host: process.env.SSHX_HOST || "homa-server2.burro-piranha.ts.net",
+      host: webHost,
       port: webPort,
       protocol: "wss",
     },

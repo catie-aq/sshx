@@ -92,18 +92,31 @@
   </section>
 
   <div
-    class="mb-10 max-w-md border border-zinc-700 rounded-lg bg-zinc-900/80 p-5"
+    class="mb-10 max-w-lg border border-zinc-700 rounded-lg bg-zinc-900/80 p-5"
   >
     <h3 class="text-sm font-medium uppercase tracking-wide text-zinc-300 mb-2">
       Development Build
     </h3>
     <p class="text-sm text-zinc-400 mb-4">
       Latest dev binaries from the <code class="name">claude</code> branch (v0.5.0).
+      Build locally with <code class="name">scripts/build-all.sh</code>.
     </p>
+    <p class="text-xs text-zinc-500 mb-2">Linux</p>
+    <div class="flex flex-wrap gap-2 mb-3">
+      <DownloadLink href="/dist/sshx-0.5.0-linux-x86_64.tar.gz">Linux x86_64</DownloadLink>
+      <DownloadLink href="/dist/sshx-0.5.0-linux-aarch64.tar.gz">Linux ARM64</DownloadLink>
+      <DownloadLink href="/dist/sshx-0.5.0-linux-armv7.tar.gz">Linux ARMv7</DownloadLink>
+      <DownloadLink href="/dist/sshx-0.5.0-linux-armv6.tar.gz">Linux ARMv6</DownloadLink>
+    </div>
+    <p class="text-xs text-zinc-500 mb-2">Windows</p>
+    <div class="flex flex-wrap gap-2 mb-3">
+      <DownloadLink href="/dist/sshx-0.5.0-windows-x86_64.zip">Windows x86_64</DownloadLink>
+      <DownloadLink href="/dist/sshx-0.5.0-windows-x86.zip">Windows x86</DownloadLink>
+      <DownloadLink href="/dist/sshx-0.5.0-windows-aarch64.zip">Windows ARM64</DownloadLink>
+    </div>
+    <p class="text-xs text-zinc-500 mb-2">Other</p>
     <div class="flex flex-wrap gap-2">
-      <DownloadLink href="/dist/sshx-0.5.0-linux-x86_64.tar.gz"
-        >Linux x86_64</DownloadLink
-      >
+      <DownloadLink href="/dist/sshx-0.5.0-freebsd-x86_64.tar.gz">FreeBSD x86_64</DownloadLink>
     </div>
   </div>
 
