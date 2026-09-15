@@ -37,6 +37,7 @@ services:
       --secret ${SSHX_SECRET:-dev-secret}
       --redis-url redis://localhost:${SSHX_REDIS_PORT:-12602}
       --listen 0.0.0.0
+      --admin-token ${SSHX_ADMIN_TOKEN:-dev-admin-token}
       --host ${SSHX_HOST:-homa-server2.burro-piranha.ts.net}
     depends_on:
       - redis-dev

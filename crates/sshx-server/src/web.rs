@@ -2,11 +2,12 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Multipart, Path, State};
-use axum::http::StatusCode;
+use axum::extract::{Multipart, Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{any, get_service, post};
+use axum::routing::{any, get, get_service, post};
 use axum::{Json, Router};
+use serde::Deserialize;
 use serde_json::json;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::warn;
@@ -44,6 +45,47 @@ fn backend() -> Router<Arc<ServerState>> {
     Router::new()
         .route("/s/{name}", any(socket::get_session_ws))
         .route("/s/{name}/upload", post(handle_upload))
+        .route("/sessions", get(handle_list_sessions))
+}
+
+#[derive(Deserialize)]
+struct AdminQuery {
+    token: Option<String>,
+}
+
+/// Admin endpoint: list all active sessions.
+async fn handle_list_sessions(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Query(query): Query<AdminQuery>,
+) -> impl IntoResponse {
+    if !state.admin_enabled() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "admin API is not enabled"})),
+        )
+            .into_response();
+    }
+
+    // Extract token from Authorization header or query param.
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|s| s.to_string())
+        .or(query.token);
+
+    match token {
+        Some(t) if state.check_admin_token(&t) => {
+            let sessions = state.list_sessions();
+            Json(json!({ "sessions": sessions })).into_response()
+        }
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "invalid or missing admin token"})),
+        )
+            .into_response(),
+    }
 }
 
 /// Handle image upload: save the file to ./uploads/{session_name}/ and return its URL.

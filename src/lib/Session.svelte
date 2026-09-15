@@ -2204,13 +2204,20 @@
                 break;
               }
             }
+            const ext = (blob.name?.split(".").pop() || "png").toLowerCase();
+            const pastedName = blob.name && blob.name.trim().length > 0
+              ? blob.name
+              : `image-${Date.now()}.${ext}`;
             if (hoveredFilePath) {
-              srocket?.send({ updateFileMetadata: [hoveredFilePath, { imagePath: url }] });
+              srocket?.send({
+                updateFileMetadata: [
+                  hoveredFilePath,
+                  { imagePath: url, imageName: pastedName },
+                ],
+              });
             } else {
               const [cx, cy] = lastCanvasMousePos ?? [0, 0];
-              const ext = (blob.name?.split(".").pop() || "png").toLowerCase();
-              const defaultName = `image-${Date.now()}.${ext}`;
-              srocket?.send({ createImageWidget: [cx, cy, url, defaultName, defaultName] });
+              srocket?.send({ createImageWidget: [cx, cy, url, pastedName, pastedName] });
             }
           } catch (err) {
             console.error("Image paste upload failed:", err);

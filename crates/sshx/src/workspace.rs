@@ -259,8 +259,11 @@ async fn run_context_snapshot(tx: mpsc::Sender<ClientMessage>) {
     }
 }
 
-/// Spawn a task that saves image bytes received from the server into `~/.sshx/images/`.
-/// If `old_name` is set and differs from `name`, the old file is removed after saving.
+/// Spawn a task that saves image bytes received from the server into
+/// `<cwd>/.sshx/images/`, alongside the per-session `session.json`.
+///
+/// If `old_name` is set and differs from `name`, the old file is removed
+/// after saving so that UI renames propagate to the workspace.
 pub fn spawn_save_image_file(name: String, data: Vec<u8>, old_name: String) {
     tokio::spawn(async move {
         if let Err(e) = run_save_image_file(name, data, old_name).await {
@@ -269,20 +272,43 @@ pub fn spawn_save_image_file(name: String, data: Vec<u8>, old_name: String) {
     });
 }
 
+/// Sanitize a user-provided filename to a safe basename: strip any path
+/// separators, then keep only alphanumeric, dot, dash, and underscore.
+fn sanitize_image_name(name: &str) -> Option<String> {
+    let basename = std::path::Path::new(name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(name);
+    let cleaned: String = basename
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
+        .collect();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
 async fn run_save_image_file(name: String, data: Vec<u8>, old_name: String) -> Result<()> {
-    let dir = dirs::home_dir()
-        .context("no home directory")?
-        .join(".sshx")
+    let safe_name = sanitize_image_name(&name).context("invalid image name")?;
+    let dir = std::env::current_dir()
+        .context("no current directory")?
+        .join(crate::controller::SESSION_DIR)
         .join("images");
     tokio::fs::create_dir_all(&dir).await?;
-    tokio::fs::write(dir.join(&name), &data).await?;
-    info!("image saved → ~/.sshx/images/{name}");
+    tokio::fs::write(dir.join(&safe_name), &data).await?;
+    info!("image saved → .sshx/images/{safe_name}");
     // Clean up the old file if this was a rename.
     if !old_name.is_empty() && old_name != name {
-        let old_path = dir.join(&old_name);
-        if old_path.exists() {
-            tokio::fs::remove_file(&old_path).await.ok();
-            info!("removed old image → ~/.sshx/images/{old_name}");
+        if let Some(safe_old) = sanitize_image_name(&old_name) {
+            if safe_old != safe_name {
+                let old_path = dir.join(&safe_old);
+                if old_path.exists() {
+                    tokio::fs::remove_file(&old_path).await.ok();
+                    info!("removed old image → .sshx/images/{safe_old}");
+                }
+            }
         }
     }
     Ok(())

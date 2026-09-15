@@ -44,6 +44,10 @@ struct Args {
     /// TURN server in the form url,username,credential (repeatable).
     #[clap(long)]
     turn_server: Vec<String>,
+
+    /// Admin token for the session listing API. If unset, the endpoint is disabled.
+    #[clap(long, env = "SSHX_ADMIN_TOKEN")]
+    admin_token: Option<String>,
 }
 
 #[tokio::main]
@@ -61,6 +65,7 @@ async fn start(args: Args) -> Result<()> {
     if !args.stun_servers.is_empty() {
         options.stun_servers = args.stun_servers;
     }
+    options.admin_token = args.admin_token;
     options.turn_servers = args
         .turn_server
         .into_iter()

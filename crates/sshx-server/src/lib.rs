@@ -50,6 +50,9 @@ pub struct ServerOptions {
 
     /// TURN server configuration: each entry is `(url, username, credential)`.
     pub turn_servers: Vec<(String, String, String)>,
+
+    /// Admin token for the session listing API. If unset, the endpoint is disabled.
+    pub admin_token: Option<String>,
 }
 
 impl Default for ServerOptions {
@@ -61,6 +64,7 @@ impl Default for ServerOptions {
             host: None,
             stun_servers: vec!["stun:stun.l.google.com:19302".to_string()],
             turn_servers: vec![],
+            admin_token: None,
         }
     }
 }

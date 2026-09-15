@@ -52,6 +52,8 @@
 
   // Image name input state
   let imageName = "";
+  // Last filename pushed to the CLI; used to delete the old file on rename.
+  let prevSavedImageName = "";
 
   // Monaco editor state
   let editorInstance: MonacoType.editor.IStandaloneCodeEditor | null = null;
@@ -215,8 +217,13 @@
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const { url } = await res.json();
       const origName = fileBlob.name || "image.png";
-      dispatch("updateMetadata", { path: file.path, update: { imagePath: url, imageName: origName } });
+      const oldImageName = prevSavedImageName;
+      dispatch("updateMetadata", {
+        path: file.path,
+        update: { imagePath: url, imageName: origName, oldImageName },
+      });
       imageName = origName;
+      prevSavedImageName = origName;
     } catch (e) {
       console.error("Image upload failed:", e);
     }
@@ -244,7 +251,13 @@
 
   function submitImageName() {
     if (!file || !imageName.trim()) return;
-    dispatch("updateMetadata", { path: file.path, update: { imageName: imageName.trim() } });
+    const newName = imageName.trim();
+    if (newName === prevSavedImageName) return;
+    dispatch("updateMetadata", {
+      path: file.path,
+      update: { imageName: newName, oldImageName: prevSavedImageName },
+    });
+    prevSavedImageName = newName;
   }
 
   let showCode = true;

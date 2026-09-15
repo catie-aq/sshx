@@ -183,6 +183,9 @@ pub struct WsFileMetadataUpdate {
     pub widget_h: Option<u32>,
     /// User-defined filename to save the image as on the CLI (None = no push).
     pub image_name: Option<String>,
+    /// Previous image filename on the CLI, sent so the old file can be
+    /// removed when the user renames it from the UI (None or empty = no cleanup).
+    pub old_image_name: Option<String>,
 }
 
 /// A real-time event from a running Claude Code session.

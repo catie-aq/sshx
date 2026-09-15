@@ -444,11 +444,15 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>, ice_server
                             let local = img_path.trim_start_matches('/');
                             match tokio::fs::read(local).await {
                                 Ok(data) => {
+                                    let old_name = update
+                                        .old_image_name
+                                        .clone()
+                                        .unwrap_or_default();
                                     session.update_tx()
                                         .send(ServerMessage::ImageFile(ImageFile {
                                             name: name.clone(),
                                             data: data.into(),
-                                            old_name: String::new(),
+                                            old_name,
                                         }))
                                         .await
                                         .ok();

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { createEventDispatcher } from "svelte";
+  import { makeToast } from "../toast";
   import {
     ActivityIcon,
     CastIcon,
@@ -15,6 +16,7 @@
     PlusCircleIcon,
     SearchIcon,
     SettingsIcon,
+    Share2Icon,
     TerminalIcon,
     WifiIcon,
   } from "svelte-feather-icons";
@@ -85,6 +87,16 @@
 
   function handleWindowClick() {
     if (ideDropdownOpen) ideDropdownOpen = false;
+  }
+
+  async function shareSession() {
+    const url = window.location.href;
+    try {
+      await navigator.clipboard.writeText(url);
+      makeToast({ kind: "success", message: "Session URL copied to clipboard." });
+    } catch {
+      makeToast({ kind: "error", message: "Failed to copy URL." });
+    }
   }
 
   function setMajorMode(mode: "none" | "edition" | "slides") {
@@ -304,8 +316,11 @@
 
       <div class="v-divider" />
 
-      <!-- Group 4: Settings / Network -->
+      <!-- Group 4: Share / Settings / Network -->
       <div class="flex space-x-1 flex-shrink-0">
+        <button class="icon-button" on:click={shareSession} title="Share session URL">
+          <Share2Icon strokeWidth={1.5} class="p-0.5" />
+        </button>
         <button class="icon-button" on:click={() => dispatch("settings")} title="Settings">
           <SettingsIcon strokeWidth={1.5} class="p-0.5" />
         </button>

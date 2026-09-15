@@ -43,6 +43,24 @@ pub struct ServerState {
 
     /// Storage and distributed communication provider, if enabled.
     mesh: Option<StorageMesh>,
+
+    /// Admin token for the session listing API.
+    admin_token: Option<String>,
+}
+
+/// Summary information about a session, for the admin listing API.
+#[derive(serde::Serialize)]
+pub struct SessionInfo {
+    /// Session ID (URL key).
+    pub id: String,
+    /// Human-readable session name.
+    pub session_name: String,
+    /// Names of currently connected users.
+    pub users: Vec<String>,
+    /// Number of active shells.
+    pub shell_count: usize,
+    /// URL to connect to this session.
+    pub url: String,
 }
 
 impl ServerState {
@@ -72,6 +90,7 @@ impl ServerState {
             ice_servers,
             store: DashMap::new(),
             mesh,
+            admin_token: options.admin_token,
         })
     }
 
@@ -88,6 +107,55 @@ impl ServerState {
     /// Returns the ICE server configuration for WebRTC clients.
     pub fn ice_servers(&self) -> &[WsIceServer] {
         &self.ice_servers
+    }
+
+    /// Returns whether the admin API is enabled (token is configured).
+    pub fn admin_enabled(&self) -> bool {
+        self.admin_token.is_some()
+    }
+
+    /// Validates the admin token. Returns true if the token matches.
+    pub fn check_admin_token(&self, token: &str) -> bool {
+        match &self.admin_token {
+            Some(expected) => {
+                // Constant-time comparison to prevent timing attacks.
+                use subtle::ConstantTimeEq;
+                expected.as_bytes().ct_eq(token.as_bytes()).into()
+            }
+            None => false,
+        }
+    }
+
+    /// List all local sessions with their metadata and connected users.
+    pub fn list_sessions(&self) -> Vec<SessionInfo> {
+        let origin = self.override_origin.clone().unwrap_or_default();
+        self.store
+            .iter()
+            .map(|entry| {
+                let id = entry.key().clone();
+                let session = entry.value();
+                let metadata = session.metadata();
+                let users: Vec<String> = session
+                    .list_users()
+                    .into_iter()
+                    .map(|(_, u)| u.name)
+                    .filter(|name| !name.is_empty())
+                    .collect();
+                let shell_count = session.list_shells().len();
+                let url = if origin.is_empty() {
+                    format!("/s/{id}")
+                } else {
+                    format!("{origin}/s/{id}")
+                };
+                SessionInfo {
+                    id,
+                    session_name: metadata.name.clone(),
+                    users,
+                    shell_count,
+                    url,
+                }
+            })
+            .collect()
     }
 
     /// Lookup a local session by name.

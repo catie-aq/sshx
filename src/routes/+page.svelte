@@ -98,14 +98,11 @@
       Development Build
     </h3>
     <p class="text-sm text-zinc-400 mb-4">
-      Latest dev binaries from the <code class="name">claude</code> branch.
+      Latest dev binaries from the <code class="name">claude</code> branch (v0.5.0).
     </p>
     <div class="flex flex-wrap gap-2">
-      <DownloadLink href="/dist/sshx-0.4.1-linux-x86_64.tar.gz"
+      <DownloadLink href="/dist/sshx-0.5.0-linux-x86_64.tar.gz"
         >Linux x86_64</DownloadLink
-      >
-      <DownloadLink href="/dist/sshx-0.4.1-darwin-x86_64.tar.gz"
-        >macOS x86_64</DownloadLink
       >
     </div>
   </div>
