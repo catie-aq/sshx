@@ -16,6 +16,29 @@ L'essentiel du développement a été réalisé en binôme avec Claude Code (co-
 
 ---
 
+## Positionnement — sshx comme porte d'accès aux outils IA
+
+sshx de base résout un problème précis : partager un terminal **sans aucune configuration** — pas de clés SSH, pas d'ouverture de ports, pas de VPN, pas de compte. Une commande génère une URL ; toute personne qui l'ouvre dans un navigateur accède au terminal, chiffré de bout en bout.
+
+Le fork CATIE prolonge cette propriété vers un nouvel usage : **mettre des outils d'IA comme Claude Code à disposition de personnes qui ne savent pas configurer SSH ni installer une base de code**.
+
+Le modèle :
+
+1. Un opérateur (expert, formateur, équipe support) prépare une machine : dépôt cloné, dépendances installées, Claude Code authentifié, `sshx` lancé.
+2. L'utilisateur final reçoit **une simple URL**. Rien à installer, aucun SSH ni clé API à gérer, aucun environnement à monter.
+3. Dans son navigateur, il dispose de tout l'atelier :
+   - le **terminal** où dialoguer avec Claude Code ;
+   - le **flux d'activité Claude** (livrable 03) pour comprendre ce que fait l'agent sans savoir lire un terminal ;
+   - les **FileCards** et l'analyse de workspace (livrable 02) pour voir les fichiers touchés sans connaître git ;
+   - l'**IDE VS Code** (livrable 06) pour ouvrir et modifier le code sans installation ;
+   - le canvas — notes, dessin, diaporama (livrable 07) — et le **partage d'écran** (livrable 04) pour l'accompagnement et la formation ;
+   - le tout utilisable depuis un **mobile ou une tablette**.
+4. L'accompagnant co-pilote en direct (curseurs, chat, annotations), et l'**API admin** (livrable 08) permet d'opérer un serveur mutualisé pour plusieurs bénéficiaires.
+
+Chaque feature du fork prend ainsi un double rôle : outil de collaboration entre développeurs **et** couche de médiation qui rend un agent de code utilisable par des non-initiés. Le chiffrement de bout en bout conserve la confidentialité du code, même sur un serveur partagé dont l'administrateur ne voit que des métadonnées.
+
+---
+
 ## Chronologie des phases
 
 | Phase | Dates | Commits | Contenu | Livrable détaillé |

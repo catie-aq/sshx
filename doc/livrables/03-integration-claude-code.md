@@ -42,6 +42,7 @@ Documentation associée : `doc/features/claude-interactions.md`, `code-claude-fe
 - **Pair programming humain/IA observable** : toute l'équipe voit ce que fait l'agent en temps réel, dans le même espace que les terminaux et les fichiers — utile pour la supervision, la formation et la confiance dans le travail de l'agent.
 - Le ring buffer serveur garantit qu'un participant qui rejoint tard voit l'historique récent sans dépendre du CLI.
 - Positionne sshx comme **console d'observation d'agents IA**, un différenciateur fort par rapport au sshx upstream.
+- Combiné à la propriété de base de sshx (accès par simple URL, sans SSH ni installation), c'est la brique centrale de la **mise à disposition de Claude Code à des publics non techniques** : l'opérateur prépare la machine, le bénéficiaire n'a qu'un lien à ouvrir et voit l'agent travailler (cf. section « Positionnement » de la synthèse).
 - Auto-référence intéressante : les livrables du projet ont eux-mêmes été produits dans des sessions visibles par cet outil.
 
 ## Utilisation
