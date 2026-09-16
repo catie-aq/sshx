@@ -1,22 +1,89 @@
-# sshx
+# sshx — CATIE fork
 
-> **CATIE fork:** for Tailscale/tailnet setup, see [Tailscale.md](Tailscale.md).
-
-A secure web-based, collaborative terminal.
+A secure web-based, collaborative terminal — extended into a collaborative
+workspace for AI-assisted development.
 
 ![](https://i.imgur.com/Q3qKAHW.png)
 
-**Features:**
+This is the [CATIE](https://www.catie.fr) fork of
+[ekzhang/sshx](https://github.com/ekzhang/sshx) (based on v0.4.1). Upstream
+features are all still there:
 
 - Run a single command to share your terminal with anyone.
 - Resize, move windows, and freely zoom and pan on an infinite canvas.
 - See other people's cursors moving in real time.
-- Connect to the nearest server in a globally distributed mesh.
 - End-to-end encryption with Argon2 and AES.
 - Automatic reconnection and real-time latency estimates.
 - Predictive echo for faster local editing (à la Mosh).
 
-Visit [sshx.io](https://sshx.io) to learn more.
+## Why this fork: AI tools with zero setup
+
+Upstream sshx solves one problem very well: sharing a terminal **without any
+configuration** — no SSH keys, no open ports, no VPN, no account. One command
+prints a URL; whoever opens it gets the terminal, end-to-end encrypted.
+
+This fork carries that property to a new use case: **giving people access to AI
+coding tools such as Claude Code when they don't know how to set up SSH or
+install a codebase.**
+
+1. An operator (expert, trainer, support team) prepares a machine: repository
+   cloned, dependencies installed, Claude Code authenticated, `sshx` running.
+2. The end user receives **a single URL** — nothing to install, no SSH or API
+   keys to manage, no environment to build.
+3. In the browser they get the whole workshop: the terminal to talk to Claude
+   Code, a **Claude activity feed** to follow what the agent does without
+   reading raw terminal output, **FileCards** to see the files it touches
+   without knowing git, an embedded **VS Code** to open the code, and the canvas
+   plus **screen sharing** for guidance — usable from a phone.
+4. A helper co-pilots live (cursors, chat, annotations), and the **admin API**
+   lets one shared server host many users.
+
+Every feature thus plays two roles: a collaboration tool between developers,
+and a mediation layer that makes a coding agent usable by non-specialists.
+End-to-end encryption keeps the code private even on a shared server, whose
+administrator only sees metadata.
+
+## What the fork adds
+
+| Feature | Status | Usage |
+|---|---|---|
+| **Claude Code integration** — transcripts are discovered automatically and streamed live: activity feed, active instances, execution graph, session timeline. A 200-event server buffer replays history on reconnect; sshx can start before Claude. | working | run `sshx` where Claude works (`--no-claude-tracking` to opt out) |
+| **Workspace analysis & canvas widgets** — FileCards (metadata, import graph, image previews), searchable file tree, library cards, Markdown sticky notes, Cmd+K palette. Positions and images persist in the workspace. | working | `sshx analyze`, then `sshx` (`--workspace`, `--no-workspace`) |
+| **Embedded VS Code** — OpenVSCode Server auto-downloaded and tunneled through the existing sshx connection (no extra port), with the `sshx-collab` extension syncing files, cursors and edit locks. | working | `sshx --ide` — see [below](#vs-code-ide-integration) |
+| **P2P screen sharing** — WebRTC between participants; the server only relays signaling, never media. | working | "Share your screen" toolbar button |
+| **Offscreen browser** — `sshx-browser` runs Chromium in Xvfb, streams VP8 and accepts remote keyboard/mouse. Frame ingestion works; relaying to viewers is not done yet. | partial | `sshx --with-browser <url>` (needs xvfb, chromium, ffmpeg) |
+| **React / Next.js observability** — injected dev-mode scripts show the component and source file under the cursor; "Show in SSHX" opens its FileCard on the canvas. | working | see [doc/observability](doc/observability) |
+| **Rich text, drawing, slideshow** — TipTap text blocks, free images, pen/highlighter layer with undo/redo, canvas regions presented as slides. | in progress | context menu, toolbar |
+| **Mobile support** — reworked touch gestures, toolbar and terminals for small screens. | working | open the URL on a phone |
+| **Session persistence** — widgets and notes survive restarts. | working | automatic |
+| **Custom session slugs** — readable URLs (`/s/<slug>`). | working | `--slug <name>` |
+| **Administration & sharing** — `/api/sessions` behind an admin token (constant-time check) and a `/sessions` page listing sessions, users and shells; **Share** button copying the session URL. | working | `sshx-server --admin-token <secret>` (or `SSHX_ADMIN_TOKEN`) |
+| **Self-update** — `sshx update` installs the latest client published by the server it points to; a background check runs at most hourly. | working | `sshx update [--check] [--force]`, opt out with `--no-auto-update` |
+
+Detailed write-ups (in French) of each feature — description, implications,
+usage — live in [doc/livrables/](doc/livrables/00-synthese.md); architecture
+docs are in [doc/](doc) and [CLAUDE.md](CLAUDE.md).
+
+### Getting the fork's client
+
+The fork's server publishes its own client builds. Download the binary from the
+server's landing page (it shows the latest version), then keep it current with:
+
+```shell
+sshx --server https://<your-server> update
+```
+
+Operators publish a new build with `scripts/publish-release.sh`, which bumps the
+workspace version, builds (Linux via `cargo zigbuild` against glibc 2.28 rather
+than musl, so Tailscale MagicDNS names resolve), and writes
+`releases/manifest.json`, served by the server under `/releases`. For a tailnet
+deployment with HTTPS, see [Tailscale.md](Tailscale.md); packaging scripts for
+Linux, macOS and Arch are in [distribution/](distribution).
+
+---
+
+The sections below document the upstream project; the `sshx.io` install
+commands give you the upstream client, without the fork's features.
 
 ## Installation
 
@@ -112,11 +179,12 @@ frontend in parallel on your machine.
 
 ## Deployment
 
-I host the application servers on [Fly.io](https://fly.io/) and with
+Upstream hosts the application servers on [Fly.io](https://fly.io/) and with
 [Redis Cloud](https://redis.com/).
 
-Self-hosted deployments are not supported at the moment. If you want to deploy
-sshx, you'll need to properly implement HTTP/TCP reverse proxies, gRPC
+Upstream does not support self-hosted deployments. The CATIE fork is
+self-hosted on a Tailscale tailnet (see [Tailscale.md](Tailscale.md)); in the
+general case you'll need to properly implement HTTP/TCP reverse proxies, gRPC
 forwarding, TLS termination, private mesh networking, and graceful shutdown.
 
 Please do not run the development commands in a public setting, as this is
