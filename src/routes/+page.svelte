@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import {
     CastIcon,
     DownloadIcon,
@@ -42,6 +43,57 @@
   function scrollToInstallation() {
     installationEl.scrollIntoView({ behavior: "smooth" });
   }
+
+  // Client builds published by scripts/publish-release.sh, if any.
+  type Release = { platform: string; version: string; url: string };
+  let releases: Release[] = [];
+
+  function versionParts(version: string): number[] {
+    return version.split(/[+-]/)[0].split(".").map(Number);
+  }
+
+  function compareVersions(a: string, b: string): number {
+    const [pa, pb] = [versionParts(a), versionParts(b)];
+    for (let i = 0; i < 3; i++) {
+      if ((pa[i] ?? 0) !== (pb[i] ?? 0)) return (pa[i] ?? 0) - (pb[i] ?? 0);
+    }
+    return 0;
+  }
+
+  $: latestVersion = releases
+    .map((r) => r.version)
+    .sort(compareVersions)
+    .at(-1);
+
+  const osNames: Record<string, string> = {
+    linux: "Linux",
+    windows: "Windows",
+    macos: "macOS",
+    freebsd: "FreeBSD",
+  };
+  const archNames: Record<string, string> = {
+    aarch64: "ARM64",
+    armv7: "ARMv7",
+    armv6: "ARMv6",
+  };
+
+  function platformName(platform: string): string {
+    const [os, arch] = platform.split("-");
+    return `${osNames[os] ?? os} ${archNames[arch] ?? arch}`;
+  }
+
+  onMount(async () => {
+    try {
+      const resp = await fetch("/releases/manifest.json");
+      if (!resp.ok || !resp.headers.get("content-type")?.includes("json")) return;
+      const manifest = await resp.json();
+      releases = Object.entries(manifest.platforms ?? {})
+        .map(([platform, r]) => ({ platform, ...(r as Omit<Release, "platform">) }))
+        .sort((a, b) => a.platform.localeCompare(b.platform));
+    } catch {
+      // No releases published on this server.
+    }
+  });
 </script>
 
 <main
@@ -91,34 +143,36 @@
     </p>
   </section>
 
-  <div
-    class="mb-10 max-w-lg border border-zinc-700 rounded-lg bg-zinc-900/80 p-5"
-  >
-    <h3 class="text-sm font-medium uppercase tracking-wide text-zinc-300 mb-2">
-      Development Build
-    </h3>
-    <p class="text-sm text-zinc-400 mb-4">
-      Latest dev binaries from the <code class="name">claude</code> branch (v0.5.0).
-      Build locally with <code class="name">scripts/build-all.sh</code>.
-    </p>
-    <p class="text-xs text-zinc-500 mb-2">Linux</p>
-    <div class="flex flex-wrap gap-2 mb-3">
-      <DownloadLink href="/dist/sshx-0.5.0-linux-x86_64.tar.gz">Linux x86_64</DownloadLink>
-      <DownloadLink href="/dist/sshx-0.5.0-linux-aarch64.tar.gz">Linux ARM64</DownloadLink>
-      <DownloadLink href="/dist/sshx-0.5.0-linux-armv7.tar.gz">Linux ARMv7</DownloadLink>
-      <DownloadLink href="/dist/sshx-0.5.0-linux-armv6.tar.gz">Linux ARMv6</DownloadLink>
+  {#if releases.length > 0}
+    <div
+      class="mb-10 max-w-lg border border-zinc-700 rounded-lg bg-zinc-900/80 p-5"
+    >
+      <h3 class="text-sm font-medium uppercase tracking-wide text-zinc-300 mb-2">
+        Development Build
+        <span class="ml-2 normal-case tracking-normal text-emerald-400">
+          v{latestVersion}
+        </span>
+      </h3>
+      <p class="text-sm text-zinc-400 mb-4">
+        Latest binaries published on this server. Already installed? Run
+        <code class="name">sshx update</code>.
+      </p>
+      <div class="flex flex-wrap gap-2">
+        {#each releases as release (release.platform)}
+          <DownloadLink href={release.url}>
+            {platformName(release.platform)}
+            {#if release.version !== latestVersion}
+              <span class="text-zinc-500">v{release.version}</span>
+            {/if}
+          </DownloadLink>
+        {/each}
+      </div>
+      <p class="text-xs text-zinc-500 mt-3">
+        Gzipped executable: <code>gunzip</code>, then
+        <code>chmod +x</code>.
+      </p>
     </div>
-    <p class="text-xs text-zinc-500 mb-2">Windows</p>
-    <div class="flex flex-wrap gap-2 mb-3">
-      <DownloadLink href="/dist/sshx-0.5.0-windows-x86_64.zip">Windows x86_64</DownloadLink>
-      <DownloadLink href="/dist/sshx-0.5.0-windows-x86.zip">Windows x86</DownloadLink>
-      <DownloadLink href="/dist/sshx-0.5.0-windows-aarch64.zip">Windows ARM64</DownloadLink>
-    </div>
-    <p class="text-xs text-zinc-500 mb-2">Other</p>
-    <div class="flex flex-wrap gap-2">
-      <DownloadLink href="/dist/sshx-0.5.0-freebsd-x86_64.tar.gz">FreeBSD x86_64</DownloadLink>
-    </div>
-  </div>
+  {/if}
 
   <div class="pb-12 md:pb-36">
     <button

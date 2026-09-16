@@ -308,3 +308,15 @@ The activity feed pipelines Claude Code JSONL transcripts to the browser in real
 **History replay on connect**: `tail_transcript` reads and sends the last 200 lines of an existing transcript before entering tail mode, so the browser sees current-session history immediately.
 
 **Server-side ring buffer**: `Session::claude_events` (`session.rs`) holds the last 200 `WsClaudeEvent` items. `socket.rs` replays them during the initial WebSocket handshake so reconnecting browsers see recent history without a new CLI connection.
+
+---
+
+## Releases & Self-Update
+
+`sshx update` (and a background check at session start, at most hourly) installs the latest client build published by the server it points to (`--server`, default baked in at build time via `SSHX_BUILD_URL`).
+
+- **Version**: the workspace version in `Cargo.toml`, compared as `major.minor.patch`. Each publish bumps the patch (`--bump minor|major|none` otherwise); commit the bump afterwards.
+- **Publishing**: `scripts/publish-release.sh` builds, gzips and writes `releases/manifest.json` (per-platform `version`, `url`, `sha256`); the server serves `./releases` at `/releases`. Keeps the last 3 builds per platform. The landing page (`src/routes/+page.svelte`) reads the manifest at runtime to show the latest version and download links.
+- **Linux builds use glibc 2.28 via `cargo zigbuild`, not musl**: musl ignores nsswitch and cannot resolve Tailscale MagicDNS names when systemd-resolved is only reachable through nss-resolve.
+- **Client logic**: `crates/sshx/src/update.rs`. Auto-update is skipped for binaries run from a cargo `target/` directory; opt out with `--no-auto-update` / `SSHX_NO_AUTO_UPDATE=1`.
+- No client/server compatibility check is performed.

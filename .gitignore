@@ -9,3 +9,4 @@
 /distribution/*/dist/
 
 .local/openvscode-server*
+/releases

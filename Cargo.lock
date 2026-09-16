@@ -2599,7 +2599,7 @@ checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 
 [[package]]
 name = "sshx"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "aes",
  "ansi_term",
@@ -2624,6 +2624,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "sshx-core",
  "tar",
  "tempfile",
@@ -2640,7 +2641,7 @@ dependencies = [
 
 [[package]]
 name = "sshx-browser"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2657,7 +2658,7 @@ dependencies = [
 
 [[package]]
 name = "sshx-core"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "prost",
  "rand",
@@ -2668,7 +2669,7 @@ dependencies = [
 
 [[package]]
 name = "sshx-media"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -2680,7 +2681,7 @@ dependencies = [
 
 [[package]]
 name = "sshx-server"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "async-channel",

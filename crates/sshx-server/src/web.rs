@@ -33,10 +33,14 @@ pub fn app() -> Router<Arc<ServerState>> {
     // Serve uploaded image files from the ./uploads/ directory.
     let uploads_dir = ServeDir::new("uploads");
 
+    // Client builds and manifest for `sshx update` (scripts/publish-release.sh).
+    let releases_dir = ServeDir::new("releases");
+
     Router::new()
         .nest("/ide", ide_proxy::routes())
         .nest("/api", backend())
         .nest_service("/uploads", get_service(uploads_dir))
+        .nest_service("/releases", get_service(releases_dir))
         .fallback_service(get_service(static_files))
 }
 

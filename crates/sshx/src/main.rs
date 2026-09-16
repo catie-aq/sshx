@@ -20,16 +20,20 @@ use tracing::{error, warn};
 
 /// A secure web-based, collaborative terminal.
 #[derive(Parser, Debug)]
-#[clap(author, version, about, long_about = None)]
+#[clap(author, version = sshx::update::VERSION, about, long_about = None)]
 struct Args {
     #[clap(subcommand)]
     command: Option<Commands>,
 
+    /// Address of the remote sshx server.
+    #[clap(long, global = true, default_value = env!("SSHX_DEFAULT_SERVER_URL"), env = "SSHX_SERVER")]
+    server: String,
+
     // ---- Session options (used when no subcommand is given) ---------------
 
-    /// Address of the remote sshx server.
-    #[clap(long, default_value = env!("SSHX_DEFAULT_SERVER_URL"), env = "SSHX_SERVER")]
-    server: String,
+    /// Do not check the server for sshx updates in the background.
+    #[clap(long, env = "SSHX_NO_AUTO_UPDATE")]
+    no_auto_update: bool,
 
     /// Local shell command to run in the terminal.
     #[clap(long)]
@@ -117,6 +121,17 @@ enum Commands {
         #[clap(long, value_name = "FILE")]
         output: Option<PathBuf>,
     },
+
+    /// Update sshx to the latest release published by the server.
+    Update {
+        /// Only check whether an update is available.
+        #[clap(long)]
+        check: bool,
+
+        /// Reinstall the server's release even if it is not newer.
+        #[clap(long)]
+        force: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -148,12 +163,66 @@ fn main() -> ExitCode {
 }
 
 async fn run(args: Args) -> Result<()> {
+    sshx::update::cleanup_old_exe();
     match args.command {
         Some(Commands::Analyze { workspace, output }) => {
             run_analyze(workspace, output).await
         }
+        Some(Commands::Update { check, force }) => run_update(&args.server, check, force).await,
         None => run_session(args).await,
     }
+}
+
+// ---------------------------------------------------------------------------
+// `sshx update`
+// ---------------------------------------------------------------------------
+
+async fn run_update(server: &str, check: bool, force: bool) -> Result<()> {
+    use sshx::update::{install, is_newer, latest_release, PLATFORM, VERSION};
+
+    println!(
+        "\n  {} {}  {}\n",
+        Green.bold().paint("sshx"),
+        Green.paint(format!("v{VERSION}")),
+        Fixed(8).paint(PLATFORM),
+    );
+
+    let Some(release) = latest_release(server).await? else {
+        anyhow::bail!("{server} does not publish an sshx release for {PLATFORM}");
+    };
+
+    if !force && !is_newer(&release.version, VERSION) {
+        println!(
+            "  {}  Already up to date (latest: v{})\n",
+            Green.paint("✓"),
+            release.version,
+        );
+        return Ok(());
+    }
+
+    if check {
+        println!(
+            "  {}  Update available: v{}  (run `sshx update`)\n",
+            Yellow.paint("ℹ"),
+            release.version,
+        );
+        return Ok(());
+    }
+
+    println!(
+        "  {}  Downloading v{} from {}…",
+        Green.paint("➜"),
+        release.version,
+        Fixed(8).paint(server),
+    );
+    let exe = install(server, &release).await?;
+    println!(
+        "  {}  Updated {} to v{}\n",
+        Green.paint("✓"),
+        Cyan.paint(exe.display().to_string()),
+        release.version,
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -233,10 +302,7 @@ async fn run_analyze(workspace: Option<PathBuf>, output: Option<PathBuf>) -> Res
 // ---------------------------------------------------------------------------
 
 fn print_greeting(shell: &str, controller: &Controller) {
-    let version_str = match option_env!("CARGO_PKG_VERSION") {
-        Some(version) => format!("v{version}"),
-        None => String::from("[dev]"),
-    };
+    let version_str = format!("v{}", sshx::update::VERSION);
     if let Some(write_url) = controller.write_url() {
         println!(
             r#"
@@ -337,6 +403,21 @@ async fn run_session(args: Args) -> Result<()> {
         }
     } else {
         print_greeting(&shell, &controller);
+    }
+
+    if !args.no_auto_update {
+        let server = args.server.clone();
+        let quiet = args.quiet;
+        tokio::spawn(async move {
+            match sshx::update::auto_update(&server).await {
+                Ok(Some(version)) if !quiet => println!(
+                    "  {}  sshx updated to v{version} (applies on next launch)\n",
+                    Green.paint("➜"),
+                ),
+                Ok(_) => {}
+                Err(err) => warn!("automatic update failed: {err:#}"),
+            }
+        });
     }
 
     // Spawn sshx-browser if requested.

@@ -14,4 +14,5 @@ pub mod openvscode;
 pub mod runner;
 pub mod terminal;
 pub mod tunnel;
+pub mod update;
 pub mod workspace;
