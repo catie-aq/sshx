@@ -30,6 +30,7 @@ async fn test_json_snapshot_roundtrip() -> Result<()> {
             name: "persistence-test".into(),
             write_password_hash: None,
             restore_snapshot: None,
+            custom_name: None,
         })
         .await?
         .into_inner();
@@ -254,6 +255,7 @@ async fn test_restore_from_json_snapshot() -> Result<()> {
             name: "restore-test".into(),
             write_password_hash: None,
             restore_snapshot: Some(snapshot_bytes.into()),
+            custom_name: None,
         })
         .await?
         .into_inner();
@@ -308,7 +310,7 @@ async fn test_e2e_session_persistence() -> Result<()> {
 
     // 1. Create a session with a Controller (simulating the CLI).
     let mut controller =
-        Controller::new(&server.endpoint(), "persistence-user", Runner::Echo, false, None, None, None).await?;
+        Controller::new(&server.endpoint(), "persistence-user", Runner::Echo, false, None, None, None, None).await?;
     let name = controller.name().to_owned();
     let key = controller.encryption_key().to_owned();
     tokio::spawn(async move { controller.run().await });
@@ -473,6 +475,7 @@ async fn test_e2e_session_persistence() -> Result<()> {
             name: "restored-e2e".into(),
             write_password_hash: None,
             restore_snapshot: Some(snapshot_json.into()),
+            custom_name: None,
         })
         .await?
         .into_inner();

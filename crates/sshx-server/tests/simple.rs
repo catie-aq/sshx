@@ -18,6 +18,7 @@ async fn test_rpc() -> Result<()> {
         name: String::new(),
         write_password_hash: None,
         restore_snapshot: None,
+        custom_name: None,
     };
     let resp = client.open(req).await?;
     assert!(!resp.into_inner().name.is_empty());

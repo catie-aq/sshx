@@ -11,7 +11,7 @@ use crate::common::*;
 
 /// Controller with no IDE binary — IDE unavailable.
 async fn make_controller_no_ide(server: &TestServer) -> Controller {
-    Controller::new(&server.endpoint(), "", Runner::Echo, false, None, None, None)
+    Controller::new(&server.endpoint(), "", Runner::Echo, false, None, None, None, None)
         .await
         .unwrap()
 }
@@ -25,6 +25,7 @@ async fn make_controller_with_ide(server: &TestServer) -> Controller {
         false,
         None,
         Some(PathBuf::from("/nonexistent/openvscode-server")),
+        None,
         None,
     )
     .await
