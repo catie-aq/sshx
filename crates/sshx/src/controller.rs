@@ -19,7 +19,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::encrypt::Encrypt;
 use crate::ide::{self, IdeManager, IdeSyncHandle};
-use crate::runner::{Runner, ShellData};
+use crate::runner::{Runner, ShellContext, ShellData};
 use crate::tunnel::HttpTunnel;
 use crate::workspace::{spawn_context_snapshot, spawn_describe_files, spawn_save_image_file, spawn_update_file_metadata, spawn_update_widget_name};
 
@@ -67,6 +67,8 @@ pub struct Controller {
     ide_managers: HashMap<u32, IdeManager>,
     /// IDE sync server handle for the sshx-collab extension.
     ide_sync: Option<IdeSyncHandle>,
+    /// Environment and registry shared with every spawned shell.
+    shell_ctx: ShellContext,
 }
 
 impl Controller {
@@ -185,6 +187,7 @@ impl Controller {
             http_tunnels: HashMap::new(),
             ide_managers: HashMap::new(),
             ide_sync,
+            shell_ctx: ShellContext::default(),
         })
     }
 
@@ -215,6 +218,26 @@ impl Controller {
     /// Returns the write URL of the session, if it exists.
     pub fn write_url(&self) -> Option<&str> {
         self.write_url.as_deref()
+    }
+
+    /// Returns the write password, if read-only mode is enabled.
+    pub fn write_password(&self) -> Option<&str> {
+        self.write_url.as_deref().and_then(|u| u.rsplit_once(',')).map(|(_, p)| p)
+    }
+
+    /// Returns the session URL without the encryption key fragment.
+    pub fn public_url(&self) -> &str {
+        self.url.split('#').next().unwrap_or(&self.url)
+    }
+
+    /// Returns the origin of the sshx server this controller talks to.
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    /// Set the environment and registry given to shells spawned from now on.
+    pub fn set_shell_context(&mut self, ctx: ShellContext) {
+        self.shell_ctx = ctx;
     }
 
     /// Returns the encryption key for this session, hidden from the server.
@@ -421,6 +444,7 @@ impl Controller {
         let runner = self.runner.clone();
         let encrypt = self.encrypt.clone();
         let output_tx = self.output_tx.clone();
+        let ctx = self.shell_ctx.clone();
         tokio::spawn(async move {
             debug!(%id, "spawning new shell");
             let new_shell = NewShell {
@@ -432,7 +456,7 @@ impl Controller {
                 error!(%id, ?err, "failed to send shell creation message");
                 return;
             }
-            if let Err(err) = runner.run(id, encrypt, shell_rx, output_tx.clone()).await {
+            if let Err(err) = runner.run(id, encrypt, shell_rx, output_tx.clone(), ctx).await {
                 let err = ClientMessage::Error(err.to_string());
                 output_tx.send(err).await.ok();
             }
@@ -478,6 +502,7 @@ impl Controller {
             if let Some(ref sync) = self.ide_sync {
                 ide.set_sync_port(sync.port);
             }
+            ide.set_connection_token(ide::connection_token(&self.encryption_key));
             if let Err(e) = ide.spawn().await {
                 error!("failed to start IDE instance {ide_id}: {e:#}");
                 let resp = HttpTunnelResponse {

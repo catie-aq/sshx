@@ -1,5 +1,8 @@
 //! Defines tasks that control the behavior of a single shell in the client.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use anyhow::Result;
 use encoding_rs::{CoderResult, UTF_8};
 use sshx_core::proto::{client_update::ClientMessage, TerminalData};
@@ -9,8 +12,21 @@ use tokio::{
     sync::mpsc,
 };
 
+use crate::agent::TerminalRegistry;
 use crate::encrypt::Encrypt;
 use crate::terminal::Terminal;
+
+/// How often each shell reports its foreground process to the registry.
+const FOREGROUND_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Per-session context given to every shell spawned by the controller.
+#[derive(Clone, Default)]
+pub struct ShellContext {
+    /// Static environment variables added to every shell.
+    pub env: Vec<(String, String)>,
+    /// Registry of live terminals, used for platform and agent tracking.
+    pub registry: Option<Arc<TerminalRegistry>>,
+}
 
 const CONTENT_CHUNK_SIZE: usize = 1 << 16; // Send at most this many bytes at a time.
 const CONTENT_ROLLING_BYTES: usize = 8 << 20; // Store at least this much content.
@@ -44,9 +60,17 @@ impl Runner {
         encrypt: Encrypt,
         shell_rx: mpsc::Receiver<ShellData>,
         output_tx: mpsc::Sender<ClientMessage>,
+        ctx: ShellContext,
     ) -> Result<()> {
         match self {
-            Self::Shell(shell) => shell_task(id, encrypt, shell, shell_rx, output_tx).await,
+            Self::Shell(shell) => {
+                let registry = ctx.registry.clone();
+                let result = shell_task(id, encrypt, shell, shell_rx, output_tx, ctx).await;
+                if let Some(registry) = registry {
+                    registry.unregister(id.0);
+                }
+                result
+            }
             Self::Echo => echo_task(id, encrypt, shell_rx, output_tx).await,
         }
     }
@@ -59,9 +83,17 @@ async fn shell_task(
     shell: &str,
     mut shell_rx: mpsc::Receiver<ShellData>,
     output_tx: mpsc::Sender<ClientMessage>,
+    ctx: ShellContext,
 ) -> Result<()> {
-    let mut term = Terminal::new(shell).await?;
+    let mut env = ctx.env.clone();
+    env.push((crate::agent::ENV_TERMINAL_ID.into(), id.0.to_string()));
+    let mut term = Terminal::new(shell, &env).await?;
     term.set_winsize(24, 80)?;
+    if let Some(registry) = &ctx.registry {
+        registry.register(id.0, term.child_pid());
+    }
+    let mut fg_interval = tokio::time::interval(FOREGROUND_POLL_INTERVAL);
+    fg_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let mut content = String::new(); // content from the terminal
     let mut content_offset = 0; // bytes before the first character of `content`
@@ -73,6 +105,12 @@ async fn shell_task(
 
     while !finished {
         tokio::select! {
+            _ = fg_interval.tick() => {
+                if let Some(registry) = &ctx.registry {
+                    registry.set_foreground(id.0, term.foreground_pgid());
+                }
+                continue;
+            }
             result = term.read(&mut buf) => {
                 let n = result?;
                 if n == 0 {

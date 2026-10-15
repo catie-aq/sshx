@@ -50,12 +50,15 @@ pub struct Terminal {
 
 impl Terminal {
     /// Create a new terminal, with attached PTY.
-    #[instrument]
-    pub async fn new(shell: &str) -> Result<Terminal> {
+    ///
+    /// `env` holds extra environment variables set in the shell, used to let
+    /// programs inside the terminal identify it (see `crate::agent`).
+    #[instrument(skip(env))]
+    pub async fn new(shell: &str, env: &[(String, String)]) -> Result<Terminal> {
         let result = pty::openpty(None, None)?;
 
         // The slave file descriptor was created by openpty() and is forked here.
-        let child = Self::fork_child(shell, result.slave.as_raw_fd())?;
+        let child = Self::fork_child(shell, env, result.slave.as_raw_fd())?;
 
         // We need to clone the file object to prevent livelocks in Tokio, when multiple
         // reads and writes happen concurrently on the same file descriptor. This is a
@@ -74,21 +77,25 @@ impl Terminal {
     }
 
     /// Entry point for the child process, which spawns a shell.
-    fn fork_child(shell: &str, slave_port: RawFd) -> Result<Pid> {
+    fn fork_child(shell: &str, env: &[(String, String)], slave_port: RawFd) -> Result<Pid> {
         let shell = CString::new(shell.to_owned())?;
 
         // Safety: This does not use any async-signal-unsafe operations in the child
         // branch, such as memory allocation.
         match unsafe { fork() }? {
             ForkResult::Parent { child } => Ok(child),
-            ForkResult::Child => match Self::execv_child(&shell, slave_port) {
+            ForkResult::Child => match Self::execv_child(&shell, env, slave_port) {
                 Ok(infallible) => match infallible {},
                 Err(_) => std::process::exit(1),
             },
         }
     }
 
-    fn execv_child(shell: &CStr, slave_port: RawFd) -> Result<Infallible, Errno> {
+    fn execv_child(
+        shell: &CStr,
+        extra_env: &[(String, String)],
+        slave_port: RawFd,
+    ) -> Result<Infallible, Errno> {
         // Safety: The slave file descriptor was created by openpty().
         Errno::result(unsafe { login_tty(slave_port) })?;
         // Safety: This is called immediately before an execv(), and there are no other
@@ -100,9 +107,25 @@ impl Terminal {
         env::set_var("COLORTERM", "truecolor");
         env::set_var("TERM_PROGRAM", "sshx");
         env::remove_var("TERM_PROGRAM_VERSION");
+        for (key, value) in extra_env {
+            env::set_var(key, value);
+        }
 
         // Start the process.
         execvp(shell, &[shell])
+    }
+
+    /// Process ID of the shell running in this terminal.
+    pub fn child_pid(&self) -> u32 {
+        self.child.as_raw() as u32
+    }
+
+    /// Process group currently in the foreground of the TTY (e.g. `claude`
+    /// while it runs, the shell itself at the prompt).
+    pub fn foreground_pgid(&self) -> Option<u32> {
+        // Safety: tcgetpgrp only reads the TTY state of a valid descriptor.
+        let pgid = unsafe { nix::libc::tcgetpgrp(self.master_read.as_raw_fd()) };
+        (pgid > 0).then_some(pgid as u32)
     }
 
     /// Get the window size of the TTY.

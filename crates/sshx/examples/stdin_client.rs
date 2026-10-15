@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
     let shell = get_default_shell().await;
     info!(%shell, "using default shell");
 
-    let mut terminal = Terminal::new(&shell).await?;
+    let mut terminal = Terminal::new(&shell, &[]).await?;
 
     // Separate thread for reading from standard input.
     let (tx, mut rx) = mpsc::channel::<Arc<[u8]>>(16);

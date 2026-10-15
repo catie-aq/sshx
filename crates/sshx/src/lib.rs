@@ -6,11 +6,14 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod agent;
 pub mod analyze;
+pub mod claude_hooks;
 pub mod controller;
 pub mod encrypt;
 pub mod ide;
 pub mod openvscode;
+pub mod platform;
 pub mod runner;
 pub mod terminal;
 pub mod tunnel;

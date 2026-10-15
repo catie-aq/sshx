@@ -23,7 +23,7 @@ mod tests {
     #[tokio::test]
     async fn winsize() -> Result<()> {
         let shell = if cfg!(unix) { "/bin/sh" } else { "cmd.exe" };
-        let mut terminal = Terminal::new(shell).await?;
+        let mut terminal = Terminal::new(shell, &[]).await?;
         assert_eq!(terminal.get_winsize()?, (0, 0));
         terminal.set_winsize(120, 72)?;
         assert_eq!(terminal.get_winsize()?, (120, 72));

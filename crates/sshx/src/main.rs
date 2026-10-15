@@ -5,9 +5,11 @@ use ansi_term::Color::{Cyan, Fixed, Green, White, Yellow};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use sshx::{
+    agent::{spawn_proc_poller, TerminalRegistry, ENV_HOOK_SOCKET, ENV_SESSION},
     analyze::{AnalysisDb, ANALYSIS_FILENAME},
     controller::Controller,
-    runner::Runner,
+    platform::{PlatformClient, PlatformConfig, Registration},
+    runner::{Runner, ShellContext},
     terminal::get_default_shell,
     workspace::{send_widget_names, spawn_claude_pid_tracker, spawn_claude_tracker, spawn_source_analyzer},
 };
@@ -93,6 +95,44 @@ struct Args {
     /// point to a custom binary instead.
     #[clap(long)]
     ide: bool,
+
+    /// URL of the sshx platform to register this session with. Defaults to
+    /// the configuration saved by `sshx platform enroll`.
+    #[clap(long, value_name = "URL", env = "SSHX_PLATFORM_URL")]
+    platform: Option<String>,
+
+    /// Machine token created in the platform UI (`smt_….<key>`).
+    #[clap(long, value_name = "TOKEN", env = "SSHX_PLATFORM_TOKEN", hide_env_values = true)]
+    platform_token: Option<String>,
+
+    /// Do not register this session with the platform.
+    #[clap(long)]
+    no_platform: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum HooksAction {
+    /// Add the sshx hooks to ~/.claude/settings.json (idempotent).
+    Install,
+    /// Remove the sshx hooks from ~/.claude/settings.json.
+    Uninstall,
+    /// Show whether the hooks are installed.
+    Status,
+}
+
+#[derive(Subcommand, Debug)]
+enum PlatformAction {
+    /// Save the platform URL and machine token for future sessions.
+    Enroll {
+        /// Base URL of the platform.
+        url: String,
+        /// Machine token shown by the platform (`smt_….<key>`).
+        token: String,
+    },
+    /// Show the saved platform configuration and check the token.
+    Status,
+    /// Delete the saved platform configuration.
+    Forget,
 }
 
 #[derive(Subcommand, Debug)]
@@ -122,6 +162,29 @@ enum Commands {
         output: Option<PathBuf>,
     },
 
+    /// Forward an agent hook event (read on stdin) to the sshx process that
+    /// owns this terminal. Used by `sshx claude-hooks install`; silent no-op
+    /// outside an sshx terminal.
+    #[clap(hide = true)]
+    Hook {
+        /// Agent kind sending the event.
+        #[clap(default_value = "claude")]
+        agent: String,
+    },
+
+    /// Manage the Claude Code hooks that report agent state per terminal
+    /// (working, finished, question, permission).
+    ClaudeHooks {
+        #[clap(subcommand)]
+        action: HooksAction,
+    },
+
+    /// Connect this machine to an sshx platform.
+    Platform {
+        #[clap(subcommand)]
+        action: PlatformAction,
+    },
+
     /// Update sshx to the latest release published by the server.
     Update {
         /// Only check whether an update is available.
@@ -140,6 +203,12 @@ enum Commands {
 
 fn main() -> ExitCode {
     let args = Args::parse();
+
+    // Hooks run on every agent event: forward and exit before any setup.
+    if let Some(Commands::Hook { agent }) = &args.command {
+        sshx::agent::forward_hook(agent);
+        return ExitCode::SUCCESS;
+    }
 
     let default_level = if args.quiet { "error" } else { "info" };
 
@@ -169,6 +238,9 @@ async fn run(args: Args) -> Result<()> {
             run_analyze(workspace, output).await
         }
         Some(Commands::Update { check, force }) => run_update(&args.server, check, force).await,
+        Some(Commands::Hook { .. }) => Ok(()),
+        Some(Commands::ClaudeHooks { action }) => run_claude_hooks(action),
+        Some(Commands::Platform { action }) => run_platform(action).await,
         None => run_session(args).await,
     }
 }
@@ -222,6 +294,108 @@ async fn run_update(server: &str, check: bool, force: bool) -> Result<()> {
         Cyan.paint(exe.display().to_string()),
         release.version,
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `sshx claude-hooks` and `sshx platform`
+// ---------------------------------------------------------------------------
+
+fn run_claude_hooks(action: HooksAction) -> Result<()> {
+    use sshx::claude_hooks::{install, status, uninstall, HOOK_EVENTS};
+    match action {
+        HooksAction::Install => {
+            let path = install()?;
+            println!(
+                "\n  {}  Claude Code hooks installed in {}",
+                Green.paint("✓"),
+                Cyan.paint(path.display().to_string()),
+            );
+            println!(
+                "  {}  Claude sessions started in sshx terminals now report their state.\n  {}  Already running sessions pick it up after a restart.\n",
+                Fixed(8).paint("ℹ"),
+                Fixed(8).paint(" "),
+            );
+        }
+        HooksAction::Uninstall => {
+            let (path, removed) = uninstall()?;
+            println!(
+                "\n  {}  Removed {removed} hook(s) from {}\n",
+                Green.paint("✓"),
+                Cyan.paint(path.display().to_string()),
+            );
+        }
+        HooksAction::Status => {
+            let (path, events) = status()?;
+            let ok = events.len() == HOOK_EVENTS.len();
+            println!(
+                "\n  {}  {}/{} hook events installed in {}\n",
+                if ok { Green.paint("✓") } else { Yellow.paint("ℹ") },
+                events.len(),
+                HOOK_EVENTS.len(),
+                Cyan.paint(path.display().to_string()),
+            );
+            if !ok {
+                println!("  {} run `sshx claude-hooks install`\n", Fixed(8).paint("tip"));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_platform(action: PlatformAction) -> Result<()> {
+    match action {
+        PlatformAction::Enroll { url, token } => {
+            let config = PlatformConfig { url, token };
+            let client = PlatformClient::new(&config)?;
+            let machine = client.whoami().await?;
+            let path = config.save()?;
+            println!(
+                "\n  {}  Enrolled as {} ({}, owner {})",
+                Green.paint("✓"),
+                White.bold().paint(&machine.name),
+                machine.kind,
+                machine.owner,
+            );
+            println!(
+                "  {}  Configuration saved to {}\n  {}  Every `sshx` session now appears on {}\n",
+                Green.paint("➜"),
+                Cyan.paint(path.display().to_string()),
+                Green.paint("➜"),
+                Cyan.underline().paint(client.base_url()),
+            );
+            if !sshx::claude_hooks::is_installed() {
+                println!(
+                    "  {} run `sshx claude-hooks install` to report Claude Code status\n",
+                    Fixed(8).paint("tip"),
+                );
+            }
+        }
+        PlatformAction::Status => match PlatformConfig::load()? {
+            None => println!("\n  {}  Not enrolled (run `sshx platform enroll <url> <token>`)\n", Yellow.paint("ℹ")),
+            Some(config) => {
+                let client = PlatformClient::new(&config)?;
+                match client.whoami().await {
+                    Ok(machine) => println!(
+                        "\n  {}  {} as {} ({}, owner {})\n",
+                        Green.paint("✓"),
+                        Cyan.paint(client.base_url()),
+                        White.bold().paint(&machine.name),
+                        machine.kind,
+                        machine.owner,
+                    ),
+                    Err(err) => println!("\n  {}  {}: {err:#}\n", Yellow.paint("✗"), client.base_url()),
+                }
+            }
+        },
+        PlatformAction::Forget => {
+            if PlatformConfig::forget()? {
+                println!("\n  {}  Platform configuration deleted\n", Green.paint("✓"));
+            } else {
+                println!("\n  {}  No platform configuration\n", Yellow.paint("ℹ"));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -383,6 +557,57 @@ async fn run_session(args: Args) -> Result<()> {
         )
         .await?;
 
+    // Per-terminal tracking: environment, hook socket, cwd/git/process poller.
+    let registry = TerminalRegistry::new();
+    let mut shell_env = vec![(ENV_SESSION.to_string(), controller.name().to_string())];
+    #[cfg(unix)]
+    let _hook_socket = match sshx::agent::spawn_hook_server(registry.clone(), controller.name().to_string()) {
+        Ok(guard) => {
+            shell_env.push((ENV_HOOK_SOCKET.to_string(), guard.path().to_string_lossy().into_owned()));
+            Some(guard)
+        }
+        Err(err) => {
+            warn!("agent hook socket unavailable: {err:#}");
+            None
+        }
+    };
+    spawn_proc_poller(registry.clone());
+    controller.set_shell_context(ShellContext {
+        env: shell_env,
+        registry: Some(registry.clone()),
+    });
+
+    // Register with the platform, if configured.
+    let platform = if args.no_platform {
+        None
+    } else {
+        match PlatformConfig::resolve(args.platform.clone(), args.platform_token.clone()) {
+            Ok(Some(config)) => match PlatformClient::new(&config) {
+                Ok(client) => {
+                    let reg = Registration {
+                        name: controller.name().to_string(),
+                        url: controller.public_url().to_string(),
+                        sshx_server: controller.origin().to_string(),
+                        display_name: name.clone(),
+                        encryption_key: controller.encryption_key().to_string(),
+                        write_password: controller.write_password().map(String::from),
+                    };
+                    Some(sshx::platform::spawn_reporter(client, reg, registry.clone()))
+                        .map(|h| (h, config.url))
+                }
+                Err(err) => {
+                    warn!("invalid platform configuration: {err:#}");
+                    None
+                }
+            },
+            Ok(None) => None,
+            Err(err) => {
+                warn!("invalid platform configuration: {err:#}");
+                None
+            }
+        }
+    };
+
     // Spawn workspace intelligence tasks.
     if !args.no_workspace {
         let workspace_root = workspace_root.unwrap_or_else(|| PathBuf::from("."));
@@ -403,6 +628,15 @@ async fn run_session(args: Args) -> Result<()> {
         }
     } else {
         print_greeting(&shell, &controller);
+        if let Some((_, url)) = &platform {
+            println!("  {}  Platform: {}\n", Green.paint("➜"), Cyan.underline().paint(url));
+            if !sshx::claude_hooks::is_installed() {
+                println!(
+                    "  {} run `sshx claude-hooks install` to report Claude Code status\n",
+                    Fixed(8).paint("tip"),
+                );
+            }
+        }
     }
 
     if !args.no_auto_update {
@@ -444,6 +678,9 @@ async fn run_session(args: Args) -> Result<()> {
         _ = controller.run() => unreachable!(),
         Ok(()) = &mut exit_signal => (),
     };
+    if let Some((handle, _)) = platform {
+        handle.close().await;
+    }
     controller.close().await?;
 
     if let Some(ref mut child) = browser_child {

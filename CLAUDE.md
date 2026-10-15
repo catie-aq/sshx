@@ -320,3 +320,32 @@ The activity feed pipelines Claude Code JSONL transcripts to the browser in real
 - **Linux builds use glibc 2.28 via `cargo zigbuild`, not musl**: musl ignores nsswitch and cannot resolve Tailscale MagicDNS names when systemd-resolved is only reachable through nss-resolve.
 - **Client logic**: `crates/sshx/src/update.rs`. Auto-update is skipped for binaries run from a cargo `target/` directory; opt out with `--no-auto-update` / `SSHX_NO_AUTO_UPDATE=1`.
 - No client/server compatibility check is performed.
+
+---
+
+## Platform Integration & Per-Terminal Agent State (branch `platform`)
+
+The multi-user platform lives in `../sshx-dev-platform` (see its `docs/architecture.md`). sshx stays
+usable on its own; these additions are inert unless a platform is configured or hooks installed.
+
+- **Shell environment** (`runner.rs`, `terminal/unix.rs`): every PTY gets `SSHX_SESSION`,
+  `SSHX_TERMINAL_ID` and `SSHX_HOOK_SOCKET`. `Runner::run` takes a `ShellContext` (env + registry).
+- **`agent.rs`**: `TerminalRegistry` (per terminal: PID, foreground process group, cwd, git info,
+  project, agent state), the private hook socket (`$XDG_RUNTIME_DIR` or `$TMPDIR`/`sshx-<uid>/`,
+  modes 0700/0600), the Claude Code state machine `next_agent_info`, and a 3 s poller (`ps`, and
+  `/proc` or `lsof` for cwd). The shell is "at its prompt" when it leads the foreground process
+  group; an agent is dropped after 10 s quiet at the prompt.
+- **`sshx hook <agent>`** (hidden): forwards a hook payload from stdin to the socket. Handled in
+  `main()` before the runtime starts. Must never print, block or fail.
+- **`claude_hooks.rs`** / `sshx claude-hooks install|uninstall|status`: idempotent edit of
+  `~/.claude/settings.json` (honours `CLAUDE_CONFIG_DIR`, keeps key order, writes a
+  `.sshx-backup`). Hooks are synchronous so events arrive in order.
+- **`platform.rs`** / `sshx platform enroll|status|forget`, `--platform`, `--platform-token`,
+  `--no-platform`: registers the session and reports terminals every change (debounced) or 15 s.
+  Machine token = `smt_<bearer>.<machine key>`; only the bearer part is sent. The session key and
+  terminal metadata are sealed with AES-256-GCM (`seal`/`open`, AAD per slot). Keep the format
+  byte-compatible with the platform's `src/lib/crypto.ts` (shared test vector).
+- **IDE connection token** (`ide.rs` `connection_token`, `src/lib/ideToken.ts`): OpenVSCode now
+  requires a token derived from the session key, passed with `--connection-token-file`; the IDE
+  widget appends `?tkn=`. Previously anyone knowing the session name could open the IDE.
+

@@ -231,6 +231,8 @@ async fn post_unlock(
 pub struct IdeManager {
     /// Path to the `openvscode-server` binary.
     bin_path: PathBuf,
+    /// Connection token required by OpenVSCode Server, if set.
+    connection_token: Option<String>,
     /// IDE instance / widget ID, passed as `SSHX_IDE_ID` env var.
     ide_id: u32,
     /// Port the server is listening on.
@@ -258,6 +260,7 @@ impl IdeManager {
             .join("vscode-data");
         Self {
             bin_path,
+            connection_token: None,
             ide_id,
             port: 0,
             child: None,
@@ -266,6 +269,11 @@ impl IdeManager {
             user_data_dir,
             sync_port: None,
         }
+    }
+
+    /// Require this connection token from browsers (see [`connection_token`]).
+    pub fn set_connection_token(&mut self, token: String) {
+        self.connection_token = Some(token);
     }
 
     /// Set the sync server port (called after sync server is spawned).
@@ -348,10 +356,19 @@ impl IdeManager {
         );
 
         let mut cmd = Command::new(&self.bin_path);
-        cmd.arg("--port")
-            .arg(port.to_string())
-            .arg("--without-connection-token")
-            .arg("--host")
+        cmd.arg("--port").arg(port.to_string());
+        match &self.connection_token {
+            Some(token) => {
+                // A file keeps the token out of the process list.
+                let token_file = self.user_data_dir.join(format!("connection-token-{}", self.ide_id));
+                write_private_file(&token_file, token).context("failed to write the IDE token")?;
+                cmd.arg("--connection-token-file").arg(&token_file);
+            }
+            None => {
+                cmd.arg("--without-connection-token");
+            }
+        }
+        cmd.arg("--host")
             .arg("127.0.0.1")
             .arg("--server-base-path")
             .arg(&self.base_path)
@@ -485,8 +502,51 @@ impl Drop for IdeManager {
 }
 
 /// Find a free TCP port on localhost.
+/// Connection token required by the IDE of a session.
+///
+/// Derived from the end-to-end encryption key, so that only people holding the
+/// session key (URL fragment) can open the IDE: the sshx server relays IDE
+/// traffic but never learns the key. Browsers compute the same value in
+/// `src/lib/ideToken.ts`.
+pub fn connection_token(encryption_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("sshx-ide-connection-token/v1:{encryption_key}"));
+    digest.iter().take(16).map(|b| format!("{b:02x}")).collect()
+}
+
+fn write_private_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(contents.as_bytes())
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, contents)
+}
+
 fn find_free_port() -> Result<u16> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
     Ok(port)
+}
+
+#[cfg(test)]
+mod token_tests {
+    /// Same vector as the TypeScript test in the platform repository.
+    #[test]
+    fn connection_token_vector() {
+        assert_eq!(super::connection_token("abc"), "f76b47e1a1b48f75f85288683bfa6c3a");
+        assert_eq!(super::connection_token("abc"), super::connection_token("abc"));
+        assert_ne!(super::connection_token("abc"), super::connection_token("abd"));
+    }
 }

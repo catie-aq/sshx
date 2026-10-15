@@ -8,6 +8,8 @@
   export let canWrite: boolean;
   /** The session name, used to construct the IDE iframe URL. */
   export let sessionName: string;
+  /** Connection token required by the IDE, derived from the session key. */
+  export let ideToken: string = "";
   /** Map of IDE states, keyed by Wid (widget ID). */
   export let ideStates: Map<number, WsIdeState> = new Map();
   /** Current edit lock state. */
@@ -37,8 +39,7 @@
     if (!iframeEl) return;
     // Navigate the iframe to the IDE URL with the file path appended.
     // OpenVSCode Server supports /?folder=...&file=... query params.
-    const base = iframeUrl.replace(/\/$/, "");
-    iframeEl.src = `${base}/?file=${encodeURIComponent(path)}`;
+    iframeEl.src = `${iframeBase}?tkn=${ideToken}&file=${encodeURIComponent(path)}`;
   }
 
   /** User dot colors for collaborators. */
@@ -59,7 +60,8 @@
     widget.kind.type === "ideEditor"
       ? (widget.kind.ideId ?? (widget.kind as any).ide_id ?? 0)
       : 0;
-  $: iframeUrl = `/ide/s/${sessionName}/${ideId}/`;
+  $: iframeBase = `/ide/s/${sessionName}/${ideId}/`;
+  $: iframeUrl = ideToken ? `${iframeBase}?tkn=${ideToken}` : iframeBase;
 
   /** Other IDE widgets with state (excluding this widget). */
   $: collaborators = (() => {

@@ -11,6 +11,7 @@
   import { debounce, throttle } from "lodash-es";
 
   import { Encrypt } from "./encrypt";
+  import { ideConnectionToken } from "./ideToken";
   import { createLock } from "./lock";
   import { Srocket } from "./srocket";
   import type { WsClient, WsClaudeEvent, WsDrawing, WsFileMetadataUpdate, WsIceCandidate, WsNote, WsServer, WsSlide, WsSourceFile, WsTextBlock, WsUser, WsVideoStream, WsWidget, WsWinsize } from "./protocol";
@@ -522,6 +523,8 @@
   }
 
   let encrypt: Encrypt;
+  /** Connection token of the embedded IDE, derived from the session key. */
+  let ideToken = "";
   let srocket: Srocket<WsServer, WsClient> | null = null;
 
   let connected = false;
@@ -1031,6 +1034,7 @@
     const writePassword = window.location.hash?.slice(1).split(",")[1] ?? null;
 
     encrypt = await Encrypt.new(key);
+    ideToken = await ideConnectionToken(key);
     const encryptedZeros = await encrypt.zeros();
 
     const writeEncryptedZeros = writePassword
@@ -2884,6 +2888,7 @@
             {widget}
             canWrite={hasWriteAccess ?? false}
             sessionName={id}
+            {ideToken}
             {ideStates}
             {editLock}
             users={new Map(users)}
@@ -3300,7 +3305,7 @@
         </button>
       </div>
       <iframe
-        src="/ide/s/{id}/{fullscreenIdeId}/"
+        src="/ide/s/{id}/{fullscreenIdeId}/?tkn={ideToken}"
         title="VS Code IDE (fullscreen)"
         class="flex-1 w-full border-none"
         sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-downloads"

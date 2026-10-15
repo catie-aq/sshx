@@ -43,7 +43,7 @@ pub struct Terminal {
 impl Terminal {
     /// Create a new terminal, with attached PTY.
     #[instrument]
-    pub async fn new(shell: &str) -> Result<Terminal> {
+    pub async fn new(shell: &str, _env: &[(String, String)]) -> Result<Terminal> {
         let mut command = Command::new(shell);
 
         // Set terminal environment variables appropriately.
@@ -63,6 +63,16 @@ impl Terminal {
             writer,
             winsize: (0, 0),
         })
+    }
+
+    /// Process ID tracking is not implemented on Windows.
+    pub fn child_pid(&self) -> u32 {
+        0
+    }
+
+    /// Foreground process tracking is not implemented on Windows.
+    pub fn foreground_pgid(&self) -> Option<u32> {
+        None
     }
 
     /// Get the window size of the TTY.
