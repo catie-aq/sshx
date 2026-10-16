@@ -34,6 +34,11 @@
   import CommandPalette from "./ui/CommandPalette.svelte";
   import ScreenShareWidget from "./ui/ScreenShareWidget.svelte";
   import ImageWidget from "./ui/ImageWidget.svelte";
+  import {
+    annotatedFileName,
+    flattenAnnotations,
+    type ImageAnnotation,
+  } from "./imageAnnotations";
   import AppOverlayWidget from "./ui/AppOverlayWidget.svelte";
   import IdeEditorWidget from "./ui/IdeEditorWidget.svelte";
   import CircleButton from "./ui/CircleButton.svelte";
@@ -52,7 +57,15 @@
   import { EyeIcon } from "svelte-feather-icons";
   import "$lib/fonts"; // Load all font CSS
   import { type SelectionItem, type SelectionRect, normalizeRect, rectContainsPoint } from "$lib/selection";
-  import { UndoHistory, type HistoryAction } from "$lib/history";
+  import {
+    CreateTracker,
+    UndoHistory,
+    applyChange,
+    plain,
+    type HistoryAction,
+    type ObjectKind,
+    type PushOptions,
+  } from "$lib/history";
 
   export let id: string;
 
@@ -440,11 +453,24 @@
         if (tag === "INPUT" || tag === "TEXTAREA" || editable) return;
         e.preventDefault();
         const offset = 40;
+        // One paste is one undo step.
+        const group = `paste-${Date.now()}`;
         for (const item of clipboard) {
           if (item.type === "note" && item.data) {
-            srocket?.send({ createNote: [item.data.x + offset, item.data.y + offset] });
+            const x = item.data.x + offset;
+            const y = item.data.y + offset;
+            // The server creates an empty note; fill it with the copied content.
+            sendCreate({ createNote: [x, y] }, {
+              group,
+              onCreated: (nid) => srocket?.send({ updateNote: [nid, { ...plain(item.data), x, y }] }),
+            });
           } else if (item.type === "textBlock" && item.data) {
-            srocket?.send({ createTextBlock: [item.data.x + offset, item.data.y + offset] });
+            const x = item.data.x + offset;
+            const y = item.data.y + offset;
+            sendCreate({ createTextBlock: [x, y] }, {
+              group,
+              onCreated: (tid) => srocket?.send({ updateTextBlock: [tid, { ...plain(item.data), x, y }] }),
+            });
           } else if (item.type === "drawing" && item.data) {
             const d = item.data;
             const shifted = [...d.points];
@@ -452,12 +478,12 @@
               shifted[i] += offset;
               shifted[i + 1] += offset;
             }
-            srocket?.send({ createDrawing: { ...d, points: shifted } });
+            sendCreate({ createDrawing: { ...d, points: shifted } }, { group });
           }
         }
       }
       // Ctrl+Z: undo
-      if ((e.metaKey || e.ctrlKey) && e.key === "z" && !e.shiftKey) {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z" && !e.shiftKey) {
         const tag = (e.target as HTMLElement)?.tagName;
         const editable = (e.target as HTMLElement)?.isContentEditable;
         if (tag === "INPUT" || tag === "TEXTAREA" || editable) return;
@@ -465,8 +491,8 @@
         const action = undoHistory.undo();
         if (action) applyUndoAction(action);
       }
-      // Ctrl+Shift+Z: redo
-      if ((e.metaKey || e.ctrlKey) && e.key === "z" && e.shiftKey) {
+      // Ctrl+Shift+Z (or Ctrl+Y): redo
+      if ((e.metaKey || e.ctrlKey) && ((e.key.toLowerCase() === "z" && e.shiftKey) || e.key === "y")) {
         const tag = (e.target as HTMLElement)?.tagName;
         const editable = (e.target as HTMLElement)?.isContentEditable;
         if (tag === "INPUT" || tag === "TEXTAREA" || editable) return;
@@ -480,12 +506,19 @@
         const editable = (e.target as HTMLElement)?.isContentEditable;
         if (tag === "INPUT" || tag === "TEXTAREA" || editable) return;
         e.preventDefault();
+        const kinds: Record<string, ObjectKind> = {
+          note: "note",
+          textBlock: "textBlock",
+          widget: "widget",
+          drawing: "drawing",
+        };
+        const actions: HistoryAction[] = [];
         for (const item of selectedItems) {
-          if (item.type === "note") srocket?.send({ deleteNote: item.id });
-          else if (item.type === "textBlock") srocket?.send({ deleteTextBlock: item.id });
-          else if (item.type === "widget") srocket?.send({ closeWidget: item.id });
-          else if (item.type === "drawing") srocket?.send({ deleteDrawing: item.id });
+          const kind = kinds[item.type];
+          const action = kind ? deleteObject(kind, item.id) : null;
+          if (action) actions.push(action);
         }
+        undoHistory.push({ type: "batch", actions });
         selectedItems = [];
       }
     }
@@ -613,6 +646,7 @@
   let resizingNote: { nid: number; startW: number; startH: number; startX: number; startY: number } | null = null;
 
   function startNoteResize(e: MouseEvent, nid: number, note: WsNote) {
+    beginGesture("note", nid);
     const w = note.w || 260;
     const h = note.h || 160;
     resizingNote = { nid, startW: w, startH: h, startX: e.clientX, startY: e.clientY };
@@ -639,6 +673,7 @@
     const note = notes.get(resizingNote.nid);
     if (note) {
       srocket?.send({ updateNote: [resizingNote.nid, { ...note, w, h }] });
+      endGesture({ ...note, w, h });
     }
     resizingNote = null;
     window.removeEventListener("pointermove", onNoteResizeMove);
@@ -675,7 +710,7 @@
     const cx = Math.round(center[0] + window.innerWidth / 2 / zoom - ox);
     const cy = Math.round(center[1] + window.innerHeight / 2 / zoom - oy);
     const order = slides.size + 1;
-    srocket?.send({ createSlide: { x: cx - 480, y: cy - 270, w: 960, h: 540, order, label: "" } });
+    sendCreate({ createSlide: { x: cx - 480, y: cy - 270, w: 960, h: 540, order, label: "" } });
   }
 
   function navigateToSlide(index: number) {
@@ -791,6 +826,7 @@
 
   // Undo/redo
   const undoHistory = new UndoHistory();
+  const createTracker = new CreateTracker();
 
   // Clipboard (local, for copy/paste)
   let clipboard: { type: string; data: any }[] = [];
@@ -798,64 +834,238 @@
   // Alt+drag duplication tracking
   let altDragActive = false;
 
+  /** Widget kinds that can be put back after closing (no state outside the widget). */
+  const RESTORABLE_WIDGETS = new Set(["fileTree", "fileCard", "image"]);
+
+  /** Current state of an undoable object, or undefined if it is gone. */
+  function currentObject(kind: ObjectKind, id: number): any {
+    switch (kind) {
+      case "note": return notes.get(id);
+      case "textBlock": return textBlocks.get(id);
+      case "drawing": return drawings.get(id);
+      case "widget": return widgets.get(id);
+      case "slide": return slides.get(id);
+      case "slideOrder": return [...slides].map(([slid, s]) => [slid, s.order]);
+      case "shell": return shells.find(([sid]) => sid === id)?.[1];
+      case "shellName": return shellNames.get(id) ?? "";
+      case "video": return videoStreams.get(id);
+    }
+  }
+
+  function snapshot(kind: ObjectKind, id: number): any {
+    return plain(currentObject(kind, id));
+  }
+
+  /** Send the messages that bring an object to `value`. */
+  function sendObjectUpdate(kind: ObjectKind, id: number, value: any) {
+    switch (kind) {
+      case "note": srocket?.send({ updateNote: [id, value] }); break;
+      case "textBlock": srocket?.send({ updateTextBlock: [id, value] }); break;
+      case "slide": srocket?.send({ updateSlide: [id, value] }); break;
+      case "slideOrder": srocket?.send({ reorderSlides: value }); break;
+      case "shell": srocket?.send({ move: [id, value] }); break;
+      case "shellName": srocket?.send({ setShellName: [id, value] }); break;
+      case "video": {
+        const cur = videoStreams.get(id);
+        if (!cur) break;
+        if (cur.x !== value.x || cur.y !== value.y) srocket?.send({ moveVideoStream: [id, value.x, value.y] });
+        if (cur.w !== value.w || cur.h !== value.h) srocket?.send({ resizeVideoStream: [id, value.w, value.h] });
+        break;
+      }
+      case "widget": {
+        const cur = widgets.get(id);
+        if (!cur) break;
+        if (cur.x !== value.x || cur.y !== value.y) srocket?.send({ moveWidget: [id, value.x, value.y] });
+        if (cur.w !== value.w || cur.h !== value.h) srocket?.send({ resizeWidget: [id, value.w, value.h] });
+        if (!!cur.collapsed !== !!value.collapsed) srocket?.send({ setWidgetCollapsed: [id, !!value.collapsed] });
+        if ((cur.name ?? "") !== (value.name ?? "") && value.name) {
+          srocket?.send({ setWidgetName: [id, value.name] });
+          if (cur.kind.type === "image") srocket?.send({ pushImageWidget: [id, value.name, cur.name ?? ""] });
+        }
+        if (cur.kind.type === "image" && value.kind?.type === "image") {
+          const before = [cur.kind.annotations ?? "", cur.kind.annotatedUrl ?? ""];
+          const after = [value.kind.annotations ?? "", value.kind.annotatedUrl ?? ""];
+          if (before[0] !== after[0] || before[1] !== after[1]) {
+            srocket?.send({ saveImageAnnotations: [id, after[0], after[1]] });
+          }
+        }
+        break;
+      }
+    }
+  }
+
+  function sendObjectDelete(kind: ObjectKind, id: number) {
+    switch (kind) {
+      case "note": srocket?.send({ deleteNote: id }); break;
+      case "textBlock": srocket?.send({ deleteTextBlock: id }); break;
+      case "drawing": srocket?.send({ deleteDrawing: id }); break;
+      case "widget": srocket?.send({ closeWidget: id }); break;
+      case "slide": srocket?.send({ deleteSlide: id }); break;
+    }
+  }
+
+  function sendObjectRestore(kind: ObjectKind, id: number, data: any) {
+    switch (kind) {
+      case "note": srocket?.send({ restoreNote: [id, data] }); break;
+      case "textBlock": srocket?.send({ restoreTextBlock: [id, data] }); break;
+      case "drawing": srocket?.send({ restoreDrawing: [id, data] }); break;
+      case "widget": srocket?.send({ restoreWidget: [id, data] }); break;
+      case "slide": srocket?.send({ restoreSlide: [id, data] }); break;
+    }
+  }
+
+  /** An empty editor reports "<p></p>" for what the server stores as "". */
+  function normalizeRichText(kind: ObjectKind, value: any): any {
+    const field = kind === "note" ? "text" : kind === "textBlock" ? "content" : null;
+    if (!field || value?.[field] !== "<p></p>") return value;
+    return { ...value, [field]: "" };
+  }
+
+  /** Record a change to an object; no-op changes are dropped. */
+  function recordUpdate(kind: ObjectKind, id: number, before: any, after: any, opts: PushOptions = {}) {
+    if (before === undefined || after === undefined) return;
+    undoHistory.push({
+      type: "update",
+      kind,
+      id,
+      before: plain(normalizeRichText(kind, before)),
+      after: plain(normalizeRichText(kind, after)),
+    }, opts);
+  }
+
+  /** Delete an object, returning the history step that puts it back (if any). */
+  function deleteObject(kind: ObjectKind, id: number): HistoryAction | null {
+    const data = snapshot(kind, id);
+    sendObjectDelete(kind, id);
+    if (data === undefined) return null;
+    if (kind === "widget" && !RESTORABLE_WIDGETS.has(data.kind?.type)) return null;
+    return { type: "delete", kind, id, data };
+  }
+
+  function deleteAndRecord(kind: ObjectKind, id: number) {
+    const action = deleteObject(kind, id);
+    if (action) undoHistory.push(action);
+  }
+
+  function closeWidget(wid: number) {
+    deleteAndRecord("widget", wid);
+  }
+
+  function setWidgetCollapsed(wid: number, collapsed: boolean) {
+    const widget = widgets.get(wid);
+    if (widget) recordUpdate("widget", wid, widget, { ...widget, collapsed });
+    srocket?.send({ setWidgetCollapsed: [wid, collapsed] });
+  }
+
+  /** Record the state of an object when a drag or resize starts. */
+  let gestureStart: { kind: ObjectKind; id: number; before: any } | null = null;
+
+  function beginGesture(kind: ObjectKind, id: number) {
+    gestureStart = { kind, id, before: snapshot(kind, id) };
+  }
+
+  /** Record the finished gesture; `after` defaults to the object's current state. */
+  function endGesture(after?: any) {
+    if (!gestureStart) return;
+    const { kind, id, before } = gestureStart;
+    gestureStart = null;
+    recordUpdate(kind, id, before, after ?? currentObject(kind, id));
+  }
+
+  /**
+   * Send a creation message and record the creation once the server echoes
+   * the new object back with its ID.
+   */
+  function sendCreate(
+    message: WsClient,
+    opts: PushOptions & { onCreated?: (id: number, data: any) => void } = {},
+  ) {
+    const near = (a: number, b: number) => Math.abs(a - b) < 1;
+    let expectation: [ObjectKind, (data: any) => boolean] | null = null;
+    if (message.createNote) {
+      const [x, y] = message.createNote;
+      expectation = ["note", (n) => n.x === x && n.y === y];
+    } else if (message.createTextBlock) {
+      const [x, y] = message.createTextBlock;
+      expectation = ["textBlock", (b) => b.x === x && b.y === y];
+    } else if (message.createDrawing) {
+      const pts = message.createDrawing.points;
+      expectation = ["drawing", (d) =>
+        d.points.length === pts.length &&
+        near(d.points[0], pts[0]) && near(d.points[1], pts[1]) &&
+        near(d.points[pts.length - 2], pts[pts.length - 2]) &&
+        near(d.points[pts.length - 1], pts[pts.length - 1])];
+    } else if (message.createSlide) {
+      const s = message.createSlide;
+      expectation = ["slide", (o) => o.x === s.x && o.y === s.y && o.w === s.w && o.h === s.h];
+    } else if (message.openFileCard) {
+      const [x, y, path] = message.openFileCard;
+      expectation = ["widget", (w) => w.kind.type === "fileCard" && w.kind.path === path && near(w.x, x) && near(w.y, y)];
+    } else if (message.openFileTree) {
+      const [x, y] = message.openFileTree;
+      expectation = ["widget", (w) => w.kind.type === "fileTree" && near(w.x, x) && near(w.y, y)];
+    } else if (message.createImageWidget) {
+      const url = message.createImageWidget[2];
+      expectation = ["widget", (w) => w.kind.type === "image" && w.kind.url === url];
+    }
+    if (expectation) {
+      const [kind, matches] = expectation;
+      createTracker.expect(kind, matches, (id, data) => {
+        undoHistory.push({ type: "create", kind, id, data: plain(data) }, opts);
+        opts.onCreated?.(id, data);
+      });
+    }
+    srocket?.send(message);
+  }
+
+  /** Tell the tracker about objects that appeared in a full list update. */
+  function noticeNew<T>(kind: ObjectKind, before: Map<number, T>, list: [number, T][]) {
+    for (const [id, data] of list) {
+      if (!before.has(id)) createTracker.notice(kind, id, data);
+    }
+  }
+
   function applyUndoAction(action: HistoryAction) {
     switch (action.type) {
-      case "createNote":
-        srocket?.send({ deleteNote: action.id });
+      case "create": {
+        const data = snapshot(action.kind, action.id);
+        if (data !== undefined) action.data = data;
+        sendObjectDelete(action.kind, action.id);
         break;
-      case "deleteNote":
-        srocket?.send({ createNote: [action.data.x, action.data.y] });
+      }
+      case "delete":
+        sendObjectRestore(action.kind, action.id, action.data);
         break;
-      case "updateNote":
-        srocket?.send({ updateNote: [action.id, action.before] });
+      case "update": {
+        const current = currentObject(action.kind, action.id);
+        if (current === undefined) break;
+        sendObjectUpdate(action.kind, action.id, applyChange(plain(current), action.after, action.before));
         break;
-      case "createTextBlock":
-        srocket?.send({ deleteTextBlock: action.id });
-        break;
-      case "deleteTextBlock":
-        srocket?.send({ createTextBlock: [action.data.x, action.data.y] });
-        break;
-      case "updateTextBlock":
-        srocket?.send({ updateTextBlock: [action.id, action.before] });
-        break;
-      case "createDrawing":
-        srocket?.send({ deleteDrawing: action.id });
-        break;
-      case "deleteDrawing":
-        srocket?.send({ createDrawing: action.data });
-        break;
+      }
       case "batch":
-        for (const a of action.actions) applyUndoAction(a);
+        for (const a of [...action.actions].reverse()) applyUndoAction(a);
         break;
     }
   }
 
   function applyRedoAction(action: HistoryAction) {
     switch (action.type) {
-      case "createNote":
-        srocket?.send({ createNote: [action.data.x, action.data.y] });
+      case "create":
+        sendObjectRestore(action.kind, action.id, action.data);
         break;
-      case "deleteNote":
-        srocket?.send({ deleteNote: action.id });
+      case "delete": {
+        // Keep edits made since the undo for the next undo.
+        const data = snapshot(action.kind, action.id);
+        if (data !== undefined) action.data = data;
+        sendObjectDelete(action.kind, action.id);
         break;
-      case "updateNote":
-        srocket?.send({ updateNote: [action.id, action.after] });
+      }
+      case "update": {
+        const current = currentObject(action.kind, action.id);
+        if (current === undefined) break;
+        sendObjectUpdate(action.kind, action.id, applyChange(plain(current), action.before, action.after));
         break;
-      case "createTextBlock":
-        srocket?.send({ createTextBlock: [action.data.x, action.data.y] });
-        break;
-      case "deleteTextBlock":
-        srocket?.send({ deleteTextBlock: action.id });
-        break;
-      case "updateTextBlock":
-        srocket?.send({ updateTextBlock: [action.id, action.after] });
-        break;
-      case "createDrawing":
-        srocket?.send({ createDrawing: action.data });
-        break;
-      case "deleteDrawing":
-        srocket?.send({ deleteDrawing: action.id });
-        break;
+      }
       case "batch":
         for (const a of action.actions) applyRedoAction(a);
         break;
@@ -887,6 +1097,8 @@
   // Workspace intelligence state
   let workspaceRootName = "workspace"; // project folder name, e.g. "my-project"
   let sourceFiles = new Map<string, WsSourceFile>(); // path → metadata
+  /** Absolute path of the directory the CLI runs in, when it streams workspace metadata. */
+  let workspaceRootPath: string | null = null;
   // Per-Claude-session activity state
   type ClaudeInstance = {
     sessionId: string;
@@ -1117,22 +1329,29 @@
           const serverLatency = Date.now() - Number(message.pong);
           serverLatencies = [...serverLatencies, serverLatency].slice(-10);
         } else if (message.notes) {
+          const prev = notes;
           notes = new Map(message.notes);
+          noticeNew("note", prev, message.notes);
         } else if (message.noteDiff) {
           const [nid, note] = message.noteDiff;
           if (note === null) {
             notes.delete(nid);
           } else {
+            const isNew = !notes.has(nid);
             notes.set(nid, note);
+            if (isNew) createTracker.notice("note", nid, note);
           }
           notes = notes; // trigger reactivity
         } else if (message.textBlocks) {
+          const prev = textBlocks;
           textBlocks = new Map(message.textBlocks);
+          noticeNew("textBlock", prev, message.textBlocks);
         } else if (message.textBlockDiff) {
           const [tid, block] = message.textBlockDiff;
           if (block === null) {
             textBlocks.delete(tid);
           } else {
+            if (!textBlocks.has(tid)) createTracker.notice("textBlock", tid, block);
             textBlocks.set(tid, block);
             // Auto-focus newly created text block
             if (pendingAutoFocusPos && block.x === pendingAutoFocusPos[0] && block.y === pendingAutoFocusPos[1]) {
@@ -1143,28 +1362,37 @@
           }
           textBlocks = textBlocks;
         } else if (message.drawings) {
+          const prev = drawings;
           drawings = new Map(message.drawings);
+          noticeNew("drawing", prev, message.drawings);
         } else if (message.drawingDiff) {
           const [did, drawing] = message.drawingDiff;
           if (drawing === null) {
             drawings.delete(did);
           } else {
+            const isNew = !drawings.has(did);
             drawings.set(did, drawing);
+            if (isNew) createTracker.notice("drawing", did, drawing);
           }
           drawings = drawings;
         } else if (message.slides) {
+          const prev = slides;
           slides = new Map(message.slides);
+          noticeNew("slide", prev, message.slides);
         } else if (message.slideDiff) {
           const [slid, slide] = message.slideDiff;
           if (slide === null) {
             slides.delete(slid);
           } else {
+            const isNew = !slides.has(slid);
             slides.set(slid, slide);
+            if (isNew) createTracker.notice("slide", slid, slide);
           }
           slides = slides;
         } else if (message.sourceFiles) {
-          const [root, _rootPath, files] = message.sourceFiles;
+          const [root, rootPath, files] = message.sourceFiles;
           workspaceRootName = root || "workspace";
+          workspaceRootPath = rootPath || null;
           sourceFiles = new Map(files.map((f) => [f.path, f]));
         } else if (message.claudeEvent) {
           const ev = message.claudeEvent;
@@ -1242,13 +1470,16 @@
                   const x = Math.round(center[0] + window.innerWidth / 2 / zoom - ox + n * 30);
                   const y = Math.round(center[1] + window.innerHeight / 2 / zoom - oy + n * 30);
                   autoOpenOffset = (autoOpenOffset + 1) % 8;
+                  // Opened by Claude's activity, not by the user: not an undo step.
                   srocket?.send({ openFileCard: [x, y, filePath] });
                 }
               }
             }
           }
         } else if (message.widgets) {
+          const prev = widgets;
           widgets = new Map(message.widgets);
+          noticeNew("widget", prev, message.widgets);
         } else if (message.widgetDiff) {
           const [wid, widget] = message.widgetDiff;
           if (widget === null) {
@@ -1257,7 +1488,9 @@
             if (widget.kind?.type === "ideEditor") {
               console.log("[sshx] IDE widget received:", JSON.stringify(widget.kind));
             }
+            const isNew = !widgets.has(wid);
             widgets.set(wid, widget);
+            if (isNew) createTracker.notice("widget", wid, widget);
             // Propagate custom widget name into claudeInstances so the dropdown shows it.
             if (widget.kind.type === "claudeFeed" && widget.kind.instanceId) {
               const iid = widget.kind.instanceId;
@@ -1465,10 +1698,11 @@
     const [ox, oy] = getConstantOffset();
     const x = Math.round(center[0] + window.innerWidth / 2 / zoom - ox);
     const y = Math.round(center[1] + window.innerHeight / 2 / zoom - oy);
-    srocket?.send({ openFileTree: [x, y, workspaceRootName] });
+    sendCreate({ openFileTree: [x, y, workspaceRootName] });
   }
 
   function startWidgetResize(e: PointerEvent, wid: number, widget: WsWidget) {
+    beginGesture("widget", wid);
     resizingWidget = { wid, startW: widget.w, startH: widget.h, startX: e.clientX, startY: e.clientY };
     window.addEventListener("pointermove", onWidgetResizeMove);
     window.addEventListener("pointerup", onWidgetResizeEnd, { once: true });
@@ -1493,6 +1727,8 @@
     const rw = Math.round(w);
     const rh = Math.round(h);
     srocket?.send({ resizeWidget: [resizingWidget.wid, rw, rh] });
+    const resized = widgets.get(resizingWidget.wid);
+    if (resized) endGesture({ ...resized, w: rw, h: rh });
     // Persist dimensions to JSON for fileCard widgets so they reopen at the same size.
     if (hasWriteAccess) {
       const widget = widgets.get(resizingWidget.wid);
@@ -1530,7 +1766,7 @@
     for (const [wid, w] of widgets) {
       if (w.kind.type === "appOverlay") {
         if (w.collapsed) {
-          srocket?.send({ setWidgetCollapsed: [wid, false] });
+          setWidgetCollapsed(wid, false);
         } else {
           // Already visible — scroll to it.
           const targetZoom = Math.min(zoom, INITIAL_ZOOM);
@@ -1619,7 +1855,7 @@
       ...[...notes.values()].map((n) => ({ x: n.x, y: n.y, width: 250, height: 200 })),
     ];
     const { x, y } = arrangeNewTerminal(existing);
-    srocket?.send({ createNote: [x, y] });
+    sendCreate({ createNote: [x, y] });
     touchZoom.moveTo([x, y], INITIAL_ZOOM);
   }
 
@@ -1880,6 +2116,7 @@
   let resizingVideo: { vid: number; startW: number; startH: number; startX: number; startY: number } | null = null;
 
   function startVideoResize(e: PointerEvent, vid: number, stream: WsVideoStream) {
+    beginGesture("video", vid);
     resizingVideo = { vid, startW: stream.w, startH: stream.h, startX: e.clientX, startY: e.clientY };
     window.addEventListener("pointermove", onVideoResizeMove);
     window.addEventListener("pointerup", onVideoResizeEnd, { once: true });
@@ -1902,6 +2139,8 @@
     const w = Math.max(200, Math.round(resizingVideo.startW + dw));
     const h = Math.max(150, Math.round(resizingVideo.startH + dh));
     srocket?.send({ resizeVideoStream: [resizingVideo.vid, w, h] });
+    const resizedStream = videoStreams.get(resizingVideo.vid);
+    if (resizedStream) endGesture({ ...resizedStream, w, h });
     resizingVideo = null;
     window.removeEventListener("pointermove", onVideoResizeMove);
   }
@@ -2065,6 +2304,7 @@
           sl.x = movingSlidePos.x;
           sl.y = movingSlidePos.y;
           slides = slides;
+          endGesture();
         }
         movingSlide = null;
         movingSlidePos = null;
@@ -2075,6 +2315,7 @@
         const sl = slides.get(resizingSlide.slid);
         if (sl) {
           srocket?.send({ updateSlide: [resizingSlide.slid, sl] });
+          endGesture();
         }
         resizingSlide = null;
       }
@@ -2089,6 +2330,7 @@
           s.x = movingVideoPos.x;
           s.y = movingVideoPos.y;
           videoStreams = videoStreams;
+          endGesture();
         }
         movingVideo = null;
         movingVideoPos = null;
@@ -2116,6 +2358,7 @@
           w.x = movingWidgetPos.x;
           w.y = movingWidgetPos.y;
           widgets = widgets;
+          endGesture();
         }
         movingWidget = null;
         movingWidgetPos = null;
@@ -2130,6 +2373,7 @@
           base.x = movingNotePos.x;
           base.y = movingNotePos.y;
           notes = notes;
+          endGesture();
         }
         movingNote = null;
         movingNotePos = null;
@@ -2143,6 +2387,7 @@
           base.x = movingTextBlockPos.x;
           base.y = movingTextBlockPos.y;
           textBlocks = textBlocks;
+          endGesture();
         }
         movingTextBlock = null;
         movingTextBlockPos = null;
@@ -2152,9 +2397,11 @@
         movingIsDone = true;
         sendMove.cancel();
         srocket?.send({ move: [moving, movingSize] });
+        endGesture(movingSize);
       }
 
       if (resizing !== -1) {
+        endGesture(resizingSize);
         resizing = -1;
       }
 
@@ -2221,7 +2468,7 @@
               });
             } else {
               const [cx, cy] = lastCanvasMousePos ?? [0, 0];
-              srocket?.send({ createImageWidget: [cx, cy, url, pastedName, pastedName] });
+              sendCreate({ createImageWidget: [cx, cy, url, pastedName, pastedName] });
             }
           } catch (err) {
             console.error("Image paste upload failed:", err);
@@ -2233,6 +2480,37 @@
     document.addEventListener("paste", handlePaste);
     return () => document.removeEventListener("paste", handlePaste);
   });
+
+  /**
+   * Store an image's annotations and upload the flattened copy, which the CLI
+   * saves as `.sshx/images/<stem>-annotated.png`.
+   */
+  async function saveImageAnnotations(wid: number, annotations: ImageAnnotation[]) {
+    const widget = widgets.get(wid);
+    if (widget?.kind.type !== "image") return;
+    const withAnnotations = (annotationsJson: string, annotatedUrl: string) => ({
+      ...widget,
+      kind: { ...widget.kind, annotations: annotationsJson || undefined, annotatedUrl: annotatedUrl || undefined },
+    });
+    if (annotations.length === 0) {
+      recordUpdate("widget", wid, widget, withAnnotations("", ""));
+      srocket?.send({ saveImageAnnotations: [wid, "", ""] });
+      return;
+    }
+    try {
+      const blob = await flattenAnnotations(widget.kind.url, annotations);
+      const formData = new FormData();
+      formData.append("file", blob, annotatedFileName(widget.name ?? "image.png"));
+      const res = await fetch(`/api/s/${id}/upload`, { method: "POST", body: formData });
+      if (!res.ok) throw new Error(`upload failed: ${res.status}`);
+      const { url } = (await res.json()) as { url: string };
+      recordUpdate("widget", wid, widgets.get(wid), withAnnotations(JSON.stringify(annotations), url));
+      srocket?.send({ saveImageAnnotations: [wid, JSON.stringify(annotations), url] });
+    } catch (err) {
+      console.error("Saving image annotations failed:", err);
+      makeToast({ kind: "error", message: "Could not save the annotations." });
+    }
+  }
 
   let focused: number[] = [];
   $: setFocus(focused);
@@ -2376,11 +2654,14 @@
         canWrite={hasWriteAccess ?? false}
         on:navigate={({ detail }) => navigateToSlide(detail)}
         on:create={handleCreateSlide}
-        on:reorder={({ detail }) => srocket?.send({ reorderSlides: detail })}
+        on:reorder={({ detail }) => {
+          recordUpdate("slideOrder", 0, currentObject("slideOrder", 0), detail);
+          srocket?.send({ reorderSlides: detail });
+        }}
         on:play={startSlideshowPlay}
         on:exportPdf={handleExportPdf}
         on:stop={stopSlideshowPlay}
-        on:delete={({ detail: slid }) => srocket?.send({ deleteSlide: slid })}
+        on:delete={({ detail: slid }) => deleteAndRecord("slide", slid)}
       />
     </div>
   {/if}
@@ -2468,7 +2749,7 @@
       if (textToolActive && e.target === fabricEl) {
         const [x, y] = normalizePosition(e);
         pendingAutoFocusPos = [x, y];
-        srocket?.send({ createTextBlock: [x, y] });
+        sendCreate({ createTextBlock: [x, y] });
         textToolActive = false;
         textToolGhost = null;
       }
@@ -2487,7 +2768,7 @@
       activeTool={drawingTool}
       color={drawingColor}
       canWrite={hasWriteAccess ?? false}
-      on:create={({ detail }) => srocket?.send({ createDrawing: detail })}
+      on:create={({ detail }) => sendCreate({ createDrawing: detail })}
     />
 
     {#each shells as [id, winsize] (id)}
@@ -2511,6 +2792,7 @@
           bind:write={writers[id]}
           bind:termEl={termElements[id]}
           on:nameChange={({ detail: name }) => {
+            recordUpdate("shellName", id, shellNames.get(id) ?? "", name);
             srocket?.send({ setShellName: [id, name] });
           }}
           on:titleChange={({ detail: title }) => {
@@ -2525,6 +2807,7 @@
             const rows = Math.max(ws.rows - 4, TERM_MIN_ROWS);
             const cols = Math.max(ws.cols - 10, TERM_MIN_COLS);
             if (rows !== ws.rows || cols !== ws.cols) {
+              recordUpdate("shell", id, ws, { ...ws, rows, cols });
               srocket?.send({ move: [id, { ...ws, rows, cols }] });
             }
           }}
@@ -2533,6 +2816,7 @@
             const rows = Math.min(ws.rows + 4, MOBILE_MAX_ROWS);
             const cols = Math.min(ws.cols + 10, MOBILE_MAX_COLS);
             if (rows !== ws.rows || cols !== ws.cols) {
+              recordUpdate("shell", id, ws, { ...ws, rows, cols });
               srocket?.send({ move: [id, { ...ws, rows, cols }] });
             }
           }}
@@ -2556,6 +2840,7 @@
             } else {
               const [x, y] = normalizePosition(event);
               moving = id;
+              beginGesture("shell", id);
               movingOrigin = [x - ws.x, y - ws.y];
               movingSize = ws;
               movingIsDone = false;
@@ -2596,6 +2881,7 @@
             const canvasEl = termElements[id].querySelector(".xterm-screen");
             if (canvasEl) {
               resizing = id;
+              beginGesture("shell", id);
               const r = canvasEl.getBoundingClientRect();
               resizingOrigin = [event.pageX - r.width, event.pageY - r.height];
               resizingCell = [r.width / ws.cols, r.height / ws.rows];
@@ -2625,6 +2911,7 @@
             if (!hasWriteAccess || note.pinned) return;
             const [x, y] = normalizePosition(event);
             movingNote = nid;
+            beginGesture("note", nid);
             movingNoteOrigin = [x - note.x, y - note.y];
             movingNotePos = { x: note.x, y: note.y };
           }}
@@ -2632,11 +2919,10 @@
             startNoteResize(event, nid, note);
           }}
           on:update={({ detail: updatedNote }) => {
+            recordUpdate("note", nid, notes.get(nid), updatedNote, { coalesce: true });
             srocket?.send({ updateNote: [nid, updatedNote] });
           }}
-          on:delete={() => {
-            srocket?.send({ deleteNote: nid });
-          }}
+          on:delete={() => deleteAndRecord("note", nid)}
         />
       </div>
     {/each}
@@ -2661,15 +2947,15 @@
             if (!hasWriteAccess) return;
             const [x, y] = normalizePosition(event);
             movingTextBlock = tid;
+            beginGesture("textBlock", tid);
             movingTextBlockOrigin = [x - block.x, y - block.y];
             movingTextBlockPos = { x: block.x, y: block.y };
           }}
           on:update={({ detail: updatedBlock }) => {
+            recordUpdate("textBlock", tid, textBlocks.get(tid), updatedBlock, { coalesce: true });
             srocket?.send({ updateTextBlock: [tid, updatedBlock] });
           }}
-          on:delete={() => {
-            srocket?.send({ deleteTextBlock: tid });
-          }}
+          on:delete={() => deleteAndRecord("textBlock", tid)}
         />
       </div>
     {/each}
@@ -2697,22 +2983,23 @@
               if (!hasWriteAccess) return;
               const [x, y] = normalizePosition(event);
               movingWidget = wid;
+              beginGesture("widget", wid);
               movingWidgetOrigin = [x - widget.x, y - widget.y];
               movingWidgetPos = { x: widget.x, y: widget.y };
             }}
-            on:delete={() => srocket?.send({ closeWidget: wid })}
+            on:delete={() => closeWidget(wid)}
             on:dragFile={({ detail: { path, event } }) => {
               if (!hasWriteAccess) return;
               if (!focusExistingFileCard(path)) {
                 const [x, y] = normalizePosition(event);
-                srocket?.send({ openFileCard: [Math.round(x + 30), Math.round(y), path] });
+                sendCreate({ openFileCard: [Math.round(x + 30), Math.round(y), path] });
               }
             }}
             on:collapse={({ detail: newCollapsed }) => {
               console.log("[collapse] fileTree wid=", wid, "collapsed=", newCollapsed);
               widget.collapsed = newCollapsed;
               widgets = widgets;
-              srocket?.send({ setWidgetCollapsed: [wid, newCollapsed] });
+              setWidgetCollapsed(wid, newCollapsed);
             }}
           />
         {:else if widget.kind.type === "fileCard"}
@@ -2727,14 +3014,15 @@
               if (!hasWriteAccess) return;
               const [x, y] = normalizePosition(event);
               movingWidget = wid;
+              beginGesture("widget", wid);
               movingWidgetOrigin = [x - widget.x, y - widget.y];
               movingWidgetPos = { x: widget.x, y: widget.y };
             }}
-            on:delete={() => srocket?.send({ closeWidget: wid })}
+            on:delete={() => closeWidget(wid)}
             on:openFile={({ detail: path }) => {
               if (!hasWriteAccess) return;
               if (!focusExistingFileCard(path)) {
-                srocket?.send({ openFileCard: [widget.x + 30, widget.y + 30, path] });
+                sendCreate({ openFileCard: [widget.x + 30, widget.y + 30, path] });
               }
             }}
             on:describe={({ detail: path }) => srocket?.send({ describeFiles: [path] })}
@@ -2749,7 +3037,7 @@
               console.log("[collapse] fileCard wid=", wid, "collapsed=", newCollapsed);
               widget.collapsed = newCollapsed;
               widgets = widgets;
-              srocket?.send({ setWidgetCollapsed: [wid, newCollapsed] });
+              setWidgetCollapsed(wid, newCollapsed);
             }}
             on:loadImports={() => {
               if (!hasWriteAccess || widget.kind.type !== "fileCard") return;
@@ -2758,7 +3046,7 @@
               let offset = 0;
               for (const imp of sf.localImports) {
                 if (![...widgets.values()].some((w) => w.kind.type === "fileCard" && w.kind.path === imp)) {
-                  srocket?.send({ openFileCard: [widget.x - 320 + offset * 10, widget.y + offset * 15, imp] });
+                  sendCreate({ openFileCard: [widget.x - 320 + offset * 10, widget.y + offset * 15, imp] });
                   offset++;
                 }
               }
@@ -2770,7 +3058,7 @@
               let offset = 0;
               for (const dep of sf.importedBy) {
                 if (![...widgets.values()].some((w) => w.kind.type === "fileCard" && w.kind.path === dep)) {
-                  srocket?.send({ openFileCard: [widget.x + 320 + offset * 10, widget.y + offset * 15, dep] });
+                  sendCreate({ openFileCard: [widget.x + 320 + offset * 10, widget.y + offset * 15, dep] });
                   offset++;
                 }
               }
@@ -2816,6 +3104,7 @@
               if (!hasWriteAccess) return;
               const [x, y] = normalizePosition(event);
               movingWidget = wid;
+              beginGesture("widget", wid);
               movingWidgetOrigin = [x - widget.x, y - widget.y];
               movingWidgetPos = { x: widget.x, y: widget.y };
             }}
@@ -2823,10 +3112,11 @@
             on:collapse={({ detail: newCollapsed }) => {
               widget.collapsed = newCollapsed;
               widgets = widgets;
-              srocket?.send({ setWidgetCollapsed: [wid, newCollapsed] });
+              setWidgetCollapsed(wid, newCollapsed);
             }}
             on:rename={({ detail: newName }) => {
               if (!hasWriteAccess) return;
+              recordUpdate("widget", wid, widget, { ...widget, name: newName });
               srocket?.send({ setWidgetName: [wid, newName] });
             }}
             on:highlightFile={({ detail: path }) => {
@@ -2834,7 +3124,7 @@
                 const [ox, oy] = getConstantOffset();
                 const x = Math.round(center[0] + window.innerWidth / 2 / zoom - ox);
                 const y = Math.round(center[1] + window.innerHeight / 2 / zoom - oy);
-                srocket?.send({ openFileCard: [x, y, path] });
+                sendCreate({ openFileCard: [x, y, path] });
               }
             }}
             on:toggleAutoOpen={() => { autoOpenCards = !autoOpenCards; }}
@@ -2844,20 +3134,26 @@
         {:else if widget.kind.type === "image"}
           <ImageWidget
             {widget}
+            workspaceRoot={workspaceRootPath}
             canWrite={hasWriteAccess ?? false}
             on:startMove={({ detail: event }) => {
               if (!hasWriteAccess) return;
               const [x, y] = normalizePosition(event);
               movingWidget = wid;
+              beginGesture("widget", wid);
               movingWidgetOrigin = [x - widget.x, y - widget.y];
               movingWidgetPos = { x: widget.x, y: widget.y };
             }}
-            on:delete={() => srocket?.send({ closeWidget: wid })}
+            on:delete={() => closeWidget(wid)}
             on:rename={({ detail: newName }) => {
               if (!hasWriteAccess) return;
               const oldName = widget.name ?? "";
+              recordUpdate("widget", wid, widget, { ...widget, name: newName });
               srocket?.send({ setWidgetName: [wid, newName] });
               srocket?.send({ pushImageWidget: [wid, newName, oldName] });
+            }}
+            on:saveAnnotations={({ detail: annotations }) => {
+              if (hasWriteAccess) saveImageAnnotations(wid, annotations);
             }}
           />
         {:else if widget.kind.type === "appOverlay"}
@@ -2869,14 +3165,15 @@
               if (!hasWriteAccess) return;
               const [x, y] = normalizePosition(event);
               movingWidget = wid;
+              beginGesture("widget", wid);
               movingWidgetOrigin = [x - widget.x, y - widget.y];
               movingWidgetPos = { x: widget.x, y: widget.y };
             }}
-            on:delete={() => srocket?.send({ setWidgetCollapsed: [wid, true] })}
+            on:delete={() => setWidgetCollapsed(wid, true)}
             on:collapse={({ detail: newCollapsed }) => {
               widget.collapsed = newCollapsed;
               widgets = widgets;
-              srocket?.send({ setWidgetCollapsed: [wid, newCollapsed] });
+              setWidgetCollapsed(wid, newCollapsed);
             }}
             on:updateSettings={({ detail: { url, allowOpenFile, allowOpenClaude } }) => {
               srocket?.send({ updateAppOverlay: [wid, url, allowOpenFile, allowOpenClaude] });
@@ -2897,10 +3194,12 @@
               if (!hasWriteAccess) return;
               const [x, y] = normalizePosition(event);
               movingWidget = wid;
+              beginGesture("widget", wid);
               movingWidgetOrigin = [x - widget.x, y - widget.y];
               movingWidgetPos = { x: widget.x, y: widget.y };
             }}
             on:resize={({ detail }) => {
+              recordUpdate("widget", wid, widget, { ...widget, w: detail.w, h: detail.h });
               srocket?.send({ resizeWidget: [wid, detail.w, detail.h] });
             }}
             on:maximize={({ detail: ideId }) => { fullscreenIdeWid = wid; fullscreenIdeId = ideId; }}
@@ -2959,6 +3258,7 @@
           on:startMove={({ detail: event }) => {
             const [x, y] = normalizePosition(event);
             movingVideo = vid;
+            beginGesture("video", vid);
             movingVideoOrigin = [x - stream.x, y - stream.y];
             movingVideoPos = { x: stream.x, y: stream.y };
           }}
@@ -3013,7 +3313,7 @@
           on:openFile={({ detail: path }) => {
             if (!hasWriteAccess) return;
             if (!focusExistingFileCard(path)) {
-              srocket?.send({ openFileCard: [pos.x + 260, pos.y, path] });
+              sendCreate({ openFileCard: [pos.x + 260, pos.y, path] });
             }
           }}
         />
@@ -3039,13 +3339,15 @@
               if (!hasWriteAccess) return;
               const [x, y] = normalizePosition(event);
               movingSlide = slid;
+              beginGesture("slide", slid);
               movingSlideOrigin = [x - sl.x, y - sl.y];
               movingSlidePos = { x: sl.x, y: sl.y };
             }}
             on:startResize={({ detail: e }) => {
+              beginGesture("slide", slid);
               resizingSlide = { slid, startW: sl.w, startH: sl.h, startX: e.clientX, startY: e.clientY };
             }}
-            on:delete={() => srocket?.send({ deleteSlide: slid })}
+            on:delete={() => deleteAndRecord("slide", slid)}
           />
         </div>
       {/each}
@@ -3099,10 +3401,10 @@
       } else if (detail === "new-text") {
         if (!hasWriteAccess) { makeToast("error", "Write access required"); return; }
         pendingAutoFocusPos = [cx, cy];
-        srocket?.send({ createTextBlock: [cx, cy] });
+        sendCreate({ createTextBlock: [cx, cy] });
       } else if (detail === "new-note") {
         if (!hasWriteAccess) { makeToast("error", "Write access required"); return; }
-        srocket?.send({ createNote: [cx, cy] });
+        sendCreate({ createNote: [cx, cy] });
       } else if (detail === "open-file") {
         filePickerScreenPos = [contextMenuX, contextMenuY];
         filePickerCanvasPos = [cx, cy];
@@ -3111,7 +3413,7 @@
         if (!hasWriteAccess) { makeToast("error", "Write access required"); return; }
         const exists = [...widgets.values()].some(w => w.kind.type === "fileTree");
         if (!exists) {
-          srocket?.send({ openFileTree: [cx, cy, workspaceRootName] });
+          sendCreate({ openFileTree: [cx, cy, workspaceRootName] });
         }
         workspaceOpen = !workspaceOpen;
       }
@@ -3127,7 +3429,7 @@
         filePickerOpen = false;
         const [cx, cy] = filePickerCanvasPos;
         if (!focusExistingFileCard(path)) {
-          srocket?.send({ openFileCard: [cx, cy, path] });
+          sendCreate({ openFileCard: [cx, cy, path] });
         }
       }}
       on:close={() => (filePickerOpen = false)}

@@ -354,3 +354,38 @@ usable on its own; these additions are inert unless a platform is configured or 
   requires a token derived from the session key, passed with `--connection-token-file`; the IDE
   widget appends `?tkn=`. Previously anyone knowing the session name could open the IDE.
 
+
+---
+
+## Image Annotations
+
+Pasted images (`ImageWidget.svelte`) are saved by the CLI under `.sshx/images/<name>`. The title
+bar has a copy button (relative path, for pasting into a terminal / Claude) and, with write access,
+an annotate button: freehand drawing and text, stored as vectors in the image's pixel space
+(`WsWidgetKind::Image.annotations`, JSON) so they stay editable. Saving flattens them into a PNG
+(`src/lib/imageAnnotations.ts`), uploads it and sends `saveImageAnnotations`; the server pushes it to
+the CLI as `.sshx/images/<stem>-annotated.png`, and the copy button then copies that path. Keep
+`sanitizeImageName`/`annotatedFileName` in step with `sanitize_image_name` (`workspace.rs`) and
+`annotated_file_name` (`socket.rs`).
+
+---
+
+## Undo / Redo
+
+⌘Z / Ctrl+Z undoes, ⌘⇧Z / Ctrl+Y redoes, per browser tab (`src/lib/history.ts`, wired in
+`Session.svelte`). Ignored while typing in an input/editor or when a terminal has focus.
+
+- **Steps**: `create` / `delete` / `update` / `batch` on an `ObjectKind` (note, textBlock, drawing,
+  widget, slide, slideOrder, shell, shellName, video). Replayed as ordinary messages, so other users
+  see the change. Updates only re-apply the fields that changed (`applyChange`), so concurrent edits
+  to other fields survive.
+- **Same IDs**: deleted objects come back under their original ID via `restoreNote`,
+  `restoreTextBlock`, `restoreDrawing`, `restoreSlide`, `restoreWidget` (server checks the ID was
+  already issued; widgets limited to fileTree / fileCard / image).
+- **Creations**: the server picks the ID, so `sendCreate` registers what was sent and
+  `CreateTracker` pairs it with the next new object of that kind that matches (position, path, URL).
+  New create paths must go through `sendCreate`; automatic ones (Claude auto-open) must not.
+- **Gestures**: call `beginGesture(kind, id)` when a drag/resize starts and `endGesture()` when it
+  ends — the server echoes intermediate positions, so the start state must be captured up front.
+- Text edits coalesce (`{ coalesce: true }`); a paste or a multi-selection delete is one step.
+- Not undoable: creating/closing terminals, IDE / Claude feed widgets, chat, screen shares.

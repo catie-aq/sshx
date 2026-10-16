@@ -396,6 +396,83 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>, ice_server
                     send(socket, WsServer::Error(err.to_string())).await?;
                 }
             }
+            WsClient::RestoreNote(id, note) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                // Only IDs this session has already handed out may come back.
+                let result = if id.0 < session.counter().get_all_values().next_nid {
+                    session.insert_note(id, note)
+                } else {
+                    Err(anyhow::anyhow!("this note cannot be restored"))
+                };
+                if let Err(err) = result {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
+            }
+            WsClient::RestoreTextBlock(id, block) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                let result = if id.0 < session.counter().get_all_values().next_tid {
+                    session.insert_text_block(id, block)
+                } else {
+                    Err(anyhow::anyhow!("this text block cannot be restored"))
+                };
+                if let Err(err) = result {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
+            }
+            WsClient::RestoreDrawing(id, drawing) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                let result = if id.0 < session.counter().get_all_values().next_did {
+                    session.add_drawing(id, drawing)
+                } else {
+                    Err(anyhow::anyhow!("this drawing cannot be restored"))
+                };
+                if let Err(err) = result {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
+            }
+            WsClient::RestoreSlide(id, slide) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                let result = if id.0 < session.counter().get_all_values().next_slid {
+                    session.add_slide(id, slide)
+                } else {
+                    Err(anyhow::anyhow!("this slide cannot be restored"))
+                };
+                if let Err(err) = result {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
+            }
+            WsClient::RestoreWidget(id, widget) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                let restorable = match &widget.kind {
+                    WsWidgetKind::FileTree { .. } | WsWidgetKind::FileCard { .. } => true,
+                    WsWidgetKind::Image { url, annotated_url, .. } => {
+                        is_upload_url(url) && annotated_url.as_deref().map_or(true, is_upload_url)
+                    }
+                    _ => false,
+                };
+                // Only IDs this session has already handed out may come back.
+                let issued = id.0 < session.counter().get_all_values().next_wid;
+                if !restorable || !issued {
+                    send(socket, WsServer::Error("this widget cannot be restored".into())).await?;
+                } else if let Err(err) = session.add_widget(id, widget) {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                }
+            }
             WsClient::SetWidgetCollapsed(id, collapsed) => {
                 if let Err(err) = session.set_widget_collapsed(id, collapsed) {
                     send(socket, WsServer::Error(err.to_string())).await?;
@@ -764,7 +841,12 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>, ice_server
                     y,
                     w: 400,
                     h: 300,
-                    kind: WsWidgetKind::Image { url: url.clone(), alt },
+                    kind: WsWidgetKind::Image {
+                        url: url.clone(),
+                        alt,
+                        annotations: None,
+                        annotated_url: None,
+                    },
                     collapsed: false,
                     name: auto_name.clone().filter(|n| !n.is_empty()),
                 };
@@ -805,6 +887,7 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>, ice_server
                         _ => None,
                     });
                 if let Some(url) = url {
+                    let annotated_names = (annotated_file_name(&new_name), annotated_file_name(&old_name));
                     // Rename the file on disk if the name changed.
                     let local = url.trim_start_matches('/');
                     let new_url = rename_upload_file(local, &new_name).await.unwrap_or_else(|| url.clone());
@@ -832,11 +915,80 @@ async fn handle_socket(socket: &mut WebSocket, session: Arc<Session>, ice_server
                         }
                         Err(e) => warn!("image push: could not read {read_path}: {e}"),
                     }
+                    // Keep the annotated copy's filename in step with the image's.
+                    let annotated = session.list_widgets().into_iter()
+                        .find(|(id, _)| *id == wid)
+                        .and_then(|(_, w)| match w.kind {
+                            WsWidgetKind::Image { annotated_url, .. } => annotated_url,
+                            _ => None,
+                        });
+                    if let Some(annotated_url) = annotated {
+                        push_upload_to_cli(
+                            &session,
+                            &annotated_url,
+                            annotated_names.0,
+                            annotated_names.1,
+                        )
+                        .await;
+                    }
+                }
+            }
+            WsClient::SaveImageAnnotations(wid, annotations, annotated_url) => {
+                if let Err(e) = session.check_write_permission(user_id) {
+                    send(socket, WsServer::Error(e.to_string())).await?;
+                    continue;
+                }
+                if !annotated_url.is_empty() && !is_upload_url(&annotated_url) {
+                    send(socket, WsServer::Error("invalid annotated image URL".into())).await?;
+                    continue;
+                }
+                let name = session.list_widgets().into_iter()
+                    .find(|(id, _)| *id == wid)
+                    .map(|(_, w)| w.name.unwrap_or_else(|| format!("image-{}.png", wid.0)));
+                if let Err(err) = session.set_image_annotations(wid, annotations, annotated_url.clone()) {
+                    send(socket, WsServer::Error(err.to_string())).await?;
+                } else if let (Some(name), false) = (name, annotated_url.is_empty()) {
+                    push_upload_to_cli(&session, &annotated_url, annotated_file_name(&name), String::new()).await;
                 }
             }
         }
     }
     Ok(())
+}
+
+/// Whether a client-supplied URL points inside the server's upload directory.
+fn is_upload_url(url: &str) -> bool {
+    url.starts_with("/uploads/") && !url.split('/').any(|part| part == "..")
+}
+
+/// Filename of an image's annotated copy in the CLI workspace:
+/// `shot.png` becomes `shot-annotated.png`.
+fn annotated_file_name(name: &str) -> String {
+    if name.is_empty() {
+        return String::new();
+    }
+    let stem = match name.rfind('.') {
+        Some(i) if i > 0 => &name[..i],
+        _ => name,
+    };
+    format!("{stem}-annotated.png")
+}
+
+/// Send an uploaded file to the CLI, which saves it under `.sshx/images/`.
+async fn push_upload_to_cli(session: &Session, url: &str, name: String, old_name: String) {
+    if name.is_empty() || !is_upload_url(url) {
+        return;
+    }
+    let local = url.trim_start_matches('/');
+    match tokio::fs::read(local).await {
+        Ok(data) => {
+            session.update_tx()
+                .send(ServerMessage::ImageFile(ImageFile { name, data: data.into(), old_name }))
+                .await
+                .ok();
+        }
+        Err(e) => warn!("image push: could not read {local}: {e}"),
+    }
 }
 
 /// Rename an uploaded file on disk to match a new user-chosen name.

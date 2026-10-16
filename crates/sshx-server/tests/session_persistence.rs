@@ -110,6 +110,8 @@ async fn test_json_snapshot_roundtrip() -> Result<()> {
             kind: WsWidgetKind::Image {
                 url: "/uploads/test.png".into(),
                 alt: "test image".into(),
+                annotations: None,
+                annotated_url: None,
             },
             collapsed: false,
             name: Some("My Image".into()),

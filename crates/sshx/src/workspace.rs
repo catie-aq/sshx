@@ -409,7 +409,10 @@ async fn send_db(db: &AnalysisDb, tx: &mpsc::Sender<ClientMessage>) -> Result<()
 fn load_or_build(root: &Path) -> AnalysisDb {
     let path = root.join(ANALYSIS_FILENAME);
     match AnalysisDb::load(&path) {
-        Ok(Some(db)) => {
+        Ok(Some(mut db)) => {
+            // The file may come from another checkout; the browser relies on
+            // this root to build absolute paths.
+            db.workspace_root = root.to_string_lossy().into_owned();
             info!(
                 files = db.file_count(),
                 described = db.described_count(),

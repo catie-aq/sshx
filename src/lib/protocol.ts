@@ -64,7 +64,15 @@ export type WsWidgetKind =
   | { type: "fileTree"; root: string }
   | { type: "fileCard"; path: string }
   | { type: "claudeFeed"; instanceId: string }
-  | { type: "image"; url: string; alt: string }
+  | {
+      type: "image";
+      url: string;
+      alt: string;
+      /** Drawing and text annotations, JSON-encoded `ImageAnnotation[]`. */
+      annotations?: string;
+      /** The image flattened with its annotations. */
+      annotatedUrl?: string;
+    }
   | { type: "appOverlay"; url: string; allowOpenFile: boolean; allowOpenClaude: boolean }
   | { type: "ideEditor"; workspaceLabel: string; ideId: number };
 
@@ -283,6 +291,13 @@ export type WsClient = {
   moveWidget?: [Wid, number, number];
   resizeWidget?: [Wid, number, number];
   closeWidget?: Wid;
+  /** Put back deleted objects under their original IDs (undo). */
+  restoreNote?: [Nid, WsNote];
+  restoreTextBlock?: [Tid, WsTextBlock];
+  restoreDrawing?: [Did, WsDrawing];
+  restoreSlide?: [Slid, WsSlide];
+  /** Put back a closed widget under its original ID (undo). */
+  restoreWidget?: [Wid, WsWidget];
   /** Toggle the collapsed state of a widget. */
   setWidgetCollapsed?: [Wid, boolean];
   /** Request AI descriptions for the listed file paths (empty = all undescribed). */
@@ -325,6 +340,8 @@ export type WsClient = {
   createImageWidget?: [number, number, string, string, string | null];
   /** Push an ImageWidget's image to the CLI with a given filename. [wid, newName, oldName] */
   pushImageWidget?: [Wid, string, string];
+  /** Save an ImageWidget's annotations. [wid, annotationsJson, annotatedUrl]; empty clears. */
+  saveImageAnnotations?: [Wid, string, string];
   /** Request all connected overlay clients to flash a component by name. */
   highlightComponent?: string;
   /** Open the app overlay widget at canvas position (x, y). */

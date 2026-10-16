@@ -242,6 +242,12 @@ pub enum WsWidgetKind {
         url: String,
         /// Optional alt text / filename.
         alt: String,
+        /// Drawing and text annotations, as JSON (edited in the browser).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        annotations: Option<String>,
+        /// URL of the image flattened with its annotations.
+        #[serde(default, rename = "annotatedUrl", skip_serializing_if = "Option::is_none")]
+        annotated_url: Option<String>,
     },
     /// App observability overlay panel.
     AppOverlay {
@@ -567,6 +573,17 @@ pub enum WsClient {
     ResizeWidget(Wid, u32, u32),
     /// Remove a widget from the canvas.
     CloseWidget(Wid),
+    /// Put back a deleted sticky note under its original ID (undo).
+    RestoreNote(Nid, WsNote),
+    /// Put back a deleted text block under its original ID (undo).
+    RestoreTextBlock(Tid, WsTextBlock),
+    /// Put back a deleted drawing under its original ID (undo).
+    RestoreDrawing(Did, WsDrawing),
+    /// Put back a deleted slide under its original ID (undo).
+    RestoreSlide(Slid, WsSlide),
+    /// Put back a closed widget under its original ID (undo). Only file trees,
+    /// file cards and images, which have no state outside the widget.
+    RestoreWidget(Wid, WsWidget),
     /// Toggle the collapsed state of a widget.
     SetWidgetCollapsed(Wid, bool),
     /// Request AI descriptions for the listed files (empty = all undescribed files).
@@ -610,6 +627,9 @@ pub enum WsClient {
     CreateImageWidget(i32, i32, String, String, Option<String>),
     /// Push an ImageWidget's image to the CLI with the given filename. (wid, new_name, old_name)
     PushImageWidget(Wid, String, String),
+    /// Save an ImageWidget's annotations: (wid, annotations JSON, flattened image URL).
+    /// Empty strings clear them.
+    SaveImageAnnotations(Wid, String, String),
     /// Request all connected overlay clients to flash a component by name.
     HighlightComponent(String),
     /// Open the app overlay widget at canvas position (x, y).

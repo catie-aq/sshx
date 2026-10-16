@@ -502,7 +502,6 @@ impl Session {
 
     /// Add a new sticky note at the given canvas position.
     pub fn add_note(&self, id: Nid, x: i32, y: i32) -> Result<()> {
-        use std::collections::hash_map::Entry::*;
         let note = WsNote {
             x,
             y,
@@ -513,6 +512,12 @@ impl Session {
             h: 0,
             font: String::new(),
         };
+        self.insert_note(id, note)
+    }
+
+    /// Add a sticky note with the given content, e.g. one put back by undo.
+    pub fn insert_note(&self, id: Nid, note: WsNote) -> Result<()> {
+        use std::collections::hash_map::Entry::*;
         match self.notes.write().entry(id) {
             Occupied(_) => bail!("note already exists with id={id}"),
             Vacant(v) => {
@@ -568,7 +573,6 @@ impl Session {
 
     /// Add a new text block at the given canvas position.
     pub fn add_text_block(&self, id: Tid, x: i32, y: i32) -> Result<()> {
-        use std::collections::hash_map::Entry::*;
         let block = WsTextBlock {
             x,
             y,
@@ -578,6 +582,12 @@ impl Session {
             align: "left".into(),
             font: String::new(),
         };
+        self.insert_text_block(id, block)
+    }
+
+    /// Add a text block with the given content, e.g. one put back by undo.
+    pub fn insert_text_block(&self, id: Tid, block: WsTextBlock) -> Result<()> {
+        use std::collections::hash_map::Entry::*;
         match self.text_blocks.write().entry(id) {
             Occupied(_) => bail!("text block already exists with id={id}"),
             Vacant(v) => {
@@ -626,7 +636,13 @@ impl Session {
 
     /// Add a new drawing stroke.
     pub fn add_drawing(&self, id: Did, drawing: WsDrawing) -> Result<()> {
-        self.drawings.write().insert(id, drawing.clone());
+        use std::collections::hash_map::Entry::*;
+        match self.drawings.write().entry(id) {
+            Occupied(_) => bail!("drawing already exists with id={id}"),
+            Vacant(v) => {
+                v.insert(drawing.clone());
+            }
+        }
         self.drawings_source.send_modify(|s| s.push((id, drawing)));
         self.sync_now();
         Ok(())
@@ -654,7 +670,13 @@ impl Session {
 
     /// Add a new slide.
     pub fn add_slide(&self, id: Slid, slide: WsSlide) -> Result<()> {
-        self.slides.write().insert(id, slide.clone());
+        use std::collections::hash_map::Entry::*;
+        match self.slides.write().entry(id) {
+            Occupied(_) => bail!("slide already exists with id={id}"),
+            Vacant(v) => {
+                v.insert(slide.clone());
+            }
+        }
         self.broadcast.send(WsServer::SlideDiff(id, Some(slide))).ok();
         self.sync_now();
         Ok(())
@@ -1135,6 +1157,40 @@ impl Session {
                     *url = new_url;
                 }
                 entry.1.name = if new_name.is_empty() { None } else { Some(new_name) };
+            }
+        });
+        let updated = self.widgets.read().get(&id).cloned();
+        if let Some(widget) = updated {
+            self.broadcast.send(WsServer::WidgetDiff(id, Some(widget))).ok();
+        }
+        Ok(())
+    }
+
+    /// Set or clear (empty strings) the annotations of an image widget.
+    pub fn set_image_annotations(
+        &self,
+        id: Wid,
+        new_annotations: String,
+        new_annotated_url: String,
+    ) -> Result<()> {
+        let to_opt = |s: String| if s.is_empty() { None } else { Some(s) };
+        let apply = |kind: &mut WsWidgetKind| {
+            if let WsWidgetKind::Image { annotations, annotated_url, .. } = kind {
+                *annotations = to_opt(new_annotations.clone());
+                *annotated_url = to_opt(new_annotated_url.clone());
+            }
+        };
+        {
+            let mut widgets = self.widgets.write();
+            let widget = widgets.get_mut(&id).context("widget not found")?;
+            if !matches!(widget.kind, WsWidgetKind::Image { .. }) {
+                bail!("widget is not an image");
+            }
+            apply(&mut widget.kind);
+        }
+        self.widget_source.send_modify(|s| {
+            if let Some(entry) = s.iter_mut().find(|(wid, _)| *wid == id) {
+                apply(&mut entry.1.kind);
             }
         });
         let updated = self.widgets.read().get(&id).cloned();
