@@ -193,6 +193,9 @@ npm run build
 
 # Run tests
 cargo test
+
+# Free disk space (target/ alone often exceeds 10 GB); -n for a dry run
+./scripts/clean.sh            # --light: caches only, --all: also node_modules/ and uploads/
 ```
 
 See `mprocs.yaml` for exact dev commands and `Tailscale.md` for deployment notes.
