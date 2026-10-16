@@ -52,7 +52,7 @@
   import type { SearchItem } from "./protocol";
   import { slide } from "./action/slide";
   import { TouchZoom, INITIAL_ZOOM } from "./action/touchZoom";
-  import { arrangeNewTerminal } from "./arrange";
+  import { NEW_TERMINAL_SIZE, arrangeNewTerminal, isFreeForTerminal } from "./arrange";
   import { settings } from "./settings";
   import { EyeIcon } from "svelte-feather-icons";
   import "$lib/fonts"; // Load all font CSS
@@ -1822,9 +1822,34 @@
       width: termWrappers[id].clientWidth,
       height: termWrappers[id].clientHeight,
     }));
-    const { x, y } = arrangeNewTerminal(existing);
+    placeNewTerminal(existing);
+  }
+
+  /**
+   * Top-left of a new terminal centered on screen, when it fits in the window
+   * at the current zoom without covering a terminal, widget or note.
+   */
+  function centeredTerminalSpot(terminals: { x: number; y: number; width: number; height: number }[]) {
+    const { width, height } = NEW_TERMINAL_SIZE;
+    if (width * zoom > window.innerWidth || height * zoom > window.innerHeight) return null;
+    const [ox, oy] = getConstantOffset();
+    const x = Math.round(center[0] + window.innerWidth / 2 / zoom - ox - width / 2);
+    const y = Math.round(center[1] + window.innerHeight / 2 / zoom - oy - height / 2);
+    const obstacles = [
+      ...terminals,
+      ...[...widgets.values()].map((w) => ({ x: w.x, y: w.y, width: w.w, height: w.h })),
+      ...[...notes.values()].map((n) => ({ x: n.x, y: n.y, width: n.w || 260, height: n.h || 160 })),
+    ];
+    return isFreeForTerminal(x, y, obstacles) ? { x, y } : null;
+  }
+
+  /** Create a terminal in the middle of the screen if there is room, else next to the others. */
+  function placeNewTerminal(terminals: { x: number; y: number; width: number; height: number }[]) {
+    const spot = centeredTerminalSpot(terminals);
+    const { x, y } = spot ?? arrangeNewTerminal(terminals);
     srocket?.send({ create: [x, y] });
-    touchZoom.moveTo([x, y], INITIAL_ZOOM);
+    // A centered terminal is already in view; only pan to one placed elsewhere.
+    if (!spot) touchZoom.moveTo([x, y], INITIAL_ZOOM);
   }
 
   function handleCreateWithInput(command: string) {
@@ -1837,9 +1862,7 @@
       width: termWrappers[id]?.clientWidth ?? 200,
       height: termWrappers[id]?.clientHeight ?? 150,
     }));
-    const { x, y } = arrangeNewTerminal(existing);
-    srocket?.send({ create: [x, y] });
-    touchZoom.moveTo([x, y], INITIAL_ZOOM);
+    placeNewTerminal(existing);
   }
 
   function handleCreateNote() {
