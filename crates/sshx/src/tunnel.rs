@@ -105,10 +105,19 @@ impl HttpTunnel {
         match request_builder.send().await {
             Ok(response) => {
                 let status_code = response.status().as_u16() as u32;
-                let mut headers = HashMap::new();
+                // The protocol carries one value per header name: repeated
+                // headers (several Set-Cookie) are joined with newlines, which
+                // header values cannot contain, and split by the server.
+                let mut headers: HashMap<String, String> = HashMap::new();
                 for (key, value) in response.headers() {
                     if let Ok(v) = value.to_str() {
-                        headers.insert(key.as_str().to_string(), v.to_string());
+                        headers
+                            .entry(key.as_str().to_string())
+                            .and_modify(|joined| {
+                                joined.push('\n');
+                                joined.push_str(v);
+                            })
+                            .or_insert_with(|| v.to_string());
                     }
                 }
 

@@ -58,7 +58,7 @@ administrator only sees metadata.
 | **Session persistence** — widgets and notes survive restarts. | working | automatic |
 | **Custom session slugs** — readable URLs (`/s/<slug>`). | working | `--slug <name>` |
 | **Administration & sharing** — `/api/sessions` behind an admin token (constant-time check) and a `/sessions` page listing sessions, users and shells; **Share** button copying the session URL. | working | `sshx-server --admin-token <secret>` (or `SSHX_ADMIN_TOKEN`) |
-| **Per-terminal agent state & platform** — each terminal knows its directory, git repo and foreground process; Claude Code hooks report working / question / permission / done per terminal; sessions can register with the multi-user [sshx platform](../sshx-dev-platform) using an end-to-end encrypted machine token. | working | `sshx platform enroll <url> <token>` (also installs the Claude Code hooks), `sshx platform status` |
+| **Per-terminal agent state & platform** — each terminal knows its directory, git repo and foreground process; Claude Code hooks report working / question / permission / done per terminal; sessions can register with the multi-user [SSHX Platform](../sshx-dev-platform) using an end-to-end encrypted machine token. | working | `sshx platform enroll <url> <token>` (also installs the Claude Code hooks), `sshx platform status` |
 | **Self-update** — `sshx update` installs the latest client published by the server it points to; a background check runs at most hourly. | working | `sshx update [--check] [--force]`, opt out with `--no-auto-update` |
 
 Detailed write-ups (in French) of each feature — description, implications,
@@ -282,8 +282,12 @@ Platform is detected automatically:
 |---|---|---|
 | Linux | x86_64 | `linux-x64` |
 | Linux | aarch64 | `linux-arm64` |
-| macOS | x86_64 (Intel) | `darwin-x64` |
-| macOS | aarch64 (Apple Silicon) | `darwin-arm64` |
+
+Gitpod publishes no macOS build. On macOS, sshx runs `serve-web` from the official VS Code CLI instead:
+the one inside an installed Visual Studio Code, or else the standalone CLI downloaded to
+`~/.sshx/vscode-cli/`. The CLI downloads the VS Code server (~600 MB, Microsoft's
+[server license](https://aka.ms/vscode-server-license), accepted with `--accept-server-license-terms`)
+into `~/.sshx/vscode-web/` on the first request, behind its own waiting page.
 
 ### Storage layout
 
@@ -300,6 +304,10 @@ Platform is detected automatically:
 ```
 
 When sshx is upgraded and pins a newer OpenVSCode version, the old install is automatically replaced on next `--ide` run.
+
+Sessions registered with SSHX Platform (`sshx platform enroll`) offer VS Code without `--ide`: the first
+"Ouvrir dans VS Code" from the platform downloads OpenVSCode Server in the background, behind a waiting
+page that reloads itself, and opens the terminal's folder (`?folder=`). `--no-ide` turns this off.
 
 ### Advanced usage
 

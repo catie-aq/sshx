@@ -328,7 +328,7 @@ The activity feed pipelines Claude Code JSONL transcripts to the browser in real
 
 ## Platform Integration & Per-Terminal Agent State (branch `platform`)
 
-The multi-user platform lives in `../sshx-dev-platform` (see its `docs/architecture.md`). sshx stays
+The multi-user platform, SSHX Platform, lives in `../sshx-dev-platform` (see its `docs/architecture.md`). sshx stays
 usable on its own; these additions are inert unless a platform is configured or hooks installed.
 
 - **Shell environment** (`runner.rs`, `terminal/unix.rs`): every PTY gets `SSHX_SESSION`,

@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::pin::pin;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use sshx_core::proto::{
@@ -67,6 +68,8 @@ pub struct Controller {
     ide_managers: HashMap<u32, IdeManager>,
     /// IDE sync server handle for the sshx-collab extension.
     ide_sync: Option<IdeSyncHandle>,
+    /// Installation of OpenVSCode Server on first use, when enabled.
+    ide_install: Option<Arc<Mutex<IdeInstall>>>,
     /// Environment and registry shared with every spawned shell.
     shell_ctx: ShellContext,
 }
@@ -187,6 +190,7 @@ impl Controller {
             http_tunnels: HashMap::new(),
             ide_managers: HashMap::new(),
             ide_sync,
+            ide_install: None,
             shell_ctx: ShellContext::default(),
         })
     }
@@ -267,7 +271,7 @@ impl Controller {
     async fn try_channel(&mut self) -> Result<()> {
         let (tx, rx) = mpsc::channel(16);
 
-        let hello = if self.openvscode_bin.is_some() {
+        let hello = if self.has_ide() {
             ClientMessage::Hello(format!("{},{},ide", self.name, self.token))
         } else {
             ClientMessage::Hello(format!("{},{}", self.name, self.token))
@@ -464,9 +468,86 @@ impl Controller {
         });
     }
 
-    /// Returns true if the IDE feature is available (binary configured).
+    /// Returns true if the IDE feature is available (binary configured or
+    /// installed on first use).
     pub fn has_ide(&self) -> bool {
-        self.openvscode_bin.is_some()
+        self.openvscode_bin.is_some() || self.ide_install.is_some()
+    }
+
+    /// Offer the IDE without a configured binary: OpenVSCode Server is
+    /// downloaded in the background by the first IDE request, which gets a
+    /// waiting page meanwhile. Used by platform sessions, so that "Open in VS
+    /// Code" works without `--ide`. No-op on unsupported platforms.
+    pub fn enable_ide_install(&mut self) {
+        if self.has_ide() || !crate::openvscode::is_supported() {
+            return;
+        }
+        if let Some(bin) = crate::openvscode::installed_binary() {
+            self.openvscode_bin = Some(bin);
+        } else {
+            self.ide_install = Some(Arc::default());
+        }
+        if self.ide_sync.is_none() {
+            match ide::spawn_sync_server(self.output_tx.clone()) {
+                Ok(handle) => self.ide_sync = Some(handle),
+                Err(e) => warn!("failed to start IDE sync server: {e}"),
+            }
+        }
+    }
+
+    /// Take the installed binary, or start the installation and answer the
+    /// request with a waiting page. Returns `None` if the request was answered.
+    async fn installed_ide_bin(&mut self, tunnel_id: u32) -> Option<PathBuf> {
+        let install = self.ide_install.clone()?;
+        let page = {
+            let mut state = install.lock().unwrap();
+            match std::mem::take(&mut *state) {
+                IdeInstall::Ready(bin) => {
+                    self.ide_install = None;
+                    return Some(bin);
+                }
+                IdeInstall::Idle => {
+                    *state = IdeInstall::Running;
+                    let install = install.clone();
+                    tokio::spawn(async move {
+                        let result = crate::openvscode::ensure_binary().await;
+                        *install.lock().unwrap() = match result {
+                            Ok(bin) => IdeInstall::Ready(bin),
+                            Err(err) => {
+                                error!("failed to install OpenVSCode Server: {err:#}");
+                                IdeInstall::Failed(format!("{err:#}"))
+                            }
+                        };
+                    });
+                    (503, ide::install_page(None))
+                }
+                IdeInstall::Running => {
+                    *state = IdeInstall::Running;
+                    (503, ide::install_page(None))
+                }
+                // Reported once; the next request starts over.
+                IdeInstall::Failed(err) => (502, ide::install_page(Some(&err))),
+            }
+        };
+        self.reply_html(tunnel_id, page.0, page.1).await;
+        None
+    }
+
+    /// Answer a tunneled request with an HTML page.
+    async fn reply_html(&self, tunnel_id: u32, status_code: u32, html: String) {
+        let headers = [
+            ("content-type", "text/html; charset=utf-8"),
+            ("cache-control", "no-store"),
+        ];
+        let resp = sshx_core::proto::HttpTunnelResponse {
+            tunnel_id,
+            status_code,
+            headers: headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            body_chunk: html.into(),
+            done: true,
+            websocket_accepted: false,
+        };
+        self.output_tx.send(ClientMessage::HttpTunnelResponse(resp)).await.ok();
     }
 
     /// Handle an HTTP tunnel request: start the correct IDE instance if needed, then forward.
@@ -478,6 +559,12 @@ impl Controller {
 
         // Lazy-start the IDE instance for this ide_id on first request.
         if !self.http_tunnels.contains_key(&ide_id) {
+            if self.openvscode_bin.is_none() && self.ide_install.is_some() {
+                match self.installed_ide_bin(tunnel_id).await {
+                    Some(bin) => self.openvscode_bin = Some(bin),
+                    None => return,
+                }
+            }
             let bin = match &self.openvscode_bin {
                 Some(b) => b.clone(),
                 None => {
@@ -546,6 +633,16 @@ impl Controller {
         client.close(req).await?;
         Ok(())
     }
+}
+
+/// Progress of an on-demand OpenVSCode Server installation.
+#[derive(Default)]
+enum IdeInstall {
+    #[default]
+    Idle,
+    Running,
+    Ready(PathBuf),
+    Failed(String),
 }
 
 /// Attempt to send a client message over an update channel.

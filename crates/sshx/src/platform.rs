@@ -1,4 +1,4 @@
-//! Registration of sshx sessions with an sshx platform server.
+//! Registration of sshx sessions with an SSHX Platform server.
 //!
 //! The platform is a multi-user web app listing every terminal of a user's
 //! machines (see the `sshx-dev-platform` repository). A machine authenticates

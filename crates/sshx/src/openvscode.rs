@@ -1,8 +1,13 @@
-//! Auto-download and manage the OpenVSCode Server binary.
+//! Auto-download and manage the IDE server binary.
 //!
-//! When `--ide` is passed, sshx checks `~/.sshx/openvscode-server/` for a
-//! matching version. If missing or outdated, it downloads the correct release
+//! On Linux, sshx checks `~/.sshx/openvscode-server/` for a matching version
+//! of OpenVSCode Server. If missing or outdated, it downloads the release
 //! tarball from GitHub, extracts it, and returns the binary path.
+//!
+//! Gitpod publishes no macOS build, so on macOS sshx runs `serve-web` from the
+//! official VS Code CLI instead: the one inside an installed Visual Studio
+//! Code, or else the standalone CLI downloaded to `~/.sshx/vscode-cli/`. The
+//! CLI downloads the matching VS Code server itself on the first request.
 
 use std::path::{Path, PathBuf};
 
@@ -21,19 +26,13 @@ const VERSION_MARKER: &str = ".version";
 
 /// Return the platform slug used in the Gitpod release tarball name.
 ///
-/// Supported: `linux-x64`, `linux-arm64`, `darwin-x64`, `darwin-arm64`.
+/// Supported: `linux-x64`, `linux-arm64` (Gitpod publishes no macOS build).
 fn platform_slug() -> Result<&'static str> {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     { return Ok("linux-x64"); }
 
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     { return Ok("linux-arm64"); }
-
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    { return Ok("darwin-x64"); }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    { return Ok("darwin-arm64"); }
 
     #[allow(unreachable_code)]
     {
@@ -58,23 +57,85 @@ fn installed_version(dir: &Path) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-/// Ensure the OpenVSCode Server binary is available at the expected path.
-///
-/// Downloads and extracts the release tarball on first use or version mismatch.
-/// Returns the path to `bin/openvscode-server`.
-pub async fn ensure_binary() -> Result<PathBuf> {
-    let dir = install_dir()?;
-    let bin = dir.join("bin").join("openvscode-server");
+/// Whether an IDE server can be installed on this platform.
+pub fn is_supported() -> bool {
+    platform_slug().is_ok() || cfg!(target_os = "macos")
+}
 
-    // Fast path: already installed and version matches.
-    if bin.exists() {
-        if let Some(v) = installed_version(&dir) {
-            if v == OPENVSCODE_VERSION {
-                info!("OpenVSCode Server v{OPENVSCODE_VERSION} already installed");
-                return Ok(bin);
-            }
-            info!("version mismatch (installed: {v}, expected: {OPENVSCODE_VERSION}), upgrading");
-        }
+/// Whether `bin` is the VS Code CLI (run as `serve-web`) rather than
+/// OpenVSCode Server.
+pub fn is_vscode_cli(bin: &Path) -> bool {
+    matches!(bin.file_name().and_then(|n| n.to_str()), Some("code" | "code-tunnel"))
+}
+
+/// Path to an IDE server binary usable without downloading anything.
+pub fn installed_binary() -> Option<PathBuf> {
+    if cfg!(target_os = "macos") {
+        return vscode_cli_candidates().into_iter().find(|p| p.is_file());
+    }
+    let dir = install_dir().ok()?;
+    let bin = dir.join("bin").join("openvscode-server");
+    (bin.exists() && installed_version(&dir).as_deref() == Some(OPENVSCODE_VERSION)).then_some(bin)
+}
+
+/// VS Code CLIs, in order of preference: an installed Visual Studio Code,
+/// then the standalone CLI previously downloaded by sshx.
+fn vscode_cli_candidates() -> Vec<PathBuf> {
+    const APP_CLI: &str = "Visual Studio Code.app/Contents/Resources/app/bin/code-tunnel";
+    let mut paths = vec![Path::new("/Applications").join(APP_CLI)];
+    if let Some(home) = dirs::home_dir() {
+        paths.push(home.join("Applications").join(APP_CLI));
+        paths.push(home.join(".sshx").join("vscode-cli").join("code"));
+    }
+    paths
+}
+
+/// Download the standalone VS Code CLI (macOS) into `~/.sshx/vscode-cli/`.
+async fn install_vscode_cli() -> Result<PathBuf> {
+    let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "x64" };
+    let url = format!("https://update.code.visualstudio.com/latest/cli-darwin-{arch}/stable");
+    let home = dirs::home_dir().context("could not determine home directory")?;
+    let dir = home.join(".sshx").join("vscode-cli");
+    std::fs::create_dir_all(&dir).context("failed to create ~/.sshx/vscode-cli")?;
+
+    eprintln!("\n  Downloading the VS Code CLI (darwin-{arch})...");
+    let bytes = download_with_progress(&url).await?;
+    let zip = dir.join("vscode-cli.zip");
+    std::fs::write(&zip, &bytes).context("failed to save the VS Code CLI archive")?;
+    let status = tokio::process::Command::new("/usr/bin/ditto")
+        .args(["-x", "-k"])
+        .arg(&zip)
+        .arg(&dir)
+        .status()
+        .await
+        .context("failed to run ditto")?;
+    std::fs::remove_file(&zip).ok();
+    let bin = dir.join("code");
+    if !status.success() || !bin.is_file() {
+        bail!("could not extract the VS Code CLI from {url}");
+    }
+    eprintln!("  Installed to {}\n", bin.display());
+    Ok(bin)
+}
+
+/// Ensure an IDE server binary is available, downloading it if needed: the
+/// VS Code CLI on macOS, OpenVSCode Server elsewhere.
+pub async fn ensure_binary() -> Result<PathBuf> {
+    if let Some(bin) = installed_binary() {
+        info!(bin = %bin.display(), "IDE server already installed");
+        return Ok(bin);
+    }
+    if cfg!(target_os = "macos") {
+        return install_vscode_cli().await;
+    }
+    install_openvscode().await
+}
+
+/// Download and extract the OpenVSCode Server release tarball.
+async fn install_openvscode() -> Result<PathBuf> {
+    let dir = install_dir()?;
+    if let Some(v) = installed_version(&dir) {
+        info!("version mismatch (installed: {v}, expected: {OPENVSCODE_VERSION}), upgrading");
     }
 
     let platform = platform_slug()?;
@@ -148,7 +209,7 @@ pub async fn ensure_binary() -> Result<PathBuf> {
         dir.display()
     );
 
-    Ok(bin)
+    Ok(dir.join("bin").join("openvscode-server"))
 }
 
 /// Download a URL, printing the total size when known.
@@ -180,11 +241,19 @@ mod tests {
 
     #[test]
     fn test_platform_slug() {
-        let slug = platform_slug().expect("should detect platform");
-        assert!(
-            ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64"].contains(&slug),
-            "unexpected slug: {slug}"
-        );
+        if cfg!(target_os = "linux") {
+            let slug = platform_slug().expect("should detect platform");
+            assert!(["linux-x64", "linux-arm64"].contains(&slug), "unexpected slug: {slug}");
+        } else {
+            assert!(platform_slug().is_err(), "Gitpod publishes Linux builds only");
+        }
+    }
+
+    #[test]
+    fn test_is_vscode_cli() {
+        assert!(is_vscode_cli(Path::new("/x/Visual Studio Code.app/Contents/Resources/app/bin/code-tunnel")));
+        assert!(is_vscode_cli(Path::new("/home/u/.sshx/vscode-cli/code")));
+        assert!(!is_vscode_cli(Path::new("/home/u/.sshx/openvscode-server/bin/openvscode-server")));
     }
 
     #[test]

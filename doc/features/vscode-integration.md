@@ -21,6 +21,19 @@ SSHX_OPENVSCODE_BIN=/path/to/openvscode-server sshx
 
 Sans `--ide` ou `--openvscode-bin`, la fonctionnalité IDE est désactivée et aucun widget IDE n'est proposé dans le canvas.
 
+### Sessions inscrites sur SSHX Platform
+
+Une session inscrite sur la plateforme (`sshx platform enroll`) propose l'IDE sans `--ide`
+(`Controller::enable_ide_install`, désactivable par `--no-ide`) :
+
+- si la version épinglée est déjà installée, elle est utilisée directement ;
+- sinon, la première requête IDE lance `ensure_binary()` en tâche de fond et reçoit une page
+  d'attente (`ide::install_page`, HTTP 503, rechargée toutes les 2 s) ; un échec est affiché une fois
+  (HTTP 502), la requête suivante relance l'installation.
+
+Le bouton « Ouvrir dans VS Code » de la plateforme ouvre `/ide/s/{session}/1/?tkn=…&folder=<dossier du
+terminal>` dans un nouvel onglet : une seule instance OpenVSCode par session, une fenêtre par dossier.
+
 ---
 
 ## Téléchargement automatique — `crates/sshx/src/openvscode.rs`
@@ -31,7 +44,16 @@ Sans `--ide` ou `--openvscode-bin`, la fonctionnalité IDE est désactivée et a
 | Source | `github.com/gitpod-io/openvscode-server/releases` |
 | Répertoire d'installation | `~/.sshx/openvscode-server/` |
 | Marqueur de version | `~/.sshx/openvscode-server/.version` |
-| Plateformes supportées | `linux-x64`, `linux-arm64`, `darwin-x64`, `darwin-arm64` |
+| Plateformes supportées | `linux-x64`, `linux-arm64` (Gitpod ne publie rien pour macOS) |
+
+Sur macOS, sshx lance `serve-web` du CLI officiel de VS Code : celui d'un Visual Studio Code installé,
+sinon le CLI autonome téléchargé dans `~/.sshx/vscode-cli/` (`openvscode::installed_binary`,
+`is_vscode_cli`). Mêmes options (`--server-base-path`, `--connection-token-file`, `--default-folder`),
+plus `--accept-server-license-terms` (licence Microsoft). Le CLI télécharge le serveur (~600 Mo) dans
+`~/.sshx/vscode-web/` à la première requête, derrière sa propre page d'attente. Il pose deux cookies
+(`vscode-tkn`, `vscode-cli-secret-half`) : le tunnel transporte donc les en-têtes répétés, joints par
+des sauts de ligne (`tunnel.rs`) puis séparés par sshx-server (`ide_proxy.rs`). L'IDE est lancé dans
+son propre groupe de processus, arrêté en entier quand sshx s'arrête.
 
 L'extraction est atomique : le tarball est extrait dans un répertoire `.tmp`, puis un `rename` atomique remplace l'ancienne installation. Un éventuel répertoire `.tmp` résiduel (crash précédent) est nettoyé au démarrage.
 

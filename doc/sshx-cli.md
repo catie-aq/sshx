@@ -41,6 +41,7 @@ Options:
   --browser-bin <PATH>    Path to sshx-browser binary
   --openvscode-bin <PATH> Path to OpenVSCode Server binary
   --ide                   Enable IDE mode (auto-downloads OpenVSCode)
+  --no-ide                Platform sessions: do not offer VS Code (installed on first use otherwise)
 
 Subcommands:
   analyze                 Run workspace analysis → .sshx-analysis.json

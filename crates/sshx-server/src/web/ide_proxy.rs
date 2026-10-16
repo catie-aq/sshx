@@ -212,12 +212,16 @@ async fn do_http_tunnel(
                     got_response = true;
                     status_code = StatusCode::from_u16(resp.status_code as u16)
                         .unwrap_or(StatusCode::BAD_GATEWAY);
-                    for (key, value) in &resp.headers {
-                        if let (Ok(k), Ok(v)) = (
-                            axum::http::header::HeaderName::from_bytes(key.as_bytes()),
-                            axum::http::header::HeaderValue::from_str(value),
-                        ) {
-                            response_headers.insert(k, v);
+                    // Repeated headers (several Set-Cookie) arrive joined
+                    // with newlines, see `tunnel.rs` in the CLI.
+                    for (key, values) in &resp.headers {
+                        let Ok(k) = axum::http::header::HeaderName::from_bytes(key.as_bytes()) else {
+                            continue;
+                        };
+                        for value in values.split('\n') {
+                            if let Ok(v) = axum::http::header::HeaderValue::from_str(value) {
+                                response_headers.append(k.clone(), v);
+                            }
                         }
                     }
                 }

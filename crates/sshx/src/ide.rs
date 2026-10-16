@@ -355,7 +355,11 @@ impl IdeManager {
             "launching OpenVSCode Server"
         );
 
+        let serve_web = crate::openvscode::is_vscode_cli(&self.bin_path);
         let mut cmd = Command::new(&self.bin_path);
+        if serve_web {
+            cmd.arg("serve-web");
+        }
         cmd.arg("--port").arg(port.to_string());
         match &self.connection_token {
             Some(token) => {
@@ -373,16 +377,32 @@ impl IdeManager {
             .arg("--server-base-path")
             .arg(&self.base_path)
             .arg("--default-folder")
-            .arg(&self.workspace_dir)
-            .arg("--user-data-dir")
-            .arg(&self.user_data_dir);
+            .arg(&self.workspace_dir);
 
-        // Point to bundled extensions if available.
-        let ext_dir = self.extensions_dir();
-        if ext_dir.exists() {
-            cmd.arg("--extensions-dir").arg(&ext_dir);
-            debug!(ext_dir = %ext_dir.display(), "using bundled extensions dir");
+        if serve_web {
+            // The VS Code CLI downloads its server on the first request (it
+            // shows a waiting page meanwhile) and keeps it, with its data, here.
+            let dir = self.user_data_dir.with_file_name("vscode-web");
+            cmd.arg("--accept-server-license-terms")
+                .arg("--disable-telemetry")
+                .arg("--server-data-dir")
+                .arg(&dir)
+                .arg("--cli-data-dir")
+                .arg(dir.join("cli"));
+        } else {
+            cmd.arg("--user-data-dir").arg(&self.user_data_dir);
+
+            // Point to bundled extensions if available.
+            let ext_dir = self.extensions_dir();
+            if ext_dir.exists() {
+                cmd.arg("--extensions-dir").arg(&ext_dir);
+                debug!(ext_dir = %ext_dir.display(), "using bundled extensions dir");
+            }
         }
+
+        // Own process group, so that Drop also stops the helpers it starts.
+        #[cfg(unix)]
+        cmd.process_group(0);
 
         // Pass the sync port and IDE instance ID as environment variables for the extension.
         if let Some(sync_port) = self.sync_port {
@@ -497,7 +517,13 @@ impl IdeManager {
 
 impl Drop for IdeManager {
     fn drop(&mut self) {
-        // kill_on_drop is set, so the child will be killed when dropped.
+        // kill_on_drop only kills the direct child: OpenVSCode's launcher
+        // script and the VS Code CLI both leave a server process behind.
+        #[cfg(unix)]
+        if let Some(pid) = self.child.as_ref().and_then(|c| c.id()) {
+            use nix::sys::signal::{killpg, Signal};
+            killpg(nix::unistd::Pid::from_raw(pid as i32), Signal::SIGTERM).ok();
+        }
     }
 }
 
@@ -512,6 +538,47 @@ pub fn connection_token(encryption_key: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(format!("sshx-ide-connection-token/v1:{encryption_key}"));
     digest.iter().take(16).map(|b| format!("{b:02x}")).collect()
+}
+
+/// Page shown while the IDE server is installed on first use (or after the
+/// installation failed). It reloads itself until VS Code answers instead.
+pub fn install_page(error: Option<&str>) -> String {
+    let escape = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let (refresh, body) = match error {
+        None => (
+            r#"<meta http-equiv="refresh" content="2">"#,
+            "<p class=\"spin\">Installation de VS Code sur la machine…</p>\
+             <p>Première ouverture : sshx télécharge le serveur VS Code dans <code>~/.sshx</code>, \
+             une seule fois. Cette page se recharge toute seule.</p>"
+                .to_string(),
+        ),
+        Some(err) => (
+            "",
+            format!(
+                "<p class=\"err\">L'installation de VS Code a échoué.</p><pre>{}</pre>\
+                 <p><a href=\"\">Réessayer</a></p>",
+                escape(err)
+            ),
+        ),
+    };
+    format!(
+        r#"<!doctype html><html lang="fr"><head><meta charset="utf-8">{refresh}
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>VS Code</title>
+<style>
+body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: #18181b;
+  color: #a1a1aa; font: 15px/1.6 system-ui, sans-serif; }}
+main {{ max-width: 32rem; padding: 1.5rem; }}
+p:first-child {{ color: #f4f4f5; font-weight: 600; }}
+.err {{ color: #f87171 !important; }}
+code, pre {{ font-family: ui-monospace, monospace; font-size: 13px; color: #d4d4d8; }}
+pre {{ white-space: pre-wrap; }}
+a {{ color: #818cf8; }}
+.spin::before {{ content: ""; display: inline-block; width: .8em; height: .8em; margin-right: .6em;
+  border: 2px solid #52525b; border-top-color: #818cf8; border-radius: 50%;
+  animation: s 1s linear infinite; }}
+@keyframes s {{ to {{ transform: rotate(360deg); }} }}
+</style></head><body><main>{body}</main></body></html>"#
+    )
 }
 
 fn write_private_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
@@ -548,5 +615,13 @@ mod token_tests {
         assert_eq!(super::connection_token("abc"), "f76b47e1a1b48f75f85288683bfa6c3a");
         assert_eq!(super::connection_token("abc"), super::connection_token("abc"));
         assert_ne!(super::connection_token("abc"), super::connection_token("abd"));
+    }
+
+    #[test]
+    fn install_page_escapes_errors() {
+        let page = super::install_page(Some("<script>x</script>"));
+        assert!(page.contains("&lt;script&gt;") && !page.contains("<script>"));
+        assert!(!page.contains("refresh"));
+        assert!(super::install_page(None).contains(r#"http-equiv="refresh""#));
     }
 }

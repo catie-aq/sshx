@@ -97,7 +97,13 @@ struct Args {
     #[clap(long)]
     ide: bool,
 
-    /// URL of the sshx platform to register this session with. Defaults to
+    /// Do not offer VS Code to SSHX Platform. By default, a session registered
+    /// with the platform installs OpenVSCode Server when VS Code is first
+    /// opened from it.
+    #[clap(long, conflicts_with = "ide")]
+    no_ide: bool,
+
+    /// URL of the SSHX Platform to register this session with. Defaults to
     /// the configuration saved by `sshx platform enroll`.
     #[clap(long, value_name = "URL", env = "SSHX_PLATFORM_URL")]
     platform: Option<String>,
@@ -186,7 +192,7 @@ enum Commands {
         action: HooksAction,
     },
 
-    /// Connect this machine to an sshx platform.
+    /// Connect this machine to SSHX Platform.
     Platform {
         #[clap(subcommand)]
         action: PlatformAction,
@@ -829,7 +835,10 @@ async fn run_session(args: Args) -> Result<()> {
         registry: Some(registry.clone()),
     });
 
-    // Register with the platform.
+    // Register with the platform, which offers VS Code in each terminal's folder.
+    if platform_client.is_some() && !args.no_ide {
+        controller.enable_ide_install();
+    }
     let platform = platform_client.map(|client| {
         let reg = Registration {
             name: controller.name().to_string(),
