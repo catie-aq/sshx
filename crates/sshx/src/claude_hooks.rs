@@ -189,6 +189,55 @@ pub fn status() -> Result<(PathBuf, Vec<&'static str>)> {
     Ok((path, installed_events(&settings)))
 }
 
+/// Distinct sshx hook commands found in the settings.
+fn installed_commands(settings: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let Some(hooks) = settings.get("hooks").and_then(|h| h.as_object()) else {
+        return out;
+    };
+    for groups in hooks.values().filter_map(|g| g.as_array()) {
+        for handlers in groups.iter().filter_map(|g| g.get("hooks").and_then(|h| h.as_array())) {
+            for cmd in handlers.iter().filter_map(|h| h.get("command").and_then(|c| c.as_str())) {
+                if is_sshx_command(cmd) && !out.iter().any(|c| c == cmd) {
+                    out.push(cmd.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Executable path of an sshx hook command (inverse of [`hook_command`]).
+pub fn command_executable(cmd: &str) -> PathBuf {
+    let exe = cmd.strip_suffix(MARKER).unwrap_or(cmd).trim();
+    let exe = match exe.strip_prefix('\'').and_then(|e| e.strip_suffix('\'')) {
+        Some(quoted) => quoted.replace(r"'\''", "'"),
+        None => exe.to_string(),
+    };
+    PathBuf::from(exe)
+}
+
+/// Detailed state of the installed hooks, for `sshx platform status`.
+pub struct HooksReport {
+    /// Settings file.
+    pub path: PathBuf,
+    /// Events with an sshx handler.
+    pub events: Vec<&'static str>,
+    /// Distinct sshx commands configured.
+    pub commands: Vec<String>,
+}
+
+/// Inspect the installed hooks.
+pub fn report() -> Result<HooksReport> {
+    let path = settings_path()?;
+    let settings = load(&path)?;
+    Ok(HooksReport {
+        events: installed_events(&settings),
+        commands: installed_commands(&settings),
+        path,
+    })
+}
+
 /// True if every hook event is installed.
 pub fn is_installed() -> bool {
     status()
@@ -216,6 +265,13 @@ mod tests {
         assert_eq!(stop.len(), 2, "user hook kept, sshx hook added once");
         // Key order is preserved (serde_json preserve_order).
         assert_eq!(settings.as_object().unwrap().keys().next().unwrap(), "model");
+
+        assert_eq!(installed_commands(&settings), vec![cmd.to_string()]);
+        assert_eq!(command_executable(cmd), PathBuf::from("/usr/local/bin/sshx"));
+        assert_eq!(
+            command_executable("'/Applications/My Tools/sshx' hook claude"),
+            PathBuf::from("/Applications/My Tools/sshx")
+        );
 
         assert_eq!(strip(&mut settings), HOOK_EVENTS.len());
         assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 1);

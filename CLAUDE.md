@@ -318,7 +318,7 @@ The activity feed pipelines Claude Code JSONL transcripts to the browser in real
 - **Version**: the workspace version in `Cargo.toml`, compared as `major.minor.patch`. Each publish bumps the patch (`--bump minor|major|none` otherwise); commit the bump afterwards.
 - **Publishing**: `scripts/publish-release.sh` builds, gzips and writes `releases/manifest.json` (per-platform `version`, `url`, `sha256`); the server serves `./releases` at `/releases`. Keeps the last 3 builds per platform. The landing page (`src/routes/+page.svelte`) reads the manifest at runtime to show the latest version and download links.
 - **Linux builds use glibc 2.28 via `cargo zigbuild`, not musl**: musl ignores nsswitch and cannot resolve Tailscale MagicDNS names when systemd-resolved is only reachable through nss-resolve.
-- **Client logic**: `crates/sshx/src/update.rs`. Auto-update is skipped for binaries run from a cargo `target/` directory; opt out with `--no-auto-update` / `SSHX_NO_AUTO_UPDATE=1`.
+- **Client logic**: `crates/sshx/src/update.rs`. Auto-update is skipped for binaries run from a cargo `target/` directory; opt out with `--no-auto-update` / `SSHX_NO_AUTO_UPDATE=1` (boolish: `1`, `true`, `yes`…).
 - No client/server compatibility check is performed.
 
 ---
@@ -342,6 +342,11 @@ usable on its own; these additions are inert unless a platform is configured or 
   `.sshx-backup`). Hooks are synchronous so events arrive in order.
 - **`platform.rs`** / `sshx platform enroll|status|forget`, `--platform`, `--platform-token`,
   `--no-platform`: registers the session and reports terminals every change (debounced) or 15 s.
+  `enroll` saves the sshx server announced by the platform (`whoami.sshxServer`) and installs the
+  Claude Code hooks (`--no-claude-hooks` to skip), so a plain `sshx` then works. `--server` is
+  optional: explicit flag/`SSHX_SERVER`, else the enrolled server, else the built-in default.
+  `status` checks every link (enrollment, token, sshx server, online sessions, hooks and their
+  binary, and the hook socket when run inside an sshx terminal) and exits with 1 on failure.
   Machine token = `smt_<bearer>.<machine key>`; only the bearer part is sent. The session key and
   terminal metadata are sealed with AES-256-GCM (`seal`/`open`, AAD per slot). Keep the format
   byte-compatible with the platform's `src/lib/crypto.ts` (shared test vector).

@@ -58,7 +58,7 @@ administrator only sees metadata.
 | **Session persistence** — widgets and notes survive restarts. | working | automatic |
 | **Custom session slugs** — readable URLs (`/s/<slug>`). | working | `--slug <name>` |
 | **Administration & sharing** — `/api/sessions` behind an admin token (constant-time check) and a `/sessions` page listing sessions, users and shells; **Share** button copying the session URL. | working | `sshx-server --admin-token <secret>` (or `SSHX_ADMIN_TOKEN`) |
-| **Per-terminal agent state & platform** — each terminal knows its directory, git repo and foreground process; Claude Code hooks report working / question / permission / done per terminal; sessions can register with the multi-user [sshx platform](../sshx-dev-platform) using an end-to-end encrypted machine token. | working | `sshx claude-hooks install`, `sshx platform enroll <url> <token>` |
+| **Per-terminal agent state & platform** — each terminal knows its directory, git repo and foreground process; Claude Code hooks report working / question / permission / done per terminal; sessions can register with the multi-user [sshx platform](../sshx-dev-platform) using an end-to-end encrypted machine token. | working | `sshx platform enroll <url> <token>` (also installs the Claude Code hooks), `sshx platform status` |
 | **Self-update** — `sshx update` installs the latest client published by the server it points to; a background check runs at most hourly. | working | `sshx update [--check] [--force]`, opt out with `--no-auto-update` |
 
 Detailed write-ups (in French) of each feature — description, implications,

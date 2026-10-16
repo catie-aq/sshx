@@ -99,6 +99,10 @@ pub struct PlatformConfig {
     pub url: String,
     /// Full machine token, `smt_…​.<key>`.
     pub token: String,
+    /// sshx server announced by the platform at enrollment, used when
+    /// `--server` is not given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
 }
 
 impl std::fmt::Debug for PlatformConfig {
@@ -106,6 +110,7 @@ impl std::fmt::Debug for PlatformConfig {
         f.debug_struct("PlatformConfig")
             .field("url", &self.url)
             .field("token", &"<redacted>")
+            .field("server", &self.server)
             .finish()
     }
 }
@@ -167,13 +172,14 @@ impl PlatformConfig {
     /// Resolve the configuration from flags/env, falling back to the saved file.
     pub fn resolve(url: Option<String>, token: Option<String>) -> Result<Option<Self>> {
         match (url, token) {
-            (Some(url), Some(token)) => Ok(Some(Self { url, token })),
+            (Some(url), Some(token)) => Ok(Some(Self { url, token, server: None })),
             (None, None) => Self::load(),
             (url, token) => {
                 // Complete a partial override with the saved configuration.
                 let saved = Self::load()?;
+                let server = saved.as_ref().and_then(|s| s.server.clone());
                 match (url.or(saved.as_ref().map(|s| s.url.clone())), token.or(saved.map(|s| s.token))) {
-                    (Some(url), Some(token)) => Ok(Some(Self { url, token })),
+                    (Some(url), Some(token)) => Ok(Some(Self { url, token, server })),
                     _ => bail!("both --platform and --platform-token are required"),
                 }
             }
@@ -219,6 +225,12 @@ pub struct MachineIdentity {
     pub project: Option<String>,
     /// Owner's username.
     pub owner: String,
+    /// sshx server machines should use, as configured on the platform.
+    #[serde(default)]
+    pub sshx_server: Option<String>,
+    /// Sessions of this machine currently online.
+    #[serde(default)]
+    pub sessions_online: Option<u32>,
 }
 
 /// Last sealed metadata per terminal: plaintext and its ciphertext.
@@ -494,12 +506,21 @@ mod tests {
         let cfg = PlatformConfig {
             url: "https://p".into(),
             token: format!("smt_abc.{key}"),
+            server: None,
         };
         let (auth, k) = cfg.credentials().unwrap();
         assert_eq!(auth, "smt_abc");
         assert_eq!(k, [1u8; 32]);
-        let bad = PlatformConfig { url: "x".into(), token: "nope".into() };
+        let bad = PlatformConfig { url: "x".into(), token: "nope".into(), server: None };
         assert!(bad.credentials().is_err());
+    }
+
+    #[test]
+    fn config_without_server_still_loads() {
+        let cfg: PlatformConfig = serde_json::from_str(r#"{"url":"https://p","token":"smt_a.b"}"#).unwrap();
+        assert!(cfg.server.is_none());
+        let text = serde_json::to_string(&cfg).unwrap();
+        assert!(!text.contains("server"), "absent server is not written: {text}");
     }
 
     /// Known-answer vector shared with the platform's TypeScript tests.
